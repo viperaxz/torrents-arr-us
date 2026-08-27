@@ -91,6 +91,23 @@ Layer 2 can be re-run independently after the initial install:
 
 Preserves media files (downloads, movies, TV) and Chocolatey/NSSM. Encrypts and saves the Caddy cert store so it can be restored on reinstall. Backs up the Deluge torrent state and the Sonarr/Radarr databases, which are restored automatically on reinstall.
 
+### Updating
+
+Updates are **notify-then-apply**: a daily scheduled task checks for new versions and shows a notification, and you apply them yourself with one command.
+
+```powershell
+box check    # compare installed versions against the recommended manifest (read-only)
+box update   # apply all available updates (auto-elevates, per-app rollback on failure)
+```
+
+How it works:
+
+- `versions.json` in this repository is the **single source of truth** for recommended versions. It is refreshed weekly by an automated GitHub Actions workflow (maintainer side) that opens a pull request with upstream bumps.
+- The daily `win-seedbox Update Check` task compares the remote manifest against the local ledger `<InstallDir>\.locks\installed_versions.json` and notifies via toast + dashboard.
+- `box update` runs one dedicated update script per app (`scripts\update_<App>.ps1`): GitHub binary swaps with rollback, Chocolatey upgrades, a source rebuild for Jellyseerr, and single-exe swaps for Zurg/rclone/Loki/Alloy.
+- Infrastructure packages (NSSM, Python) are never auto-updated; when their pin changes, `box check` lists them as manual updates (`.\master_install.ps1 -Force <AppName>`).
+- `box update -WhatIf` (or `.\master_update.ps1 -WhatIf`) prints the plan without changing anything.
+
 ## Configuration
 
 Copy `config.json.example` → `config.json` and fill in these key fields:

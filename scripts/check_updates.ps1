@@ -26,22 +26,17 @@ $ConfigPath  = Join-Path $ProjectRoot "config.json"
 if (-not (Test-Path $ConfigPath)) { exit 0 }
 $Config      = Get-Content -Raw $ConfigPath | ConvertFrom-Json
 $InstallDir  = $Config.General.InstallDir
-$LocksDir    = Join-Path $InstallDir ".locks"
 
 # -- Load local versions.json --------------------------------------------------
 $LocalVersionsPath = Join-Path $ProjectRoot "versions.json"
 if (-not (Test-Path $LocalVersionsPath)) { exit 0 }
 $LocalVersions = Get-Content -Raw $LocalVersionsPath | ConvertFrom-Json
-$RemoteUrl     = if ($LocalVersions.github_raw_url) { $LocalVersions.github_raw_url } else {
-    "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json"
-}
 
-# -- Fetch remote versions.json ------------------------------------------------
-try {
-    $RemoteVersions = Invoke-RestMethod -Uri $RemoteUrl -UseBasicParsing -TimeoutSec 15
-} catch {
-    exit 0
-}
+. (Join-Path $ProjectRoot "scripts\update_common.ps1")
+
+# -- Fetch remote versions.json (helper parses text/plain JSON) ----------------
+$RemoteVersions = Get-RemoteManifest -LocalManifest $LocalVersions
+if ([object]::ReferenceEquals($RemoteVersions, $LocalVersions)) { exit 0 }
 
 # -- Check for project script updates (git) ------------------------------------
 $projectUpdateAvailable = $false
@@ -55,39 +50,36 @@ if ($isGitRepo) {
     } catch { }
 }
 
-# -- Compare app versions vs manifest -----------------------------------------
+# -- Compare app versions vs manifest (shared, data-driven plan) ----------------
 $pendingApps     = [System.Collections.Generic.List[string]]::new()
+$manualApps      = [System.Collections.Generic.List[string]]::new()
 $securityPending = $false
 $securityNote    = ""
 
-$appOrder = @("Sonarr","Radarr","Prowlarr","Bazarr","Flaresolverr","Jellyfin","Deluge","ffmpeg","Caddy")
-foreach ($appName in $appOrder) {
-    $manifestEntry = $RemoteVersions.apps.$appName
-    if (-not $manifestEntry) { continue }
+$ScriptsDir = Join-Path $ProjectRoot "scripts"
+$plan = @(Get-UpdatePlan -Manifest $RemoteVersions -InstallDir $InstallDir -ScriptsDir $ScriptsDir)
 
-    $lower    = $appName.ToLower()
-    $lockFile = Join-Path $LocksDir ".$lower.lock"
-    if (-not (Test-Path $lockFile)) { continue }
-
-    $installedVer = (Get-Content $lockFile -Raw).Trim()
-    if (-not $installedVer -or $installedVer -eq "unknown") { continue }
-
-    $normalInstalled = $installedVer.TrimStart('v')
-    $normalManifest  = $manifestEntry.version.TrimStart('v')
-
-    if ($normalInstalled -ne $normalManifest) {
-        $pendingApps.Add($appName)
-        if ($manifestEntry.PSObject.Properties["security"] -and $manifestEntry.security -eq $true) {
-            $securityPending = $true
-            if ($manifestEntry.PSObject.Properties["securityNote"] -and $manifestEntry.securityNote) {
-                $securityNote = "$appName - $($manifestEntry.securityNote)"
-            }
+foreach ($item in $plan) {
+    if ($item.State -eq "unknown" -or $item.State -eq "notinstalled") {
+        # Self-heal: try to detect the real installed version and record it
+        # (covers legacy lock values and apps without any lock file).
+        $detected = Detect-InstalledVersion -AppName $item.App -Entry $item.Entry -InstallDir $InstallDir
+        if ($detected) {
+            Set-InstalledVersion -InstallDir $InstallDir -AppName $item.App -Version $detected
         }
+    } elseif ($item.State -eq "update") {
+        $pendingApps.Add($item.App)
+        if ($item.Security) {
+            $securityPending = $true
+            if ($item.SecurityNote) { $securityNote = "$($item.App) - $($item.SecurityNote)" }
+        }
+    } elseif ($item.State -eq "manual") {
+        $manualApps.Add($item.App)
     }
 }
 
 # -- Nothing to report  --  exit silently ----------------------------------------
-if ($pendingApps.Count -eq 0 -and -not $projectUpdateAvailable) { exit 0 }
+if ($pendingApps.Count -eq 0 -and $manualApps.Count -eq 0 -and -not $projectUpdateAvailable) { exit 0 }
 
 # -- Build toast notification --------------------------------------------------
 function Show-ToastNotification {
@@ -145,13 +137,15 @@ if ($securityPending) {
     $title = "win-seedbox - SECURITY UPDATE"
     $body  = $securityNote
     if (-not $body) { $body = ($pendingApps -join ", ") + " - security fix available." }
-    $body += " Run master_update.ps1 immediately."
+    $body += " Run 'box update' immediately."
     Show-ToastNotification -Title $title -Body $body
 } else {
-    $appList = $pendingApps -join ", "
-    $extra   = if ($projectUpdateAvailable) { " + project scripts" } else { "" }
-    $title   = "win-seedbox - Updates available"
-    $body    = "$appList$extra. Run master_update.ps1 to apply."
+    $parts = @()
+    if ($pendingApps.Count -gt 0) { $parts += ($pendingApps -join ", ") }
+    if ($manualApps.Count -gt 0)  { $parts += "manual: " + ($manualApps -join ", ") }
+    $extra = if ($projectUpdateAvailable) { " + project scripts" } else { "" }
+    $title = "win-seedbox - Updates available"
+    $body  = "$($parts -join ' | ')$extra. Run 'box update' to apply."
     Show-ToastNotification -Title $title -Body $body
 }
 

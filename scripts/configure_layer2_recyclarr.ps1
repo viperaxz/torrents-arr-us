@@ -168,4 +168,18 @@ try {
         }
     }
 }
+
+# -- Ledger entry for the updater ----------------------------------------------
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+if (Get-Variable -Name release -ErrorAction SilentlyContinue) {
+    Set-InstalledVersion -InstallDir $Config.General.InstallDir -AppName "Recyclarr" -Version $release.tag_name
+} elseif (Test-Path $RecyclarrExe) {
+    $rcOut = (& $RecyclarrExe --version 2>$null | Select-Object -First 1)
+    if ($rcOut -match '([0-9]+\.[0-9]+(?:\.[0-9]+)?)') {
+        Set-InstalledVersion -InstallDir $Config.General.InstallDir -AppName "Recyclarr" -Version $Matches[1]
+    }
+}
+
 Write-DebugLog "INFO" "configure_layer2_recyclarr.ps1 complete"

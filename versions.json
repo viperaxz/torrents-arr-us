@@ -1,6 +1,6 @@
-﻿{
-  "schema": 1,
-  "updated": "2026-08-06",
+{
+  "schema": 2,
+  "updated": "2026-08-27",
   "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
   "apps": {
     "Sonarr": {
@@ -38,7 +38,13 @@
       "version": "v3.4.1",
       "source": "github_source",
       "repo": "Fallenbagel/jellyseerr",
-      "note": "Built from source (Node.js + pnpm). Update requires manual rebuild."
+      "note": "Built from source (Node.js + pnpm). Updated by scripts\\update_jellyseerr.ps1 (rebuild from source)."
+    },
+    "Recyclarr": {
+      "version": "v8.7.1",
+      "source": "github",
+      "repo": "recyclarr/recyclarr",
+      "asset": "*win-x64.zip"
     },
     "Jellyfin": {
       "version": "10.11.11",
@@ -70,10 +76,20 @@
       "source": "chocolatey",
       "package": "python312"
     },
+    "CrowdSec": {
+      "version": "1.7.8",
+      "source": "chocolatey",
+      "package": "crowdsec"
+    },
+    "CrowdSecBouncer": {
+      "version": "0.0.6",
+      "source": "chocolatey",
+      "package": "crowdsec-windows-firewall-bouncer"
+    },
     "Grafana": {
-      "version": "latest",
+      "version": "13.2.0",
       "source": "dl.grafana.com",
-      "note": "Version resolved from grafana.com/api/grafana/versions/stable at install time. Binaries at dl.grafana.com/oss/release/"
+      "note": "Pinned stable version. scripts\\bump_versions.ps1 refreshes this pin from grafana.com/api/grafana/versions/stable. Binaries at dl.grafana.com/oss/release/"
     },
     "Loki": {
       "version": "v3.7.6",

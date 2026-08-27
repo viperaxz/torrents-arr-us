@@ -212,5 +212,18 @@ if ($svc -and $svc.Status -eq "Running") {
 
 # -- 7. Write lock file ---------------------------------------------------------
 [System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), [System.Text.Encoding]::UTF8)
+
+# Ledger entry for the updater (single source of truth for versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+$zurgVer = $null
+if (Get-Variable -Name release -ErrorAction SilentlyContinue) { $zurgVer = $release.tag_name }
+if (-not $zurgVer) {
+    $zurgEntry = if ($Config._Versions -and $Config._Versions.Apps.Zurg) { $Config._Versions.Apps.Zurg } else { $null }
+    $zurgVer = Detect-InstalledVersion -AppName "Zurg" -Entry $zurgEntry -InstallDir $InstallDir
+}
+if ($zurgVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "Zurg" -Version $zurgVer }
+
 Write-Host "  OK $AppName installed." -ForegroundColor Green
 Write-DebugLog "INFO" "15_zurg.ps1 complete. Lock file written: $LockFile"

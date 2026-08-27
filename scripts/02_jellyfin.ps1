@@ -238,5 +238,12 @@ if ($svc.Status -eq "Running") {
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
+
+# Ledger entry for the updater (single source of truth for installed versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+Set-InstalledVersion -InstallDir $InstallDir -AppName "Jellyfin" -Version $LockVersion
+
 Write-Host "[Jellyfin] Done." -ForegroundColor Cyan
 Write-DebugLog "INFO" "02_jellyfin.ps1 complete"

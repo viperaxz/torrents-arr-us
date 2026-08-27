@@ -299,5 +299,12 @@ if ($svc -and $svc.Status -eq "Running") {
 
 New-Item -Path $LockFile -ItemType File -Force | Out-Null
 Write-DebugLog "INFO" "Lock file created: $LockFile"
+
+# Ledger entry for the updater (single source of truth for installed versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+if ($Version) { Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version "v$Version" }
+
 Write-Host "[$AppName] Done." -ForegroundColor Cyan
 Write-DebugLog "INFO" "11_jellyseerr.ps1 complete"

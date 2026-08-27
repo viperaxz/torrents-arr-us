@@ -1040,6 +1040,14 @@ if ($DomainMode -eq "cloudflare") {
 # -- Write lock file -----------------------------------------------------------
 [System.IO.File]::WriteAllText($LockFile, "installed", $utf8NoBom)
 Write-DebugLog "INFO" "14_grafana.ps1 complete. Lock: $LockFile"
+
+# Ledger entries for the updater (single source of truth for versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+if ($grafanaVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "Grafana" -Version $grafanaVer }
+if ($lokiTag)    { Set-InstalledVersion -InstallDir $InstallDir -AppName "Loki" -Version $lokiTag }
+if ($alloyTag)   { Set-InstalledVersion -InstallDir $InstallDir -AppName "Alloy" -Version $alloyTag }
 Write-Host "[$AppName] Done." -ForegroundColor Cyan
 $grafanaUrl = if ($DomainMode -eq "cloudflare") {
     "https://grafana.$($Config.General.Domain)"

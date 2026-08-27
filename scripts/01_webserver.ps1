@@ -579,5 +579,11 @@ $CaddyLockVer  = if ($CaddyPinnedVersion) { $CaddyPinnedVersion } else { "unknow
 [System.IO.File]::WriteAllText($CaddyLockFile, $CaddyLockVer, [System.Text.Encoding]::UTF8)
 Write-DebugLog "INFO" "Caddy lock file written: $CaddyLockFile (version=$CaddyLockVer)"
 
+# Ledger entry for the updater (single source of truth for installed versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+Set-InstalledVersion -InstallDir $Config.General.InstallDir -AppName "Caddy" -Version $CaddyLockVer
+
 Write-Host "[WebServer] Done." -ForegroundColor Cyan
 Write-DebugLog "INFO" "01_webserver.ps1 complete"

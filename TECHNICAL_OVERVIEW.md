@@ -690,12 +690,26 @@ Collects server health metrics and writes them as `dashboard/current_status.json
 - **Security**: Windows Firewall rule count for the abuse blocklist.
 Runs every 5 minutes via `Seedbox_Status_Collector` (SYSTEM scheduled task registered by `13_status.ps1`). No credentials or secrets are written to the output JSON.
 
+#### The update system
+
+Updates follow a **notify-then-apply** model with a single source of truth per side:
+
+- **Remote truth**: `versions.json` at the repo root (published via GitHub raw). It pins the recommended version, source, and asset pattern per app, plus optional `security` / `securityNote` flags. A maintainer tool (`scripts\bump_versions.ps1`) refreshes it from upstream releases, and a weekly GitHub Actions workflow opens a PR with the bumps.
+- **Local truth**: `<InstallDir>\.locks\installed_versions.json` (the "ledger"), written by every installer via `Set-InstalledVersion` and maintained by the update scripts. Legacy `.locks\*.lock` files still exist for install idempotency and are kept in sync on successful updates.
+
+Building blocks:
+
+- `scripts\update_common.ps1` — shared helpers: `Read-InstalledLedger` / `Set-InstalledVersion`, tolerant `Compare-Versions`, data-driven `Get-UpdatePlan` (states: `current`, `update`, `manual`, `notinstalled`, `unknown`, `unresolved`), `Invoke-GitHubReleaseDownload`, `Invoke-ChocoUpgrade`, `Swap-AppDirectoryWithRollback`, `Swap-SingleExeWithRollback`, `Detect-InstalledVersion` (self-heals legacy lock values like timestamps or `installed`).
+- `scripts\update_<App>.ps1` — one script per app (18 total). Contract: `-Version -InstallDir -BinDir -Config [-WhatIf]`, returns one result object (`App/Status/Installed/Target/Detail`), writes the ledger only after a verified success. Dir swaps for Sonarr/Radarr/Prowlarr/Flaresolverr/Grafana; exe-only swaps for Zurg/rclone/Loki/Alloy (config files live next to the binary); Bazarr re-runs `pip install -r requirements.txt` after the swap; Jellyseerr rebuilds from source via pnpm; choco upgrades for Jellyfin (re-applies the `seedbox-svc` service account), Deluge, ffmpeg, Caddy (reloads the Caddyfile), CrowdSec + bouncer; Recyclarr replaces the CLI exe. NSSM and Python312 are deliberately manual.
+- `master_update.ps1` — thin data-driven orchestrator: self-update via git pull, remote manifest fetch, ledger migration, `Get-UpdatePlan`, then per-app script invocation with the summary table. Supports `-AutoApprove`, `-App <Name>`, `-WhatIf`.
+- `box.ps1` — `box check` (read-only plan) and `box update` (auto-elevates) both consume the same plan; no hardcoded app list exists anywhere.
+
 #### `scripts/check_updates.ps1`
 Daily background update checker registered as the `win-seedbox Update Check` scheduled task (runs at 10:00 AM under the interactive user).
 - Fetches the remote `versions.json` from the GitHub raw URL defined in the local `versions.json`.
-- Compares pinned versions for each app against the installed `versions.json`.
+- Builds the same `Get-UpdatePlan` as `box check` and `master_update.ps1` (all apps, not a hardcoded subset), self-healing unknown ledger entries via `Detect-InstalledVersion`.
 - If the project itself is a git repository, fetches `origin/main` and compares HEAD SHA to detect script-level updates.
-- Shows a Windows toast notification listing available updates; never applies updates automatically.
+- Shows a Windows toast notification (with `msg.exe` fallback) and always writes `dashboard\update_notification.json`; never applies updates automatically.
 
 #### `scripts/sonarr_jellyfin_refresh.py`
 A Sonarr Custom Script connection that fires on `OnDownload` events to fix a timing-dependent hierarchy bug in Jellyfin.

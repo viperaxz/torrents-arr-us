@@ -315,5 +315,16 @@ if ($mSvc -and $mSvc.Status -eq "Running" -and $mountOk) {
 
 # -- 9. Write lock file ---------------------------------------------------------
 [System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), [System.Text.Encoding]::UTF8)
+# Ledger entry for the updater (single source of truth for versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+$rcloneVer = $null
+if (Get-Variable -Name release -ErrorAction SilentlyContinue) { $rcloneVer = $release.tag_name }
+if (-not $rcloneVer) {
+    $rcloneEntry = if ($Config._Versions -and $Config._Versions.Apps.rclone) { $Config._Versions.Apps.rclone } else { $null }
+    $rcloneVer = Detect-InstalledVersion -AppName "rclone" -Entry $rcloneEntry -InstallDir $InstallDir
+}
+if ($rcloneVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "rclone" -Version $rcloneVer }
 Write-Host "  OK $AppName installed (movies: ${MovieLetter}:\)." -ForegroundColor Green
 Write-DebugLog "INFO" "16_rclone.ps1 complete. Lock file written: $LockFile"
