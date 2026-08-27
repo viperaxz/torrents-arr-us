@@ -1,0 +1,135 @@
+{
+    storage file_system {
+        root "{$CADDY_DATA_DIR}"
+    }
+}
+
+# Caddyfile — Cloudflare subdomain mode
+# Each app gets its own subdomain: app.domain.com
+# TLS_BLOCK is replaced by the installer with either:
+#   tls internal                    (testing — Caddy local CA)
+#   tls {$TLS_EMAIL}               (production — Let's Encrypt HTTP-01)
+
+# Dashboard on root domain (static HTML)
+{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    basic_auth {
+        {$ADMIN_USER} {$ADMIN_HASH_BCRYPT}
+    }
+    root * "{$INSTALL_DIR}/dashboard"
+    file_server
+}
+
+# Jellyfin
+jellyfin.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$JELLYFIN_PORT} {
+        header_up X-Real-IP {remote_host}
+        header_down -X-Frame-Options
+    }
+}
+
+# Sonarr
+sonarr.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$SONARR_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Radarr
+radarr.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$RADARR_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Prowlarr
+prowlarr.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$PROWLARR_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Bazarr
+bazarr.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$BAZARR_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Jellyseerr
+jellyseerr.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}
+
+# Deluge -- Web UI (proxied to DelugeWeb service)
+# Deluge handles authentication via its own login form; no Caddy basic_auth needed.
+deluge.{$DOMAIN} {
+    {$TLS_BLOCK}
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+    reverse_proxy 127.0.0.1:{$DELUGE_WEB_PORT} {
+        header_up X-Real-IP {remote_host}
+    }
+}

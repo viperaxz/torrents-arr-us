@@ -1,0 +1,175 @@
+﻿{
+  "General": {
+    "DomainMode": "cloudflare",
+    "TlsMode": "letsencrypt",
+    "TlsEmail": "your@email.com",
+    "DebugLogging": false,
+
+    "Domain": "example.com",
+    "CloudflareApiToken": "your-cloudflare-api-token",
+
+    "DuckDnsDomain": "myhome.duckdns.org",
+    "DuckDnsToken": "your-duckdns-token",
+
+    "AdminUsername": "admin",
+    "AdminPassword": "SuperSecretPassword123!",
+    "ServiceAccountPassword": "Svc@Seedbox2024!",
+    "DefaultUserPassword": "UserPass123!",
+    "InstallDir": "C:\\MediaServer"
+  },
+  "Apps": {
+    "Jellyfin": true,
+    "Sonarr": true,
+    "Radarr": true,
+    "Prowlarr": true,
+    "Deluge": true,
+    "Ffmpeg": true,
+    "Bazarr": true,
+    "Flaresolverr": true,
+    "Jellyseerr": true,
+    "Grafana": false,
+    "RealDebrid": false
+  },
+  "RealDebrid": {
+    "ApiKey": "",
+    "MountLetter": "R"
+  },
+  "Ports": {
+    "Jellyfin": 8096,
+    "Sonarr": 8989,
+    "Radarr": 7878,
+    "Prowlarr": 9696,
+    "Deluge": 58846,
+    "DelugeWeb": 8112,
+    "DelugeBT": 56881,
+    "Bazarr": 6767,
+    "Flaresolverr": 8191,
+    "Jellyseerr": 5055
+  },
+  "Paths": {
+    "Downloads": "C:\\MediaServer\\Downloads",
+    "Movies": "C:\\MediaServer\\Media\\Movies",
+    "TV": "C:\\MediaServer\\Media\\TV"
+  },
+  "Security": {
+    "CrowdSecEnrollKey": "",
+    "BanDurationHours": 4,
+    "ExtraWhitelistIps": [],
+    "AbuseBlocklists": true
+  },
+  "Users": [
+    { "Username": "alice", "Password": "" },
+    { "Username": "bob",   "Password": "" }
+  ],
+  "Layer2": {
+    "MinimumSeeders": 1,
+    "PublicTrackerSeedRatio": 1.0,
+    "Sonarr": {
+      "DownloadClients": [
+        {
+          "Name": "Deluge",
+          "Type": "Deluge",
+          "Host": "127.0.0.1",
+          "Port": 8112,
+          "Priority": 1
+        }
+      ],
+      "RootFolders": [
+        {
+          "Path": "C:\\MediaServer\\Media\\TV"
+        }
+      ]
+    },
+    "Radarr": {
+      "DownloadClients": [
+        {
+          "Name": "Deluge",
+          "Type": "Deluge",
+          "Host": "127.0.0.1",
+          "Port": 8112,
+          "Priority": 1
+        }
+      ],
+      "RootFolders": [
+        {
+          "Path": "C:\\MediaServer\\Media\\Movies"
+        }
+      ]
+    },
+    "Prowlarr": {
+      "Indexers": [
+        { "Name": "Bangumi Moe",          "DefinitionName": "bangumi-moe",          "Enabled": true },
+        { "Name": "Knaben",               "DefinitionName": "knaben",               "Enabled": true },
+        { "Name": "LimeTorrents",         "DefinitionName": "limetorrents",         "Enabled": true },
+        { "Name": "nekoBT",               "DefinitionName": "nekobt",               "Enabled": true },
+        { "Name": "Nyaa.si",              "DefinitionName": "nyaasi",               "Enabled": true },
+        { "Name": "SubsPlease",           "DefinitionName": "subsplease",           "Enabled": true },
+        { "Name": "Torrent Downloads",    "DefinitionName": "torrentdownloads",     "Enabled": true },
+        { "Name": "TorrentDownload",      "DefinitionName": "torrentdownload",      "Enabled": true },
+        {
+          "Name": "RuTracker",
+          "DefinitionName": "RuTracker.org",
+          "Enabled": false,
+          "Credentials": { "Username": "", "Password": "" },
+          "SeedRules": { "Ratio": 1.0, "SeedTimeMinutes": 4320 }
+        },
+        {
+          "Name": "FileList",
+          "DefinitionName": "FileList.io",
+          "Enabled": false,
+          "Credentials": { "Username": "", "Passkey": "" },
+          "SeedRules": { "Ratio": 1.0, "SeedTimeMinutes": 4320 }
+        },
+        {
+          "Name": "IPTorrents",
+          "DefinitionName": "iptorrents",
+          "Enabled": false,
+          "Credentials": { "Cookie": "", "UserAgent": "" },
+          "SeedRules": { "Ratio": 0.5, "SeedTimeMinutes": 1440 }
+        },
+        {
+          "Name": "TorrentLeech",
+          "DefinitionName": "torrentleech",
+          "Enabled": false,
+          "Credentials": { "Username": "", "Password": "", "Alt2FAToken": "" },
+          "SeedRules": { "Ratio": 1.0, "SeedTimeMinutes": 1440 }
+        }
+      ]
+    },
+    "OpenSubtitles": {
+      "Username": "",
+      "Password": ""
+    },
+    "Bazarr": {
+      "TitloviUsername": "",
+      "TitloviPassword": "",
+      "SubdlApiKey": ""
+    },
+    "Jellyfin": {
+      "GPU": "nvidia_ada",
+      "MediaLibraries": [
+        {
+          "Name": "Movies",
+          "Path": "C:\\MediaServer\\Media\\Movies",
+          "Type": "movies"
+        },
+        {
+          "Name": "TV Shows",
+          "Path": "C:\\MediaServer\\Media\\TV",
+          "Type": "tvshows"
+        },
+        {
+          "Name": "RD Movies",
+          "Path": "R:\\",
+          "Type": "movies",
+          "Lean": {
+            "DisableVideoExtraction": true,
+            "DisableMetadata": false,
+            "DisableImages": false
+          }
+        }
+      ]
+    }
+  }
+}
+

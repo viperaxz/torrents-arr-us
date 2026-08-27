@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>torrents-arr-us — Self-Hosted Media Server for Windows</title>
+<meta name="description" content="A fully automated, Swizzin-inspired Windows media server installer. One config.json and one command installs Jellyfin, Sonarr, Radarr, Prowlarr, Deluge, Bazarr, Jellyseerr and more, behind Caddy with CrowdSec protection.">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #f0883e;
+    --accent2: #58a6ff;
+    --green: #3fb950;
+    --code-bg: #010409;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  header {
+    padding: 96px 0 64px;
+    text-align: center;
+    border-bottom: 1px solid var(--border);
+    background:
+      radial-gradient(ellipse 80% 60% at 50% -10%, rgba(240,136,62,.14), transparent),
+      var(--bg);
+  }
+  h1 {
+    font-size: 3rem;
+    letter-spacing: -0.5px;
+    background: linear-gradient(90deg, var(--accent), #ffd166);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    margin-bottom: 12px;
+  }
+  .tagline { font-size: 1.25rem; color: var(--muted); max-width: 640px; margin: 0 auto 28px; }
+  .cta { display: inline-flex; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  .btn {
+    display: inline-block; padding: 12px 24px; border-radius: 8px;
+    text-decoration: none; font-weight: 600; font-size: 1rem;
+    transition: transform .12s ease;
+  }
+  .btn:hover { transform: translateY(-2px); }
+  .btn-primary { background: var(--accent); color: #161b22; }
+  .btn-ghost { border: 1px solid var(--border); color: var(--text); background: var(--panel); }
+  section { padding: 72px 0; border-bottom: 1px solid var(--border); }
+  h2 { font-size: 1.9rem; margin-bottom: 8px; letter-spacing: -0.3px; }
+  .sub { color: var(--muted); margin-bottom: 32px; max-width: 720px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px;
+  }
+  .card h3 { font-size: 1.05rem; margin-bottom: 8px; color: var(--accent2); }
+  .card p, .card li { color: var(--muted); font-size: .95rem; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border-radius: 10px; overflow: hidden; }
+  th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--accent); font-size: .85rem; text-transform: uppercase; letter-spacing: .5px; }
+  td:first-child { font-weight: 600; }
+  td:last-child { color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px; overflow-x: auto;
+    font-size: .9rem; line-height: 1.5;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace; }
+  pre code { color: #c9d1d9; }
+  .hl { color: var(--green); }
+  .cm { color: #6e7681; }
+  ol.steps { counter-reset: step; list-style: none; margin-top: 16px; }
+  ol.steps li {
+    counter-increment: step; position: relative;
+    padding: 0 0 24px 52px;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    position: absolute; left: 0; top: 0;
+    width: 34px; height: 34px; border-radius: 50%;
+    background: var(--accent); color: #161b22;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+  }
+  ol.steps li strong { display: block; margin-bottom: 4px; }
+  ol.steps li span { color: var(--muted); font-size: .95rem; }
+  .warn {
+    background: rgba(240,136,62,.1); border: 1px solid rgba(240,136,62,.4);
+    border-radius: 10px; padding: 16px 20px; margin-top: 24px;
+    font-size: .95rem;
+  }
+  footer { padding: 48px 0; text-align: center; color: var(--muted); font-size: .9rem; }
+  footer a { color: var(--accent2); text-decoration: none; }
+  @media (max-width: 640px) { h1 { font-size: 2.2rem; } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>torrents-arr-us</h1>
+    <p class="tagline">
+      One <code>config.json</code> and one command turn a plain Windows box into a
+      complete, hardened, self-hosted media stack — inspired by Swizzin, built for Windows.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="#quickstart">Get Started</a>
+      <a class="btn btn-ghost" href="https://github.com/viperaxz/torrents-arr-us">View on GitHub</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">A zero-touch installer that boots, installs, wires together and secures 15+ applications.
+       You provide credentials and a domain in one JSON file; everything else is automated.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>1. Fill in the config</h3>
+        <p>Domain, admin password, media paths, and which apps you want — all in a single <code>config.json</code>.</p>
+      </div>
+      <div class="card">
+        <h3>2. Run one command</h3>
+        <p><code>.\master_install.ps1</code> handles prerequisites, app installers, authentication and integration.</p>
+      </div>
+      <div class="card">
+        <h3>3. It wires itself</h3>
+        <p>Prowlarr indexers sync to Sonarr/Radarr, Deluge becomes the download client, Jellyfin gets libraries, Bazarr gets subtitle profiles — no clicking through UIs.</p>
+      </div>
+      <div class="card">
+        <h3>4. Secured by default</h3>
+        <p>Caddy terminates TLS on every app, CrowdSec + firewall bouncer block attackers, and app ports are LAN-scoped so nothing bypasses the proxy.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>The stack</h2>
+    <p class="sub">Every app runs as an isolated Windows service under a dedicated <code>seedbox-svc</code> account with no admin rights.</p>
+    <table>
+      <tr><th>App</th><th>Role</th></tr>
+      <tr><td>Caddy</td><td>Reverse proxy + automatic TLS (Cloudflare or DuckDNS modes)</td></tr>
+      <tr><td>Jellyfin</td><td>Media server with hardware transcoding (NVIDIA / AMD / Intel profiles)</td></tr>
+      <tr><td>Sonarr / Radarr</td><td>TV and movie automation with TRaSH-Guides quality profiles via Recyclarr</td></tr>
+      <tr><td>Prowlarr</td><td>Indexer manager — 18+ public trackers added and synced automatically</td></tr>
+      <tr><td>Deluge</td><td>Download daemon tuned for private-tracker speeds, state survives reinstalls</td></tr>
+      <tr><td>Bazarr</td><td>Subtitles — OpenSubtitles.com, YIFY, Titlovi, gestdown and more</td></tr>
+      <tr><td>Jellyseerr</td><td>Netflix-style request portal, wired to Jellyfin + the *arr apps</td></tr>
+      <tr><td>Flaresolverr</td><td>Cloudflare bypass proxy registered with Prowlarr automatically</td></tr>
+      <tr><td>Grafana + Loki + Alloy</td><td>Optional observability stack with pre-built dashboards</td></tr>
+      <tr><td>Zurg + rclone</td><td>Optional Real-Debrid library mounted as a drive letter for Jellyfin</td></tr>
+      <tr><td>CrowdSec + FW bouncer</td><td>Intrusion detection with automatic Windows Firewall bans</td></tr>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Highlights</h2>
+    <p class="sub">Details that took the long way to get right, so you don't have to.</p>
+    <div class="grid">
+      <div class="card"><h3>Idempotent installs</h3><p>Lock files make <code>master_install.ps1</code> safe to re-run; failed apps are isolated and reported per-app.</p></div>
+      <div class="card"><h3>Two-phase wiring</h3><p>Layer 1 sets each app's auth; Layer 2 wires them together via REST APIs. Re-run Layer 2 alone anytime.</p></div>
+      <div class="card"><h3>Cert cache</h3><p>Caddy's Let's Encrypt store is AES-encrypted on uninstall and restored on reinstall — no rate-limit surprises.</p></div>
+      <div class="card"><h3>Service isolation</h3><p>ACLs are applied per app directory; the <code>secrets</code> folder is readable only by admins and the service account.</p></div>
+      <div class="card"><h3>Self-unblocking security</h3><p>Loopback, LAN ranges, Tailscale and your own public IP are whitelisted before CrowdSec can ever ban them.</p></div>
+      <div class="card"><h3>End-to-end sanity check</h3><p><code>sanity_check.py</code> drives the full Prowlarr → Radarr/Sonarr → Deluge → Jellyfin → Bazarr pipeline and reports pass/fail.</p></div>
+      <div class="card"><h3>Shared users</h3><p>Users defined once in <code>config.json</code> are created in both Jellyfin and Jellyseerr automatically.</p></div>
+      <div class="card"><h3>GPU profiles</h3><p>18 hardware transcoding profiles covering NVIDIA, AMD and Intel generations — or auto-detect with one script.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Getting started</h2>
+    <p class="sub">A clean Windows 10/11 machine, a domain, and about 15 minutes. No Docker required.</p>
+
+    <ol class="steps">
+      <li>
+        <strong>Clone the repo</strong>
+        <span>
+<pre><code><span class="cm"># PowerShell</span>
+git clone https://github.com/viperaxz/torrents-arr-us.git
+cd torrents-arr-us</code></pre>
+        </span>
+      </li>
+      <li>
+        <strong>Create your config</strong>
+        <span>
+<pre><code>Copy-Item config.json.example config.json
+notepad config.json   <span class="cm"># domain, admin password, media paths</span></code></pre>
+        </span>
+      </li>
+      <li>
+        <strong>Run the installer as Administrator</strong>
+        <span>
+<pre><code>.\master_install.ps1</code></pre>
+        </span>
+      </li>
+      <li>
+        <strong>Open the dashboard</strong>
+        <span>Point a browser at your domain — every app is reachable at its own subdomain
+        (Cloudflare mode) or path (DuckDNS mode).</span>
+      </li>
+    </ol>
+
+    <div class="warn">
+      <strong>Heads-up:</strong> <code>config.json</code> holds your API tokens and passwords and is
+      gitignored by default — never commit it. If you ever remove the install,
+      <code>.\master_uninstall.ps1</code> preserves your media files, torrent state and Caddy certificates.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Optional add-ons</h2>
+    <p class="sub">Flip one flag in <code>config.json</code> to enable them.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>Real-Debrid integration</h3>
+        <p>Set <code>"RealDebrid": true</code> plus your API key. Zurg exposes your RD library over WebDAV and rclone mounts it as <code>R:\</code> — Jellyfin gets a lean "RD Movies" library that streams without touching your disk.</p>
+      </div>
+      <div class="card">
+        <h3>Observability stack</h3>
+        <p>Set <code>"Grafana": true</code> to install Grafana + Loki + Alloy with pre-provisioned dashboards for every seedbox service — or run <code>grafana_enable.ps1</code> on an existing install.</p>
+      </div>
+      <div class="card">
+        <h3>Hardware transcoding</h3>
+        <p>Run <code>scripts\detect_gpu.ps1</code> to find your GPU family slug, drop it into <code>Layer2.Jellyfin.GPU</code>, and Jellyfin gets NVENC, AMF or QSV encoding tuned for your exact card.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>Docs: <a href="https://github.com/viperaxz/torrents-arr-us/blob/main/README.md">README</a> ·
+    <a href="https://github.com/viperaxz/torrents-arr-us/blob/main/TECHNICAL_OVERVIEW.md">Technical Overview</a> ·
+    <a href="https://github.com/viperaxz/torrents-arr-us/blob/main/LAYER2_GUIDE.md">Layer 2 Guide</a> ·
+    <a href="https://github.com/viperaxz/torrents-arr-us/blob/main/ROADMAP.md">Roadmap</a></p>
+    <p style="margin-top:12px;">Inspired by Swizzin. Built with PowerShell. Use responsibly — seed what you download.</p>
+  </div>
+</footer>
+
+</body>
+</html>

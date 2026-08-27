@@ -1,0 +1,146 @@
+{
+    storage file_system {
+        root "{$CADDY_DATA_DIR}"
+    }
+}
+
+# Caddyfile — DuckDNS path-based mode
+# Single host: domain.duckdns.org, all apps served under paths
+# Each app must have UrlBase/BaseUrl configured to match its path prefix.
+# TLS_BLOCK is replaced by the installer with either:
+#   tls internal                    (testing — Caddy local CA)
+#   tls {$TLS_EMAIL}               (production — Let's Encrypt HTTP-01)
+
+{$DUCKDNS_HOST} {
+    {$TLS_BLOCK}
+
+    log {
+        output file "{$INSTALL_DIR}/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+
+    # -- *Arr apps (UrlBase set on each app) --
+
+    handle /sonarr* {
+        reverse_proxy 127.0.0.1:{$SONARR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /radarr* {
+        reverse_proxy 127.0.0.1:{$RADARR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /prowlarr* {
+        reverse_proxy 127.0.0.1:{$PROWLARR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Bazarr — base_url=/bazarr set in config.ini
+    handle /bazarr* {
+        reverse_proxy 127.0.0.1:{$BAZARR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    handle /deluge* {
+        reverse_proxy 127.0.0.1:{$DELUGE_WEB_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Jellyseerr -- /jellyseerr prefix stripped before proxying.
+    # Next.js assets (/_next*), the API (/api*), and image proxies are routed
+    # directly to Jellyseerr because the browser requests them without the prefix.
+    handle_path /jellyseerr* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /_next* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /api* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /imageproxy* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /avatarproxy* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    # Jellyseerr has no basePath support -- server-side redirects send the browser
+    # to /login, /setup, etc. (without the /jellyseerr prefix). These handles ensure
+    # all Jellyseerr pages are reachable directly.
+    handle /login* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /setup* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /requests* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /profile* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /users* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /issues* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /blocklist* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+    handle /resetpassword* {
+        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Jellyfin — BaseUrl=/jellyfin set in network.xml
+    handle /jellyfin* {
+        reverse_proxy 127.0.0.1:{$JELLYFIN_PORT} {
+            header_up X-Real-IP {remote_host}
+            header_down -X-Frame-Options
+        }
+    }
+
+    # Dashboard at root — catches everything else (static HTML)
+    handle {
+        basic_auth {
+            {$ADMIN_USER} {$ADMIN_HASH_BCRYPT}
+        }
+        root * "{$INSTALL_DIR}/dashboard"
+        file_server
+    }
+}

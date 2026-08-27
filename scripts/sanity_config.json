@@ -1,0 +1,9 @@
+{
+  "SANITY_MOVIE":         "The Godfather",
+  "SANITY_MOVIE_YEAR":    1972,
+  "SANITY_SERIES":        "Friends",
+  "SANITY_SERIES_SEASON": 1,
+  "DownloadPollSecs":     300,
+  "ImportPollSecs":       1800,
+  "ImportPollInterval":   30
+}

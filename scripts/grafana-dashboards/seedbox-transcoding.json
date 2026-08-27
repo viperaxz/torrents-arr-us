@@ -1,0 +1,140 @@
+{
+  "uid": "seedbox-transcoding",
+  "title": "Seedbox - Transcoding",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "timezone": "browser",
+  "tags": ["seedbox", "jellyfin", "transcoding"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Transcode Sessions (range)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "count_over_time({job=\"jellyfin\"} |~ \"(?i)transcode\" |~ \"(?i)(starting|begin|session|job)\" [$__range])",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "fixedColor": "blue", "mode": "fixed" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Transcode Errors (range)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "count_over_time({job=\"jellyfin\"} |~ \"(?i)transcode\" |~ \"(?i)(error|fail|abort)\" [$__range])",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": { "fixedColor": "red", "mode": "fixed" }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "textMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Transcoding Activity Over Time",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "rate({job=\"jellyfin\"} |~ \"(?i)transcode\" [5m])",
+          "legendFormat": "transcode log events/s",
+          "refId": "A"
+        },
+        {
+          "expr": "rate({job=\"jellyfin\"} |~ \"(?i)(error|fatal|fail)\" [5m])",
+          "legendFormat": "errors/s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Transcoding Log Stream",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 16 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "{job=\"jellyfin\"} |~ \"(?i)transcode\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Jellyfin Errors",
+      "gridPos": { "x": 0, "y": 28, "w": 24, "h": 10 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "{job=\"jellyfin\"} |~ \"(?i)(error|critical|fatal)\"",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": true,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    }
+  ]
+}

@@ -1,0 +1,109 @@
+{
+  "uid": "seedbox-svc-crowdsec",
+  "title": "Seedbox - CrowdSec",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": { "from": "now-24h", "to": "now" },
+  "timezone": "browser",
+  "tags": ["seedbox", "crowdsec", "security"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Active Bans",
+      "description": "Ban decisions currently in effect. Authoritative count from the CrowdSec DB, pushed by the status collector.",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "last_over_time({job=\"health-check\", service=\"CrowdSec\"} | json | unwrap crowdsec_active_bans [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Alerts Raised (all time)",
+      "description": "All CrowdSec alerts held in the local DB. Authoritative count pushed by the status collector.",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "last_over_time({job=\"health-check\", service=\"CrowdSec\"} | json | unwrap crowdsec_total_alerts [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "orange", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Alerts (24h)",
+      "description": "CrowdSec alerts raised in the last 24 hours.",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "last_over_time({job=\"health-check\", service=\"CrowdSec\"} | json | unwrap crowdsec_alerts_24h [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "yellow", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Engine Errors (range)",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"crowdsec\", level=~\"error|fatal\"} [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "dark-red", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Bouncer Errors (range)",
+      "description": "Non-zero here means decisions may not be reaching Windows Firewall.",
+      "gridPos": { "x": 0, "y": 4, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"crowdsec-bouncer\", level=~\"error|fatal\"} [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "dark-red", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Detection Activity Over Time",
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "rate({job=\"crowdsec\"} |~ \"(?i)(ban|decision)\" [5m])", "legendFormat": "decisions/s", "refId": "A" },
+        { "expr": "rate({job=\"crowdsec\"} |~ \"(?i)alert\" [5m])", "legendFormat": "alerts/s", "refId": "B" },
+        { "expr": "rate({job=\"crowdsec\", level=~\"error|fatal\"} [5m])", "legendFormat": "engine errors/s", "refId": "C" },
+        { "expr": "rate({job=\"crowdsec-bouncer\", level=~\"error|fatal\"} [5m])", "legendFormat": "bouncer errors/s", "refId": "D" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 1, "fillOpacity": 10 } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 6,
+      "type": "logs",
+      "title": "CrowdSec Engine Log",
+      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 11 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [ { "expr": "{job=\"crowdsec\"}", "refId": "A" } ],
+      "options": { "showTime": true, "showLabels": false, "showCommonLabels": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    },
+    {
+      "id": 7,
+      "type": "logs",
+      "title": "Firewall Bouncer Log",
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 11 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [ { "expr": "{job=\"crowdsec-bouncer\"}", "refId": "A" } ],
+      "options": { "showTime": true, "showLabels": false, "showCommonLabels": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ]
+}

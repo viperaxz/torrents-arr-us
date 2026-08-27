@@ -1,0 +1,59 @@
+{
+  "uid": "seedbox-svc-caddy-access",
+  "title": "Seedbox - Caddy Access Logs",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "timezone": "browser",
+  "tags": ["seedbox", "caddy", "access"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "5xx Errors (range)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"caddy-access\", status=~\"5..\"} [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Requests (range)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"caddy-access\"} [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "green", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request Rate by Status Class",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "sum(rate({job=\"caddy-access\"}[5m]))", "legendFormat": "all requests/s", "refId": "A" },
+        { "expr": "sum(rate({job=\"caddy-access\", status=~\"4..\"} [5m]))", "legendFormat": "4xx/s", "refId": "B" },
+        { "expr": "sum(rate({job=\"caddy-access\", status=~\"5..\"} [5m]))", "legendFormat": "5xx/s", "refId": "C" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 1, "fillOpacity": 10 } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Access Log Stream",
+      "gridPos": { "x": 0, "y": 11, "w": 24, "h": 17 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [ { "expr": "{job=\"caddy-access\"} | json", "refId": "A" } ],
+      "options": { "showTime": true, "showLabels": false, "showCommonLabels": true, "wrapLogMessage": false, "prettifyLogMessage": true, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ]
+}

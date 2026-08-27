@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Seedbox</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;
+  --accent:#58a6ff;--text:#c9d1d9;--muted:#8b949e;
+  --green:#3fb950;--red:#f85149;--yellow:#d29922;--radius:10px}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;min-height:100vh}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:1rem 2rem;display:flex;align-items:center;gap:.75rem}
+.logo{width:28px;height:28px;flex-shrink:0}
+header h1{font-size:1.2rem;font-weight:600;letter-spacing:-.01em;flex:1}
+header .host{color:var(--muted);font-size:.85rem;margin-left:.4rem;font-weight:400}
+main{max-width:1100px;margin:2.5rem auto;padding:0 1.5rem}
+.section-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);font-weight:600;margin-bottom:1.2rem}
+/* App cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:1rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.5rem 1rem 1.25rem;text-align:center;text-decoration:none;color:var(--text);display:flex;flex-direction:column;align-items:center;gap:.6rem;transition:border-color .12s,box-shadow .12s}
+.card:hover{border-color:var(--accent);box-shadow:0 0 0 1px rgba(88,166,255,.2)}
+.badge{width:54px;height:54px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:.78rem;font-weight:700;letter-spacing:.04em}
+.app-name{font-size:.9rem;font-weight:500}
+/* Status panel */
+.status-panel{margin-top:2.5rem}
+.status-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.2rem}
+.status-header .section-label{margin-bottom:0}
+.status-meta{display:flex;align-items:center;gap:.75rem}
+#stats-updated{font-size:.72rem;color:var(--muted)}
+.btn-refresh{background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:6px;padding:.28rem .7rem;font-size:.75rem;cursor:pointer;transition:border-color .12s,color .12s;display:flex;align-items:center;gap:.35rem}
+.btn-refresh:hover{border-color:var(--accent);color:var(--accent)}
+.btn-refresh svg{width:13px;height:13px}
+.spin{animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* Stats grid */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}
+.stat-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:1.1rem 1.2rem}
+.stat-card-title{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);font-weight:600;margin-bottom:.85rem}
+/* Services */
+.svc-list{display:flex;flex-wrap:wrap;gap:.45rem .75rem}
+.svc{display:flex;align-items:center;gap:.3rem;font-size:.82rem}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-green{background:var(--green)}
+.dot-red{background:var(--red)}
+.dot-yellow{background:var(--yellow)}
+/* Drive bars */
+.drive{margin-bottom:.65rem}
+.drive:last-child{margin-bottom:0}
+.drive-header{display:flex;justify-content:space-between;font-size:.8rem;margin-bottom:.3rem}
+.drive-label{font-weight:500}
+.drive-size{color:var(--muted)}
+.bar-track{background:#21262d;border-radius:4px;height:6px;overflow:hidden}
+.bar-fill{height:100%;border-radius:4px;transition:width .3s}
+.bar-ok{background:var(--accent)}
+.bar-warn{background:var(--yellow)}
+.bar-crit{background:var(--red)}
+/* Media stats */
+.media-row{display:flex;gap:1.25rem;flex-wrap:wrap}
+.media-stat{display:flex;flex-direction:column;gap:.15rem}
+.media-num{font-size:1.4rem;font-weight:700;line-height:1;letter-spacing:-.02em}
+.media-lbl{font-size:.72rem;color:var(--muted)}
+/* Downloads */
+.dl-summary{display:flex;gap:1.5rem;margin-bottom:.75rem;flex-wrap:wrap}
+.dl-stat{display:flex;flex-direction:column;gap:.1rem}
+.dl-num{font-size:1.1rem;font-weight:600}
+.dl-lbl{font-size:.7rem;color:var(--muted)}
+.dl-item{margin-bottom:.5rem}
+.dl-item:last-child{margin-bottom:0}
+.dl-item-name{font-size:.78rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;margin-bottom:.25rem}
+.dl-item-bar{display:flex;align-items:center;gap:.5rem}
+.dl-item-bar .bar-track{flex:1}
+.dl-pct{font-size:.72rem;color:var(--muted);min-width:2.5rem;text-align:right}
+/* Security */
+.sec-row{display:flex;flex-direction:column;gap:.5rem}
+.sec-item{display:flex;align-items:center;justify-content:space-between;font-size:.82rem}
+.sec-key{color:var(--muted)}
+.sec-val{font-weight:500}
+.sec-ok{color:var(--green)}
+.sec-warn{color:var(--yellow)}
+.sec-off{color:var(--muted)}
+/* System */
+.sys-row{display:flex;gap:1.25rem;flex-wrap:wrap;margin-bottom:.75rem}
+/* Error / loading */
+.stats-msg{color:var(--muted);font-size:.85rem;padding:.5rem 0}
+footer{text-align:center;padding:2.5rem 1rem 1.5rem;color:var(--muted);font-size:.72rem}
+</style>
+</head>
+<body>
+<header>
+  <svg class="logo" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect width="24" height="24" rx="6" fill="#58a6ff" fill-opacity=".15"/>
+    <path d="M5 12h14M12 5l7 7-7 7" stroke="#58a6ff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <h1>Seedbox<span class="host">· {HOSTNAME}</span></h1>
+</header>
+<main>
+  <div class="section-label">Applications</div>
+  <div class="grid">
+{APP_CARDS}
+  </div>
+
+  <div class="status-panel">
+    <div class="status-header">
+      <div class="section-label">Server Status</div>
+      <div class="status-meta">
+        <span id="stats-updated"></span>
+        <button class="btn-refresh" id="btn-refresh" onclick="refreshStats()">
+          <svg id="refresh-icon" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 3a5 5 0 1 0 4.546 2.914.5.5 0 0 1 .908-.417A6 6 0 1 1 8 2v1z"/>
+            <path d="M8 4.466V.534a.25.25 0 0 1 .41-.192l2.36 1.966c.12.1.12.284 0 .384L8.41 4.658A.25.25 0 0 1 8 4.466z"/>
+          </svg>
+          Refresh
+        </button>
+      </div>
+    </div>
+    <div id="stats-content"><p class="stats-msg">Loading...</p></div>
+  </div>
+</main>
+<footer>win-seedbox &bull; {HOSTNAME}</footer>
+
+<script>
+var _lastData = null;
+
+function fmt(n, decimals) {
+  if (n == null) return '--';
+  return Number(n).toFixed(decimals != null ? decimals : 0);
+}
+
+function timeSince(isoStr) {
+  var d = new Date(isoStr);
+  var sec = Math.round((Date.now() - d.getTime()) / 1000);
+  if (sec < 5) return 'just now';
+  if (sec < 60) return sec + 's ago';
+  var min = Math.round(sec / 60);
+  if (min < 60) return min + 'm ago';
+  return Math.round(min / 60) + 'h ago';
+}
+
+function barClass(pct) {
+  if (pct >= 90) return 'bar-crit';
+  if (pct >= 75) return 'bar-warn';
+  return 'bar-ok';
+}
+
+function svcDot(status) {
+  if (status === 'Running') return 'dot-green';
+  if (status === 'Stopped') return 'dot-red';
+  return 'dot-yellow';
+}
+
+function renderStats(d) {
+  var html = '<div class="stats-grid">';
+
+  // Services
+  html += '<div class="stat-card"><div class="stat-card-title">Services</div><div class="svc-list">';
+  if (d.services && d.services.length) {
+    d.services.forEach(function(s) {
+      html += '<span class="svc"><span class="dot ' + svcDot(s.state) + '"></span>' + s.name + '</span>';
+    });
+  } else {
+    html += '<span class="stats-msg">No service data</span>';
+  }
+  html += '</div></div>';
+
+  // System
+  if (d.system && !d.system.error) {
+    var memPct = d.system.memory_percent || 0;
+    html += '<div class="stat-card"><div class="stat-card-title">System</div>';
+    html += '<div class="sys-row">';
+    html += '<div class="media-stat"><div class="media-num">' + fmt(d.system.uptime_hours, 1) + '<span style="font-size:.8rem;font-weight:400"> h</span></div><div class="media-lbl">Uptime</div></div>';
+    html += '<div class="media-stat"><div class="media-num">' + fmt(d.system.memory_used_gb, 1) + '<span style="font-size:.8rem;font-weight:400"> / ' + fmt(d.system.memory_total_gb, 1) + ' GB</span></div><div class="media-lbl">Memory</div></div>';
+    html += '</div>';
+    html += '<div class="bar-track"><div class="bar-fill ' + barClass(memPct) + '" style="width:' + memPct + '%"></div></div>';
+    html += '</div>';
+  }
+
+  // Storage (drives)
+  if (d.drives && d.drives.length) {
+    html += '<div class="stat-card"><div class="stat-card-title">Storage</div>';
+    d.drives.forEach(function(dr) {
+      var pct = dr.percent_used || 0;
+      html += '<div class="drive">';
+      html += '<div class="drive-header"><span class="drive-label">' + dr.drive.replace(/\\$/, '') + '</span><span class="drive-size">' + fmt(dr.free_gb, 1) + ' GB free / ' + fmt(dr.total_gb, 0) + ' GB</span></div>';
+      html += '<div class="bar-track"><div class="bar-fill ' + barClass(pct) + '" style="width:' + pct + '%"></div></div>';
+      html += '</div>';
+    });
+    html += '</div>';
+  }
+
+  // Media (Jellyfin is the real library; *arr numbers shown as the detail line)
+  var m = d.media;
+  if (m) {
+    var jf = m.jellyfin || {};
+    html += '<div class="stat-card"><div class="stat-card-title">Library</div><div class="media-row">';
+    html += '<div class="media-stat"><div class="media-num">' + (jf.movies != null ? jf.movies : '--') + '</div><div class="media-lbl">Movies</div></div>';
+    html += '<div class="media-stat"><div class="media-num">' + (jf.series != null ? jf.series : '--') + '</div><div class="media-lbl">Series</div></div>';
+    html += '<div class="media-stat"><div class="media-num">' + (jf.episodes != null ? jf.episodes : '--') + '</div><div class="media-lbl">Episodes</div></div>';
+    html += '</div>';
+    var arrNote = [];
+    if (m.movies_total != null) arrNote.push(m.movies_total + ' movies in Radarr (' + (m.movies_downloaded != null ? m.movies_downloaded : '--') + ' on disk)');
+    if (m.series_total != null) arrNote.push(m.series_total + ' shows in Sonarr, ' + (m.episodes_downloaded != null ? m.episodes_downloaded : '--') + '/' + (m.episodes_total != null ? m.episodes_total : '--') + ' episodes on disk');
+    if (arrNote.length) html += '<div class="media-lbl" style="margin-top:.55rem">' + arrNote.join(' - ') + '</div>';
+    html += '</div>';
+  }
+
+  // Downloads
+  var dl = d.downloads;
+  if (dl) {
+    html += '<div class="stat-card"><div class="stat-card-title">Downloads</div>';
+    if (dl.error) {
+      html += '<span class="stats-msg">' + (dl.error || 'Deluge unavailable') + '</span>';
+    } else {
+      html += '<div class="dl-summary">';
+      html += '<div class="dl-stat"><div class="dl-num">' + (dl.active != null ? dl.active : '--') + '</div><div class="dl-lbl">Active</div></div>';
+      html += '<div class="dl-stat"><div class="dl-num">' + (dl.download_speed_mbps != null ? fmt(dl.download_speed_mbps, 2) + ' MB/s' : '--') + '</div><div class="dl-lbl">Download</div></div>';
+      html += '<div class="dl-stat"><div class="dl-num">' + (dl.upload_speed_mbps != null ? fmt(dl.upload_speed_mbps, 2) + ' MB/s' : '--') + '</div><div class="dl-lbl">Upload</div></div>';
+      html += '</div>';
+      var dlNote = [];
+      if (dl.downloading != null) dlNote.push(dl.downloading + ' downloading');
+      if (dl.seeding != null) dlNote.push(dl.seeding + ' seeding');
+      if (dl.paused != null) dlNote.push(dl.paused + ' paused');
+      if (dl.total_torrents != null) dlNote.push(dl.total_torrents + ' total');
+      if (dl.incoming_ok != null) dlNote.push(dl.incoming_ok ? 'incoming: OK' : 'incoming: none');
+      if (dlNote.length) html += '<div class="media-lbl" style="margin-bottom:.45rem">' + dlNote.join(' - ') + '</div>';
+      if (dl.active_items && dl.active_items.length) {
+        dl.active_items.forEach(function(item) {
+          html += '<div class="dl-item">';
+          html += '<div class="dl-item-name" title="' + item.name + '">' + item.name + '</div>';
+          html += '<div class="dl-item-bar"><div class="bar-track"><div class="bar-fill bar-ok" style="width:' + item.progress + '%"></div></div><span class="dl-pct">' + item.progress + '%</span></div>';
+          html += '</div>';
+        });
+      }
+    }
+    html += '</div>';
+  }
+
+  // Security
+  var sec = d.security;
+  if (sec) {
+    html += '<div class="stat-card"><div class="stat-card-title">Security</div><div class="sec-row">';
+    html += '<div class="sec-item"><span class="sec-key">CrowdSec engine</span><span class="sec-val ' + (sec.crowdsec_running ? 'sec-ok' : 'sec-warn') + '">' + (sec.crowdsec_running ? 'Running' : (sec.crowdsec_running === false ? 'Stopped' : '--')) + '</span></div>';
+    html += '<div class="sec-item"><span class="sec-key">Firewall bouncer</span><span class="sec-val ' + (sec.bouncer_running ? 'sec-ok' : 'sec-warn') + '">' + (sec.bouncer_running ? 'Running' : (sec.bouncer_running === false ? 'Stopped' : '--')) + '</span></div>';
+    html += '<div class="sec-item"><span class="sec-key">Active bans</span><span class="sec-val ' + (sec.crowdsec_active_bans > 0 ? 'sec-ok' : 'sec-off') + '">' + (sec.crowdsec_active_bans != null ? sec.crowdsec_active_bans : '--') + '</span></div>';
+    html += '<div class="sec-item"><span class="sec-key">Alerts raised</span><span class="sec-val">' + (sec.crowdsec_total_alerts != null ? sec.crowdsec_total_alerts : '--') + '</span></div>';
+    if (sec.crowdsec_alerts_24h != null) {
+      html += '<div class="sec-item"><span class="sec-key">Alerts (24h)</span><span class="sec-val">' + sec.crowdsec_alerts_24h + '</span></div>';
+    }
+    var blTxt = '--';
+    if (sec.blocklist_active === true) {
+      blTxt = 'Active';
+      if (sec.blocklist_sources) blTxt += ' - ' + sec.blocklist_sources;
+      if (sec.blocklist_cidrs != null) blTxt += ' (' + sec.blocklist_cidrs + ' CIDRs)';
+      if (sec.blocklist_updated) blTxt += ' - updated ' + timeSince(sec.blocklist_updated);
+    } else if (sec.blocklist_active === false) {
+      blTxt = 'Inactive';
+    }
+    html += '<div class="sec-item"><span class="sec-key">Abuse blocklist</span><span class="sec-val ' + (sec.blocklist_active ? 'sec-ok' : 'sec-warn') + '">' + blTxt + '</span></div>';
+    html += '</div></div>';
+  }
+
+  html += '</div>';
+  document.getElementById('stats-content').innerHTML = html;
+  document.getElementById('stats-updated').textContent = 'Updated ' + timeSince(d.timestamp);
+}
+
+function refreshStats() {
+  var icon = document.getElementById('refresh-icon');
+  icon.classList.add('spin');
+  document.getElementById('btn-refresh').disabled = true;
+  fetch('./current_status.json?' + Date.now())
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(data) {
+      _lastData = data;
+      renderStats(data);
+    })
+    .catch(function() {
+      if (_lastData) {
+        renderStats(_lastData);
+      } else {
+        document.getElementById('stats-content').innerHTML = '<p class="stats-msg">Status data not yet available. The collector runs every 5 minutes.</p>';
+      }
+      document.getElementById('stats-updated').textContent = 'Could not refresh';
+    })
+    .finally(function() {
+      icon.classList.remove('spin');
+      document.getElementById('btn-refresh').disabled = false;
+    });
+}
+
+// Load on page open
+refreshStats();
+
+// Auto-refresh every 60 seconds
+setInterval(refreshStats, 60000);
+
+// Tick the "X ago" label every 30 seconds
+setInterval(function() {
+  if (_lastData) {
+    document.getElementById('stats-updated').textContent = 'Updated ' + timeSince(_lastData.timestamp);
+  }
+}, 30000);
+</script>
+</body>
+</html>

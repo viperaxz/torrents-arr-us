@@ -1,0 +1,10 @@
+config.json
+*.log
+.env
+bin/
+cert-cache/
+trash
+recyclarr/recyclarr.exe
+recyclarr/logs/
+recyclarr/secrets.yml
+recyclarr/*.xml

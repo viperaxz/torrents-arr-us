@@ -1,0 +1,117 @@
+{
+  "uid": "seedbox-errors",
+  "title": "Seedbox - Errors & Warnings",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "tags": ["seedbox", "errors"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Errors (range)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({job=~\".+\", level=~\"error|fatal|critical\"} [$__range]))",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "red", "mode": "fixed" },
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Warnings (range)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({job=~\".+\", level=~\"warn|warning\"} [$__range]))",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "orange", "mode": "fixed" },
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background"
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Error & Warning Rate by Service",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 8 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "sum by(job) (rate({job=~\".+\", level=~\"error|fatal|critical\"} [5m]))",
+          "legendFormat": "{{job}} errors",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by(job) (rate({job=~\".+\", level=~\"warn|warning\"} [5m]))",
+          "legendFormat": "{{job}} warnings",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 10 }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Recent Errors & Warnings",
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 16 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        {
+          "expr": "{job=~\".+\", level=~\"error|fatal|critical|warn|warning\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    }
+  ]
+}

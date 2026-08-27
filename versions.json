@@ -1,0 +1,106 @@
+﻿{
+  "schema": 1,
+  "updated": "2026-08-06",
+  "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
+  "apps": {
+    "Sonarr": {
+      "version": "v4.0.19.2979",
+      "source": "github",
+      "repo": "Sonarr/Sonarr",
+      "asset": "*win-x64.zip"
+    },
+    "Radarr": {
+      "version": "v6.3.0.10514",
+      "source": "github",
+      "repo": "Radarr/Radarr",
+      "asset": "*windows-core-x64*.zip"
+    },
+    "Prowlarr": {
+      "version": "v2.5.2.5491",
+      "source": "github",
+      "repo": "Prowlarr/Prowlarr",
+      "asset": "*windows-core-x64*.zip"
+    },
+    "Bazarr": {
+      "version": "v1.6.0",
+      "source": "github",
+      "repo": "morpheus65535/bazarr",
+      "asset": "bazarr.zip"
+    },
+    "Flaresolverr": {
+      "version": "v3.5.0",
+      "source": "github",
+      "repo": "FlareSolverr/FlareSolverr",
+      "asset": "flaresolverr_windows_x64.zip"
+    },
+
+    "Jellyseerr": {
+      "version": "v3.4.1",
+      "source": "github_source",
+      "repo": "Fallenbagel/jellyseerr",
+      "note": "Built from source (Node.js + pnpm). Update requires manual rebuild."
+    },
+    "Jellyfin": {
+      "version": "10.11.11",
+      "source": "chocolatey",
+      "package": "jellyfin"
+    },
+    "Deluge": {
+      "version": "2.1.1",
+      "source": "chocolatey",
+      "package": "deluge"
+    },
+    "ffmpeg": {
+      "version": "9.0.0",
+      "source": "chocolatey",
+      "package": "ffmpeg"
+    },
+    "Caddy": {
+      "version": "2.11.4",
+      "source": "chocolatey",
+      "package": "caddy"
+    },
+    "NSSM": {
+      "version": "2.24.101",
+      "source": "chocolatey",
+      "package": "nssm"
+    },
+    "Python312": {
+      "version": "3.12.10",
+      "source": "chocolatey",
+      "package": "python312"
+    },
+    "Grafana": {
+      "version": "latest",
+      "source": "dl.grafana.com",
+      "note": "Version resolved from grafana.com/api/grafana/versions/stable at install time. Binaries at dl.grafana.com/oss/release/"
+    },
+    "Loki": {
+      "version": "v3.7.6",
+      "source": "github",
+      "repo": "grafana/loki",
+      "asset": "loki-windows-amd64.exe.zip"
+    },
+    "Alloy": {
+      "version": "v1.18.1",
+      "source": "github",
+      "repo": "grafana/alloy",
+      "asset": "alloy-windows-amd64.exe.zip",
+      "note": "Grafana Alloy is the official successor to Promtail (EOL). Falls back to latest release if pinned version not found."
+    },
+    "Zurg": {
+      "version": "v1.0.0",
+      "source": "github",
+      "repo": "debridmediamanager/zurg-public",
+      "asset": "*windows*amd64*",
+      "note": "Real-Debrid WebDAV bridge. Requires a valid RealDebrid.ApiKey in config.json."
+    },
+    "rclone": {
+      "version": "v1.75.0",
+      "source": "github",
+      "repo": "rclone/rclone",
+      "asset": "*windows-amd64.zip",
+      "note": "Mounts Zurg WebDAV as a local drive. Requires WinFsp (installed automatically via Chocolatey)."
+    }
+  }
+}

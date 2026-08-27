@@ -1,0 +1,57 @@
+{
+  "uid": "seedbox-svc-flaresolverr",
+  "title": "Seedbox - FlareSolverr",
+  "schemaVersion": 39,
+  "version": 4,
+  "refresh": "30s",
+  "time": { "from": "now-3h", "to": "now" },
+  "timezone": "browser",
+  "tags": ["seedbox", "flaresolverr"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Errors (range)",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"flaresolverr\", level=~\"error|critical\"} [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "red", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Solved Challenges (range)",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "count_over_time({job=\"flaresolverr\"} |~ \"(?i)(solved|success)\" [$__range])", "refId": "A", "instant": true }
+      ],
+      "fieldConfig": { "defaults": { "color": { "fixedColor": "green", "mode": "fixed" }, "unit": "short", "noValue": "0" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "auto", "orientation": "auto" }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Log Volume by Level",
+      "gridPos": { "x": 0, "y": 4, "w": 24, "h": 7 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [
+        { "expr": "sum by(level) (rate({job=\"flaresolverr\"}[5m]))", "legendFormat": "{{level}}", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 1, "fillOpacity": 10 } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Log Stream",
+      "gridPos": { "x": 0, "y": 11, "w": 24, "h": 17 },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
+      "targets": [ { "expr": "{job=\"flaresolverr\"} | regexp `^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2} [A-Z]+\\s+(?P<message>.+)` | line_format \"{{.message}}\"", "refId": "A" } ],
+      "options": { "showTime": true, "showLabels": false, "showCommonLabels": true, "wrapLogMessage": true, "prettifyLogMessage": false, "enableLogDetails": true, "sortOrder": "Descending", "dedupStrategy": "none" }
+    }
+  ]
+}
