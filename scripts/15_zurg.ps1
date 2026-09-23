@@ -134,6 +134,7 @@ token: $RdApiKey
 port: $ZurgPort
 concurrent_workers: 32
 check_for_changes_every_secs: 15
+enable_repair: true
 enable_thorough_hash_check: false
 cache_network_test_results: true
 "@
