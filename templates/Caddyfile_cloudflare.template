@@ -133,3 +133,5 @@ deluge.{$DOMAIN} {
         header_up X-Real-IP {remote_host}
     }
 }
+
+{$LLM_BLOCK}

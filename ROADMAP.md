@@ -30,12 +30,15 @@ Design (final):
 
 Reference (current hand-made live config to be replaced): `llm.viperax.org` proxies `/v1/*` → `127.0.0.1:11434` behind a static Bearer check and `/` → Open WebUI at `127.0.0.1:9090`; Open WebUI, Ollama, and ComfyUI live as manual installs under `E:\MediaServer`.
 
-Open decisions:
-- ComfyUI (`img.viperax.org`) is also a manual Caddyfile addition — cover with a generic "extra subdomain proxy" feature or leave out of scope?
-- UI over the internet behind Caddy `basicauth`, or API-only exposure?
-- Confirm `BackendPort` default of 8081
+Decisions (resolved during implementation on `feature/update-strategy`):
+- ComfyUI stays out of scope (manual Caddyfile addition; revisit later as a generic "extra subdomain proxy")
+- UI exposed behind Caddy `basicauth` by default (`ExposeUi: true`); set `ExposeUi: false` for API-only
+- `BackendPort` default confirmed as 8081
+- DuckDNS mode is API-only at `/llm/v1` (backend UI does not support path prefixes)
 
 Out of scope: installing/updating Strata or any LLM, LLM web UI hosting, model management.
+
+Status: implemented on `feature/update-strategy` (install/uninstall validation cycle deferred at the user's request).
 
 ---
 

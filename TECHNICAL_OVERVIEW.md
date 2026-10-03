@@ -212,6 +212,12 @@ CrowdSec splits into two independent components, and **both are required** — t
 - **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads).
 - **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`).
 
+### Optional LLM Reverse Proxy (bring-your-own backend)
+- Enabled by `LLM.Enabled = true` in `config.json`; the project **never installs or manages the LLM itself** — the user runs the backend (Strata, Ollama, LM Studio, or any OpenAI-compatible server) separately, bound to loopback.
+- `01_webserver.ps1` renders a `llm.<domain>` server block (Cloudflare mode) or a `/llm/v1` API path (DuckDNS mode) pointing at `LLM.BackendHost:LLM.BackendPort` (default `127.0.0.1:8081` — port 8080 is CrowdSec LAPI's).
+- When `LLM.ApiKey` is set, Caddy requires `Authorization: Bearer <key>` on the API path (phone apps don't speak basic auth). When `LLM.ExposeUi = true` (Cloudflare mode), the backend UI is proxied behind Caddy `basicauth` using the admin credentials.
+- The LLM subdomain is added to the Cloudflare DNS updater and the cert-cache domain list, and the dashboard gets a card (Cloudflare mode). `collect_status.ps1` probes `<BackendHost>:<BackendPort>/health` and reports the LLM in the service list.
+
 ### Server Status Monitoring
 - `scripts/13_status.ps1` registers `Seedbox_Status_Collector` as a SYSTEM scheduled task that repeats every 5 minutes.
 - `scripts/collect_status.ps1` collects: system uptime and memory usage, per-drive free/used/total space, service running states for all seedbox services, active and waiting Deluge download counts, and security event counts.
@@ -275,6 +281,14 @@ CrowdSec splits into two independent components, and **both are required** — t
   "RealDebrid": {
     "ApiKey":      "...",  // Real-Debrid API key
     "MountLetter": "R"     // movies on R:\, shows on S:\
+  },
+  "LLM": {
+    "Enabled":      false,       // publish an externally managed LLM via Caddy
+    "Subdomain":    "llm",       // Cloudflare-mode subdomain
+    "BackendHost":  "127.0.0.1",  // LLM stays loopback-bound; Caddy is the only exposure
+    "BackendPort":  8081,         // NOT 8080 (CrowdSec LAPI)
+    "ApiKey":       "",          // optional Bearer gate on /v1/*
+    "ExposeUi":     true          // also proxy the UI (Caddy basicauth)
   },
   "Ports": {
     "Jellyfin": 8096, "Sonarr": 8989, "Radarr": 7878,
@@ -435,6 +449,7 @@ The most complex installer — sets up the entire public-facing layer.
 5. **Dashboard**: renders `templates/dashboard.html.template` with per-app card HTML and writes `dashboard/index.html`. URLs are generated for the active domain mode; only enabled apps get a card.
 6. **Caddyfile**: Renders `templates/Caddyfile_cloudflare.template` or `templates/Caddyfile_duckdns.template` by substituting all `{$TOKEN}` placeholders with real values (ports, domain, bcrypt hash, TLS block, data directory paths).
 7. **Caddy service**: Creates an NSSM service running under `seedbox-svc`, opens firewall rules for ports 80 and 443, starts the service, and waits to confirm it is running.
+8. **Optional LLM proxy**: when `LLM.Enabled` is true, renders a `llm.<domain>` server block (Cloudflare mode) or `/llm/v1` API path (DuckDNS mode) pointing at `LLM.BackendHost:LLM.BackendPort`, with an optional Bearer-key gate on the API and a basicauth-gated UI; adds the LLM subdomain to the DNS updater, cert-cache domain list, and dashboard cards. The LLM itself is never installed or managed.
 
 #### `scripts/02_jellyfin.ps1`
 - Installs Jellyfin via Chocolatey; if the package is already present but the service is missing, forces a reinstall.
@@ -732,6 +747,8 @@ Two templates exist depending on domain mode:
 | `Caddyfile_cloudflare.template` | Cloudflare | Each app on its own subdomain (`app.domain.com`) |
 | `Caddyfile_duckdns.template` | DuckDNS | All apps on path prefixes (`domain/app`) |
 | `Caddyfile.template` | Generic | Not currently used by installer |
+
+When `LLM.Enabled` is set, an extra `{$LLM_BLOCK}` placeholder renders the LLM proxy rules: `llm.<domain>` with a `/v1` bearer gate and basicauth-gated UI in Cloudflare mode; API-only `/llm/v1` in DuckDNS mode (the backend UI is not exposed in path mode).
 
 The Cloudflare Caddyfile illustrates the security split:
 - The **dashboard** (`domain.com`) is behind `basicauth`.

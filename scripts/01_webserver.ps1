@@ -27,6 +27,28 @@ Write-DebugLog "VAR CertCacheFile=$CertCacheFile (exists=$(Test-Path $CertCacheF
 Write-DebugLog "VAR SecretsDir=$SecretsDir"
 Write-DebugLog "VAR SvcUser=$SvcUser SvcPass=[REDACTED]"
 
+# -- LLM reverse proxy config (optional, externally managed backend) -----------
+$LlmEnabled   = $false
+$LlmSubdomain = "llm"
+$LlmHost      = "127.0.0.1"
+$LlmPort      = 8081
+$LlmApiKey    = ""
+$LlmExposeUi  = $true
+if ($Config.PSObject.Properties["LLM"]) {
+    $lc = $Config.LLM
+    if ($lc.PSObject.Properties["Enabled"] -and $lc.Enabled -eq $true) { $LlmEnabled = $true }
+    if ($lc.PSObject.Properties["Subdomain"] -and $lc.Subdomain) { $LlmSubdomain = [string]$lc.Subdomain }
+    if ($lc.PSObject.Properties["BackendHost"] -and $lc.BackendHost) { $LlmHost = [string]$lc.BackendHost }
+    if ($lc.PSObject.Properties["BackendPort"] -and $lc.BackendPort) { $LlmPort = [int]$lc.BackendPort }
+    if ($lc.PSObject.Properties["ApiKey"]) { $LlmApiKey = [string]$lc.ApiKey }
+    if ($lc.PSObject.Properties["ExposeUi"]) { $LlmExposeUi = $lc.ExposeUi -eq $true }
+}
+Write-DebugLog "VAR LLM enabled=$LlmEnabled backend=${LlmHost}:${LlmPort} subdomain=$LlmSubdomain exposeUi=$LlmExposeUi apiKeySet=$(-not [string]::IsNullOrWhiteSpace($LlmApiKey))"
+if ($LlmEnabled -and $LlmPort -eq 8080) {
+    Write-Warning "[WebServer] LLM.BackendPort is 8080 -- that port belongs to CrowdSec LAPI. Use 8081 for the LLM backend."
+    Write-DebugLog "WARN" "LLM.BackendPort=8080 conflicts with CrowdSec LAPI"
+}
+
 # Load ACL helpers from 00_service_account.ps1 if not already loaded
 if (-not (Get-Command Grant-SeedboxDirAccess -ErrorAction SilentlyContinue)) {
     Write-DebugLog "INFO" "Loading ACL helpers from 00_service_account.ps1..."
@@ -122,11 +144,13 @@ if ((Test-Path $CertCacheFile) -and $caddyDataEmpty) {
             $certStoreBase = Join-Path $CaddyDataDir "certificates"
             $expectedDomains = if ($DomainMode -eq "cloudflare") {
                 $d = $Config.General.Domain
-                @($d) + (
+                $appDoms = @(
                     @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr","Grafana") |
                     Where-Object { $Config.Apps.$_ -eq $true } |
                     ForEach-Object { "$($_.ToLower()).$d" }
                 )
+                if ($LlmEnabled) { $appDoms += "$($LlmSubdomain.ToLower()).$d" }
+                @($d) + $appDoms
             } else {
                 @($Config.General.DuckDnsDomain)
             }
@@ -235,6 +259,7 @@ if ($DomainMode -eq "cloudflare") {
         foreach ($k in @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr")) {
             if ($Config.Apps.$k -eq $true) { $cfSubdomains += "`"$($k.ToLower())`"" }
         }
+        if ($LlmEnabled) { $cfSubdomains += "`"$($LlmSubdomain.ToLower())`"" }
         $CfSubdomainLiteral = $cfSubdomains -join ","
         Write-DebugLog "VAR Cloudflare updater subdomains: $CfSubdomainLiteral"
 
@@ -430,6 +455,14 @@ if (-not (Test-Path $DashTemplatePath)) {
         $cards += "      <div class=`"app-name`">$($a.Name)</div>"
         $cards += "    </a>"
     }
+    if ($LlmEnabled -and $DomainMode -eq "cloudflare") {
+        $llmUrl = "https://$($LlmSubdomain.ToLower()).$cfgDomain"
+        $cards += "    <a href=`"$llmUrl`" class=`"card`" target=`"_blank`">"
+        $cards += "      <div class=`"badge`" style=`"background:#00d26a33;color:#00d26a`">LLM</div>"
+        $cards += "      <div class=`"app-name`">$($LlmSubdomain)</div>"
+        $cards += "    </a>"
+        Write-DebugLog "INFO" "LLM dashboard card added ($llmUrl)"
+    }
     Write-DebugLog "VAR dashboard enabled apps=$($enabledApps -join ',') cards=$($cards.Count) lines"
 
     $DashHtml = Get-Content -Raw -Path $DashTemplatePath -Encoding UTF8
@@ -474,6 +507,99 @@ Write-DebugLog "VAR SafeInstallDir=$SafeInstallDir"
 Write-DebugLog "VAR SafeCaddyDataDir=$SafeCaddyDataDir"
 Write-DebugLog "VAR Ports: Jellyfin=$($Config.Ports.Jellyfin) Sonarr=$($Config.Ports.Sonarr) Radarr=$($Config.Ports.Radarr) Prowlarr=$($Config.Ports.Prowlarr) Deluge=$($Config.Ports.Deluge) DelugeWeb=$($Config.Ports.DelugeWeb) Bazarr=$($Config.Ports.Bazarr)"
 
+# -- LLM reverse proxy block (rendered only when LLM.Enabled) ------------------
+$LlmBlock = ""
+if ($LlmEnabled) {
+    $LlmBackend = "${LlmHost}:${LlmPort}"
+    Write-DebugLog "INFO" "Building Caddy LLM block: backend=$LlmBackend mode=$DomainMode"
+
+    $LlmLog = @"
+    log {
+        output file "$SafeInstallDir/logs/caddy-access.log" {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format json
+    }
+"@
+
+    if ($DomainMode -eq "cloudflare") {
+        if ([string]::IsNullOrWhiteSpace($LlmApiKey)) {
+            $LlmApiHandle = @"
+    # /v1 -> LLM API (no Caddy bearer gate -- the backend's own key, if any, applies)
+    handle /v1/* {
+        reverse_proxy $LlmBackend {
+            header_up Host $LlmBackend
+        }
+    }
+"@
+        } else {
+            $LlmApiHandle = @"
+    # /v1 -> LLM API, Bearer key required (phone apps don't speak basic auth)
+    handle /v1/* {
+        @llmkey header Authorization "Bearer $LlmApiKey"
+        handle @llmkey {
+            reverse_proxy $LlmBackend {
+                header_up Host $LlmBackend
+            }
+        }
+        respond 401
+    }
+"@
+        }
+        $LlmUiPart = if ($LlmExposeUi) {
+@"
+    # UI -- backend's own web interface, gated by Caddy basicauth (LLM UIs ship no login)
+    basic_auth {
+        $AdminUsername $AdminBcryptHash
+    }
+    reverse_proxy $LlmBackend
+"@
+        } else {
+@"
+    # UI not exposed (LLM.ExposeUi=false)
+    respond 404
+"@
+        }
+        $LlmBlock = @"
+# Local LLM -- external backend (Strata, Ollama, LM Studio, any OpenAI-compatible server)
+$($LlmSubdomain.ToLower()).$($Config.General.Domain) {
+    $TlsBlock
+$LlmLog
+$LlmApiHandle
+$LlmUiPart
+}
+"@
+    } else {
+        if ([string]::IsNullOrWhiteSpace($LlmApiKey)) {
+            $LlmBlock = @"
+# Local LLM API -- external backend under /llm (UI not available in DuckDNS path mode)
+    handle_path /llm* {
+        reverse_proxy $LlmBackend {
+            header_up Host $LlmBackend
+        }
+    }
+"@
+        } else {
+            $LlmBlock = @"
+# Local LLM API -- external backend under /llm (UI not available in DuckDNS path mode)
+    handle_path /llm* {
+        @llmkey header Authorization "Bearer $LlmApiKey"
+        handle @llmkey {
+            reverse_proxy $LlmBackend {
+                header_up Host $LlmBackend
+            }
+        }
+        respond 401
+    }
+"@
+        }
+    }
+    Write-DebugLog "INFO" "LLM Caddy block built ($($LlmBlock.Length) chars)"
+} else {
+    Write-DebugLog "INFO" "LLM reverse proxy disabled; no LLM block rendered"
+}
+
 $Content = Get-Content -Raw -Path $TemplatePath -Encoding UTF8
 Write-DebugLog "VAR template raw size=$($Content.Length) chars"
 
@@ -500,6 +626,8 @@ if ($DomainMode -eq "cloudflare") {
     $Content  = $Content.Replace('{$DUCKDNS_HOST}', $DuckHost)
     Write-DebugLog "VAR substituted DUCKDNS_HOST=$DuckHost"
 }
+$Content = $Content.Replace('{$LLM_BLOCK}', $LlmBlock)
+Write-DebugLog "VAR LLM block rendered: size=$($LlmBlock.Length) chars"
 
 $CaddyfilePath = Join-Path $CaddyDir "Caddyfile"
 # BOM-free: the Caddyfile is parsed by Caddy (Go), not PowerShell. Set-Content
