@@ -64,13 +64,19 @@ foreach ($s in $scenarios) {
             $failures++; continue
         }
         $hostOverrides = ([regex]::Matches($block, 'header_up Host')).Count
-        $expectedHost  = if ($s.Ui) { 2 } else { 1 }
-        if ($hostOverrides -lt $expectedHost) {
+        $expectedHost  = if ($s.Ui) { if ($s.Key) { 4 } else { 2 } } else { 1 }
+        if ($hostOverrides -ne $expectedHost) {
             Write-Host "RESULT: FAIL (header_up Host count $hostOverrides, want $expectedHost)"
             $failures++; continue
         }
         if ($s.Ui) {
             if ($block -notmatch '(?m)^        basic_auth \{') { Write-Host 'RESULT: FAIL (basicauth not inside a handle block)'; $failures++; continue }
+            if ($s.Key) {
+                # the UI's own monitor calls (/metrics, /mcp) carry the Bearer key and must
+                # bypass basicauth via a SIBLING handle (basic_auth runs before nested handles).
+                if ($block -notmatch '(?m)^    @llmui header Authorization "Bearer secret123"') { Write-Host 'RESULT: FAIL (no site-level @llmui matcher for the UI)'; $failures++; continue }
+                if ($block -notmatch '(?m)^    handle @llmui \{') { Write-Host 'RESULT: FAIL (no sibling handle for the UI bearer key)'; $failures++; continue }
+            }
         } else {
             if ($block -notmatch '(?m)^        respond 404') { Write-Host 'RESULT: FAIL (404 not inside a handle block)'; $failures++; continue }
         }

@@ -554,6 +554,7 @@ if ($LlmEnabled) {
 "@
         }
         $LlmUiPart = if ($LlmExposeUi) {
+            if ([string]::IsNullOrWhiteSpace($LlmApiKey)) {
 @"
     # UI -- backend's own web interface, gated by Caddy basicauth (LLM UIs ship no login)
     handle {
@@ -565,6 +566,27 @@ if ($LlmEnabled) {
         }
     }
 "@
+            } else {
+@"
+    # UI -- backend's own web interface, gated by Caddy basicauth (LLM UIs ship no login).
+    # The UI's own /metrics and /mcp calls carry its Bearer key when one is set, so that
+    # key bypasses basicauth (basic_auth runs before nested handles -- keep it a sibling).
+    @llmui header Authorization "Bearer $LlmApiKey"
+    handle @llmui {
+        reverse_proxy $LlmBackend {
+            header_up Host $LlmBackend
+        }
+    }
+    handle {
+        basic_auth {
+            $AdminUsername $AdminBcryptHash
+        }
+        reverse_proxy $LlmBackend {
+            header_up Host $LlmBackend
+        }
+    }
+"@
+            }
         } else {
 @"
     # UI not exposed (LLM.ExposeUi=false) -- catch-all handle, so the /v1 API route is untouched
