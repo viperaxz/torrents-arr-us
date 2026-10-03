@@ -216,6 +216,7 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Enabled by `LLM.Enabled = true` in `config.json`; the project **never installs or manages the LLM itself** — the user runs the backend (Strata, Ollama, LM Studio, or any OpenAI-compatible server) separately, bound to loopback.
 - `01_webserver.ps1` renders a `llm.<domain>` server block (Cloudflare mode) or a `/llm/v1` API path (DuckDNS mode) pointing at `LLM.BackendHost:LLM.BackendPort` (default `127.0.0.1:8081` — port 8080 is CrowdSec LAPI's).
 - When `LLM.ApiKey` is set, Caddy requires `Authorization: Bearer <key>` on the API path (phone apps don't speak basic auth). When `LLM.ExposeUi = true` (Cloudflare mode), the backend UI is proxied behind Caddy `basicauth` using the admin credentials.
+- **Strata note**: if the backend is Strata and its UI is exposed, add the published URL to the Strata config's `cors_origins` (e.g. `https://llm.example.com`) — otherwise the server refuses the browser page's chat requests. Caddy forwards the browser's `Origin`, so the UI path is only usable once that origin is trusted.
 - The LLM subdomain is added to the Cloudflare DNS updater and the cert-cache domain list, and the dashboard gets a card (Cloudflare mode). `collect_status.ps1` probes `<BackendHost>:<BackendPort>/health` and reports the LLM in the service list.
 
 ### Server Status Monitoring
