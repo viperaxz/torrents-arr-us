@@ -5,6 +5,40 @@ RULE FOR AI 2: COMMIT ONLY AFTER A FULL UNINSTALL -> DO CHANGES -> FULLY INSTALL
 
 ## Upcoming
 
+### Priority 0 — LLM reverse proxy (bring-your-own LLM)
+
+Expose an externally managed LLM server (Strata, Ollama, LM Studio, any OpenAI-compatible backend) over the internet through the project's Caddy setup — **without the project installing or managing the LLM itself**. The user installs and runs the LLM separately; the project only publishes it.
+
+Rationale: the current `llm.viperax.org` / Open WebUI setup is a manual, hand-edited Caddyfile addition that is wiped on every reinstall. This feature makes it a first-class, config-driven, reinstall-safe part of the seedbox.
+
+Design (final):
+
+- **Config** — new `LLM` section in `config.json.example`, disabled by default:
+  - `Enabled: false`
+  - `Subdomain: "llm"` — Cloudflare-mode subdomain
+  - `BackendHost: "127.0.0.1"` — backend always stays loopback-bound; Caddy is the only exposure
+  - `BackendPort: 8081` — deliberately NOT 8080 (CrowdSec LAPI owns 8080)
+  - `ApiKey: ""` — if set, Caddy requires `Authorization: Bearer <key>` on `/v1/*` (works for phone apps that don't speak basic auth; satisfies Strata's "never expose without a key" rule)
+  - `ExposeUi: true` — also proxy the backend UI at `/`
+- **Caddy templates** — conditional LLM server block rendered only when `LLM.Enabled`:
+  - Cloudflare mode: `llm.<domain>` with `handle /v1/*` (bearer gate) and the UI behind `basicauth` (Strata's built-in UI has no login; Caddy's bcrypt-hashed admin credentials are the gate)
+  - DuckDNS mode: API-only (`/llm/v1/*`) — Strata's UI does not support path prefixes (same class of problem as Jellyseerr); document UI as Cloudflare-mode only
+- **`01_webserver.ps1`** — renders the block from config; adds `llm` to the Cloudflare DNS updater `$Subdomains` when enabled. No new firewall rules (Caddy 80/443 already open)
+- **Monitoring** — `collect_status.ps1` health probe `GET /health` on `127.0.0.1:<BackendPort>` + dashboard card when enabled
+- **Docs** — `TECHNICAL_OVERVIEW.md` + `README.md` section: "Optional LLM proxy — pair with Strata (`--port 8081`, keep `--host 127.0.0.1`, set `--api-key`) or any OpenAI-compatible backend"
+- **Uninstaller** — nothing to remove (Caddyfile is regenerated); explicitly document that the user's external LLM install is never touched by the project
+
+Reference (current hand-made live config to be replaced): `llm.viperax.org` proxies `/v1/*` → `127.0.0.1:11434` behind a static Bearer check and `/` → Open WebUI at `127.0.0.1:9090`; Open WebUI, Ollama, and ComfyUI live as manual installs under `E:\MediaServer`.
+
+Open decisions:
+- ComfyUI (`img.viperax.org`) is also a manual Caddyfile addition — cover with a generic "extra subdomain proxy" feature or leave out of scope?
+- UI over the internet behind Caddy `basicauth`, or API-only exposure?
+- Confirm `BackendPort` default of 8081
+
+Out of scope: installing/updating Strata or any LLM, LLM web UI hosting, model management.
+
+---
+
 ### Priority 1 — Setup wizard
 
 A first-time user should be able to go from a blank Windows machine to a fully configured seedbox by running one script and answering prompts — no JSON editing, no documentation reading, no prior knowledge of the apps involved.
