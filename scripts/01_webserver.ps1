@@ -537,6 +537,12 @@ if ($LlmEnabled) {
             $LlmApiHandle = @"
     # /v1 -> LLM API, Bearer key required (phone apps don't speak basic auth)
     handle /v1/* {
+        @preflight method OPTIONS
+        handle @preflight {
+            reverse_proxy $LlmBackend {
+                header_up Host $LlmBackend
+            }
+        }
         @llmkey header Authorization "Bearer $LlmApiKey"
         handle @llmkey {
             reverse_proxy $LlmBackend {
@@ -590,6 +596,12 @@ $LlmUiPart
             $LlmBlock = @"
 # Local LLM API -- external backend under /llm (UI not available in DuckDNS path mode)
     handle_path /llm* {
+        @preflight method OPTIONS
+        handle @preflight {
+            reverse_proxy $LlmBackend {
+                header_up Host $LlmBackend
+            }
+        }
         @llmkey header Authorization "Bearer $LlmApiKey"
         handle @llmkey {
             reverse_proxy $LlmBackend {

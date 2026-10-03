@@ -76,6 +76,12 @@ foreach ($s in $scenarios) {
         }
     }
 
+    # 3. CORS preflights (OPTIONS) never carry credentials, so a bearer-gated API
+    #    must pass them through (Chatbox and other webview clients preflight).
+    if ($s.Key) {
+        if ($block -notmatch '@preflight method OPTIONS') { Write-Host 'RESULT: FAIL (no OPTIONS preflight passthrough on keyed API)'; $failures++; continue }
+    }
+
     # build a validate-able Caddyfile around the block
     $tmp = Join-Path $env:TEMP "strata_llm_$($s.Name).Caddyfile"
     if ($s.Mode -eq 'cloudflare') {
