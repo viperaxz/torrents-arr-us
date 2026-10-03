@@ -52,6 +52,30 @@ foreach ($s in $scenarios) {
     Write-Host $block
     if ([string]::IsNullOrWhiteSpace($block)) { Write-Host "RESULT: FAIL (empty block)"; $failures++; continue }
 
+    # Regression guards for two Caddy semantics bugs found in live testing:
+    #  1. site-level trailing directives (basic_auth/respond 404) wrap the handle
+    #     routes, so the bearer-gated /v1 API would get a Basic challenge.
+    #  2. the UI reverse_proxy must override Host to the backend (Strata rejects
+    #     foreign Host headers with 403).
+    if ($s.Mode -eq 'cloudflare') {
+        $trailing = [regex]::Matches($block, '(?m)^    (basic_auth \{|respond 404)\s*$')
+        if ($trailing.Count -gt 0) {
+            Write-Host "RESULT: FAIL (site-level trailing directive: $($trailing[0].Value.Trim()))"
+            $failures++; continue
+        }
+        $hostOverrides = ([regex]::Matches($block, 'header_up Host')).Count
+        $expectedHost  = if ($s.Ui) { 2 } else { 1 }
+        if ($hostOverrides -lt $expectedHost) {
+            Write-Host "RESULT: FAIL (header_up Host count $hostOverrides, want $expectedHost)"
+            $failures++; continue
+        }
+        if ($s.Ui) {
+            if ($block -notmatch '(?m)^        basic_auth \{') { Write-Host 'RESULT: FAIL (basicauth not inside a handle block)'; $failures++; continue }
+        } else {
+            if ($block -notmatch '(?m)^        respond 404') { Write-Host 'RESULT: FAIL (404 not inside a handle block)'; $failures++; continue }
+        }
+    }
+
     # build a validate-able Caddyfile around the block
     $tmp = Join-Path $env:TEMP "strata_llm_$($s.Name).Caddyfile"
     if ($s.Mode -eq 'cloudflare') {

@@ -550,15 +550,21 @@ if ($LlmEnabled) {
         $LlmUiPart = if ($LlmExposeUi) {
 @"
     # UI -- backend's own web interface, gated by Caddy basicauth (LLM UIs ship no login)
-    basic_auth {
-        $AdminUsername $AdminBcryptHash
+    handle {
+        basic_auth {
+            $AdminUsername $AdminBcryptHash
+        }
+        reverse_proxy $LlmBackend {
+            header_up Host $LlmBackend
+        }
     }
-    reverse_proxy $LlmBackend
 "@
         } else {
 @"
-    # UI not exposed (LLM.ExposeUi=false)
-    respond 404
+    # UI not exposed (LLM.ExposeUi=false) -- catch-all handle, so the /v1 API route is untouched
+    handle {
+        respond 404
+    }
 "@
         }
         $LlmBlock = @"
