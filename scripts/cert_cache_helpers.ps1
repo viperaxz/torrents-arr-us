@@ -139,3 +139,95 @@ function Restore-CaddyData {
         Write-DebugLog "VAR tmpZip removed"
     }
 }
+
+# -- CA-aware certificate store classification ---------------------------------
+# Caddy stores an acquired certificate under certificates\<CA directory>\<name>,
+# where the CA directory is derived from the ACME directory URL by stripping the
+# scheme and replacing every '/' with '-'. So
+#   https://acme-v02.api.letsencrypt.org/directory
+# becomes
+#   acme-v02.api.letsencrypt.org-directory
+# Staging and production therefore live in *separate* trees, and a certificate
+# for the right name under the wrong CA is not reusable: Caddy only looks under
+# the CA it is currently configured for, does not find it, and places a new
+# order. Reporting such a certificate as "cached" would hide the fact that a real
+# Let's Encrypt request is about to happen.
+
+function Get-CaddyCaStorageDir {
+    param([string]$AcmeDirectoryUrl)
+    if ([string]::IsNullOrWhiteSpace($AcmeDirectoryUrl)) { return $null }
+    return (($AcmeDirectoryUrl -replace '^https?://', '').TrimEnd('/') -replace '/', '-')
+}
+
+# The ACME directory Caddy uses for each TlsMode. Only the staging mode sets an
+# explicit 'ca' in the Caddyfile; 'letsencrypt' uses Caddy's default, which is
+# the production directory. Returns $null for any mode that involves no ACME CA.
+function Get-CaddyCaInfo {
+    param([string]$TlsMode)
+    $url = switch ($TlsMode) {
+        'letsencrypt'         { 'https://acme-v02.api.letsencrypt.org/directory' }
+        'letsencrypt-staging' { 'https://acme-staging-v02.api.letsencrypt.org/directory' }
+        default               { $null }
+    }
+    if (-not $url) { return $null }
+    return [PSCustomObject]@{
+        Url   = $url
+        Dir   = Get-CaddyCaStorageDir -AcmeDirectoryUrl $url
+        Label = if ($TlsMode -eq 'letsencrypt-staging') { "Let's Encrypt staging" } else { "Let's Encrypt production" }
+    }
+}
+
+# Classifies each expected domain against the restored certificate store:
+#   Cached  -- present under the CA the current TlsMode will use (reusable)
+#   WrongCa -- present, but under a different CA (Caddy will place a new order)
+#   Missing -- not present at all
+# With $ExpectedCaDir = $null the caller cannot name the CA, so "present under any
+# CA" counts as cached -- the behaviour that existed before this check was made
+# CA-aware.
+function Get-CertCacheStatus {
+    param(
+        [string]$CertStoreBase,
+        [string[]]$Domains,
+        [string]$ExpectedCaDir
+    )
+    $cached      = @()
+    $wrongCa     = @()
+    $wrongCaDirs = @()
+    $missing     = @()
+    # Paths are built with string concatenation, never Join-Path, and '-Directory' is
+    # only used behind a Test-Path guard. Both Join-Path (DriveNotFoundException) and
+    # the '-Directory' dynamic parameter fail on a drive that does not exist, and this
+    # runs under ErrorActionPreference=Stop -- an exception here would abort the
+    # install over what is only a diagnostic message.
+    $base = if ([string]::IsNullOrWhiteSpace($CertStoreBase)) { '' } else { $CertStoreBase.TrimEnd('\', '/') }
+    $otherCaDirs = @()
+    if ($base -and (Test-Path -LiteralPath $base -ErrorAction SilentlyContinue)) {
+        $otherCaDirs = @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue |
+                            Where-Object { -not $ExpectedCaDir -or $_.Name -ne $ExpectedCaDir })
+    }
+
+    foreach ($d in @($Domains)) {
+        if (-not $d) { continue }
+        $underExpected = [bool]($base -and $ExpectedCaDir -and
+            (Test-Path -LiteralPath "$base\$ExpectedCaDir\$d" -ErrorAction SilentlyContinue))
+        $otherHit      = @($otherCaDirs | Where-Object {
+            Test-Path -LiteralPath ($_.FullName + '\' + $d) -ErrorAction SilentlyContinue
+        })
+        if ($underExpected -or ((-not $ExpectedCaDir) -and $otherHit.Count -gt 0)) {
+            $cached += $d
+        } elseif ($otherHit.Count -gt 0) {
+            $wrongCa += $d
+            foreach ($h in $otherHit) {
+                if ($wrongCaDirs -notcontains $h.Name) { $wrongCaDirs += $h.Name }
+            }
+        } else {
+            $missing += $d
+        }
+    }
+    return [PSCustomObject]@{
+        Cached      = @($cached)
+        WrongCa     = @($wrongCa)
+        WrongCaDirs = @($wrongCaDirs)
+        Missing     = @($missing)
+    }
+}

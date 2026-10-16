@@ -110,7 +110,7 @@ Internet
 - Generated from templates at install time using token substitution.
 - Supports three TLS modes: `letsencrypt` (production ACME), `letsencrypt-staging` (staging ACME), and `internal` (Caddy local CA, for LAN-only use).
 - Admin credentials are hashed with bcrypt via `caddy hash-password` and embedded in the Caddyfile.
-- **Cert cache**: On uninstall the Caddy cert store (`caddy-data/`) is AES-256-CBC encrypted and saved to `cert-cache/caddy-data.enc`. On reinstall, this is decrypted and restored, avoiding unnecessary Let's Encrypt certificate reissuance.
+- **Cert cache**: On uninstall the Caddy cert store (`caddy-data/`) is AES-256-CBC encrypted and saved to `cert-cache/caddy-data.enc`. On reinstall, this is decrypted and restored, avoiding unnecessary Let's Encrypt certificate reissuance. The restore is then validated against the configured `TlsMode`: Caddy files each certificate under a directory named after its ACME endpoint (`acme-v02.api.letsencrypt.org-directory` for production, `acme-staging-v02.api.letsencrypt.org-directory` for staging), so a certificate cached under a *different* CA is reported as not reusable and Caddy will place a genuinely new order. This matters when switching between staging and production, because only a production order counts against the Let's Encrypt rate limit.
 
 ### Reinstall-Safe Data
 - **Deluge torrent state**: on uninstall, `Deluge-data\state` is copied to `%LOCALAPPDATA%\win-seedbox\deluge-state-backup`; `07_deluge.ps1` restores it before the service first starts on reinstall.

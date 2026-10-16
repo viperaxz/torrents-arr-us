@@ -166,19 +166,35 @@ if ((Test-Path $CertCacheFile) -and $caddyDataEmpty) {
             }
             Write-DebugLog "VAR cert check expectedDomains=$($expectedDomains -join ', ')"
 
-            $missingDomains = @($expectedDomains | Where-Object {
-                -not (Test-Path (Join-Path $certStoreBase "*\$_"))
-            })
-            Write-DebugLog "VAR cert check missingDomains=$($missingDomains -join ', ')"
-
-            if ($missingDomains.Count -gt 0) {
-                Write-Host "  -> Cert cache restored (ACME account preserved)." -ForegroundColor Green
-                Write-Host "  -> Certs not yet in cache: $($missingDomains -join ', ')." -ForegroundColor Yellow
-                Write-Host "  -> Caddy will request them on first start (port 80/443 must be reachable)." -ForegroundColor Yellow
-                Write-DebugLog "WARN" "Cert cache: ACME account present, certs missing=$($missingDomains -join ', '). Caddy will obtain them."
+            # A cached certificate is only reusable if it sits under the CA this
+            # TlsMode will use -- staging and production are separate trees, so a
+            # staging certificate does not satisfy a production run.
+            $caInfo = Get-CaddyCaInfo -TlsMode $TlsMode
+            if (-not $caInfo) {
+                # An unrecognised TlsMode renders as 'tls internal', which involves no
+                # ACME CA, so there is nothing meaningful to assert about the cache.
+                Write-Host "  -> Cert cache restored to $CaddyDataDir (TlsMode '$TlsMode' uses no ACME CA)." -ForegroundColor DarkGray
+                Write-DebugLog "WARN" "Cert cache: TlsMode='$TlsMode' maps to no ACME CA; cache validation skipped"
             } else {
-                Write-Host "  -> Cert cache valid: all $($expectedDomains.Count) domain(s) cached." -ForegroundColor Green
-                Write-DebugLog "INFO" "Cert cache valid: $($expectedDomains -join ', ')"
+                Write-DebugLog "VAR cert check caDir=$($caInfo.Dir) caUrl=$($caInfo.Url)"
+                $status = Get-CertCacheStatus -CertStoreBase $certStoreBase -Domains $expectedDomains `
+                                              -ExpectedCaDir $caInfo.Dir
+                Write-DebugLog "VAR cert check cached=$($status.Cached -join ', ') wrongCa=$($status.WrongCa -join ', ') missing=$($status.Missing -join ', ')"
+
+                if ($status.WrongCa.Count -gt 0 -or $status.Missing.Count -gt 0) {
+                    Write-Host "  -> Cert cache restored (ACME account preserved)." -ForegroundColor Green
+                    if ($status.WrongCa.Count -gt 0) {
+                        Write-Host "  -> Cached under a different CA ($($status.WrongCaDirs -join ', ')), so not reusable: $($status.WrongCa -join ', ')" -ForegroundColor Yellow
+                    }
+                    if ($status.Missing.Count -gt 0) {
+                        Write-Host "  -> Not in the cache at all: $($status.Missing -join ', ')" -ForegroundColor Yellow
+                    }
+                    Write-Host "  -> Caddy will request $($caInfo.Label) certificate(s) on first start (port 80/443 must be reachable)." -ForegroundColor Yellow
+                    Write-DebugLog "WARN" "Cert cache: issuing needed from $($caInfo.Label) for missing=[$($status.Missing -join ', ')] wrongCA=[$($status.WrongCa -join ', ')]"
+                } else {
+                    Write-Host "  -> Cert cache valid: all $($expectedDomains.Count) domain(s) cached for $($caInfo.Label)." -ForegroundColor Green
+                    Write-DebugLog "INFO" "Cert cache valid for $($caInfo.Label): $($expectedDomains -join ', ')"
+                }
             }
         } else {
             Write-Host "  -> Cert cache restored to $CaddyDataDir" -ForegroundColor Green
