@@ -23,21 +23,21 @@ A fully automated, Swizzin-inspired **Windows media server installer** written i
 | **CrowdSec** | Intrusion detection (log parsing + ban decisions) | 8080 (LAPI, internal) |
 | **CrowdSec FW bouncer** | Intrusion prevention (Windows Firewall enforcement) | — |
 | **Zurg** | Real-Debrid WebDAV bridge (optional) | — (internal) |
-| **rclone** | Mounts Zurg as local drive letters (optional) | — |
+| **rclone** | Mounts Zurg as a local drive letter (optional) | — |
 
 ## Domain Modes
 
 | Mode | Routing | DNS |
 |---|---|---|
 | **Cloudflare** | Each app on its own subdomain (`sonarr.yourdomain.com`) | Cloudflare API |
-| **DuckDNS** | All apps on path prefixes (`yourdomain.duckdns.org/sonarr`) | DuckDNS API |
+| **DuckDNS** | All apps on path prefixes (`yourdomain.duckdns.org/sonarr`); Jellyseerr on the root and the dashboard at `/dashboard` | DuckDNS API |
 
 ## Features
 
 - **Zero-touch install**: bootstraps Chocolatey if absent, installs NSSM and all dependencies automatically — no manual prerequisite setup required.
 - **Idempotent**: lock files prevent re-running installers; `master_install.ps1` is safe to run again.
 - **Two-phase configuration**: Layer 1 sets up each app's authentication; Layer 2 wires apps together (download clients, root folders, indexers, media libraries, subtitle providers, quality profiles).
-- **Service isolation**: dedicated `seedbox-svc` Windows account with no admin rights; each app only accesses its own data directory.
+- **Service isolation**: dedicated `seedbox-svc` Windows account with no admin rights; each app only accesses its own data directory, and the install tree is administrator-managed (write access inside it is denied to normal users except for the media paths — see [Install directory permissions](#install-directory-permissions)).
 - **TLS**: Let's Encrypt production/staging or Caddy internal CA for LAN-only setups.
 - **Cert cache**: Caddy's certificate store is AES-256 encrypted on uninstall and restored on reinstall — no unnecessary certificate reissuance.
 - **Reinstall-safe app data**: the Deluge torrent state and the Sonarr/Radarr databases (monitored shows/movies, history, settings) are backed up on uninstall and restored automatically on reinstall.
@@ -46,18 +46,18 @@ A fully automated, Swizzin-inspired **Windows media server installer** written i
 - **Subtitle automation**: Bazarr pre-configured with subtitle providers and language profiles (English + Romanian out of the box, easily adjusted).
 - **Dynamic DNS**: a scheduled task under `seedbox-svc` updates your public IP every 5 minutes.
 - **Cloudflare bypass**: Flaresolverr runs as a local Windows service and is registered with Prowlarr automatically — unlocks CF-protected trackers with no per-indexer setup.
-- **Public indexers**: 18+ free public trackers (1337x, Nyaa.si, TPB, and more) are added to Prowlarr during Layer 2.
+- **Public indexers**: the enabled entries of `Layer2.Prowlarr.Indexers` (8 of the 12 shipped in `config.json.example`) are added to Prowlarr during Layer 2.
 - **Media request portal**: Jellyseerr is installed and fully wired to Jellyfin, Sonarr, and Radarr — users request movies/shows through a Netflix-style UI without ever touching the *arr apps directly.
 - **Shared user provisioning**: users defined once in `config.json` are created in both Jellyfin and Jellyseerr automatically; no duplicate admin work across apps.
 - **Debug logging**: opt-in structured log file (`General.DebugLogging: true`) capturing every phase, variable, and API call for post-install diagnosis.
 - **End-to-end sanity check**: `scripts/sanity_check.py` drives the full Prowlarr → Radarr/Sonarr → Deluge → Jellyfin → Bazarr pipeline and reports pass/fail for each stage.
 - **Security layer**: CrowdSec parses the Caddy access log and the Windows Security event log to detect HTTP attacks and RDP/SMB brute force, and its Windows Firewall bouncer enforces the resulting bans; your current WAN IP stays whitelisted automatically even as it rotates (dynamic IP safe); Spamhaus + Firehol abuse blocklists refreshed every 6 hours.
 - **Jellyfin season repair**: `scripts/sonarr_jellyfin_refresh.py` is a Sonarr Custom Script hook that auto-fixes the Jellyfin season hierarchy bug that occurs when metadata is still loading at import time.
-- **Real-Debrid integration** (optional): Zurg exposes your RD library as a local WebDAV server; rclone mounts it on a drive letter for movies; Jellyfin lean libraries are provisioned pointing at that drive with video extraction disabled to avoid bandwidth thrashing. TV shows cannot be reliably separated from movies via the Zurg WebDAV layer, so only a Movies library is provisioned.
+- **Real-Debrid integration** (optional): Zurg exposes your RD library as a local WebDAV server that is loopback-only by design (the endpoint is unauthenticated, so it never listens on the LAN); rclone mounts it on a single drive letter for movies; Jellyfin lean libraries are provisioned pointing at that drive with video extraction disabled to avoid bandwidth thrashing. TV shows cannot be reliably separated from movies via the Zurg WebDAV layer, so only a Movies library is provisioned.
 - **Observability stack** (optional): Grafana + Loki + Alloy installed as Windows services; Alloy ships structured logs from every seedbox service to Loki; Grafana is pre-provisioned with the Loki data source and bundled dashboards. Enable with `Apps.Grafana: true` or run `grafana_enable.ps1` on an existing install.
 - **LLM reverse proxy** (optional): publish an externally managed LLM backend (Strata, Ollama, LM Studio, or any OpenAI-compatible server) through Caddy — the project never installs or updates the LLM itself. `LLM.Enabled: true` adds a `llm.<domain>` subdomain (Cloudflare mode) or a `/llm/v1` API path (DuckDNS mode), an optional Bearer-key gate on the API (`LLM.ApiKey`), and a basicauth-gated UI when `LLM.ExposeUi: true`.
 - **Server status monitoring**: a `Seedbox_Status_Collector` scheduled task runs every 5 minutes to collect uptime, memory, drive usage, service states, and download stats into `dashboard/current_status.json` for the dashboard UI.
-- **Prowlarr private tracker support**: each indexer in `Layer2.Prowlarr.Indexers` has an `Enabled` flag; private trackers (FileList, IPTorrents, RuTracker, TorrentLeech) accept per-indexer `Credentials` and `SeedRules`.
+- **Prowlarr private tracker support**: each indexer in `Layer2.Prowlarr.Indexers` has an `Enabled` flag — only an explicit `false` skips it, a missing flag means enabled; private trackers (FileList, IPTorrents, RuTracker, TorrentLeech) accept per-indexer `Credentials` and `SeedRules`.
 
 ## Quick Start
 
@@ -144,7 +144,7 @@ Copy `config.json.example` → `config.json` and fill in these key fields:
   },
   "RealDebrid": {
     "ApiKey": "",         // your Real-Debrid API key
-    "MountLetter": "R"    // movies on R:\, shows on S:\
+    "MountLetter": "R"    // the Real-Debrid library is mounted on R:\
   },
   "LLM": {
     "Enabled": false,     // publish an externally managed LLM through Caddy
@@ -193,7 +193,7 @@ Set `"Flaresolverr": false` in `Apps` if you want to skip it (all indexers will 
 
 Set `"Grafana": true` in `Apps` to install the Grafana + Loki + Alloy observability stack. You can also run `grafana_enable.ps1` on an existing install to add it without reinstalling everything.
 
-Set `"RealDebrid": true` in `Apps` and fill in `RealDebrid.ApiKey` to mount your Real-Debrid library as local drives. `MountLetter` is the base letter — movies land on `R:\` and shows on `S:\` by default.
+Set `"RealDebrid": true` in `Apps` and fill in `RealDebrid.ApiKey` to mount your Real-Debrid library as a local drive. `MountLetter` is the letter it is mounted on (`R:\` by default); exactly one drive is mounted, because Zurg serves a single flat WebDAV tree and cannot reliably separate shows from movies — Jellyfin classifies the mounted content by filename pattern.
 
 Set `"LLM": { "Enabled": true }` to publish an externally managed LLM backend through Caddy. The project installs nothing: run the LLM yourself (e.g. Strata with `--port 8081`, keep `--host 127.0.0.1`, set its own `--api-key` or use `LLM.ApiKey`) and point Caddy at `BackendHost:BackendPort`. In Cloudflare mode the backend is published as `<Subdomain>.<Domain>` — `/v1` API behind the optional Bearer gate, UI behind Caddy basicauth when `ExposeUi: true`. In DuckDNS mode only the API is exposed, at `https://<host>/llm/v1`. Never use port 8080 — it belongs to CrowdSec's LAPI. **If the backend is Strata and its UI is exposed**, also add the published URL to the Strata config's `cors_origins` (e.g. `"cors_origins": ["https://llm.example.com"]`), or the server will refuse the page's chat requests.
 
@@ -233,7 +233,7 @@ Three layers protect against self-lockout, and `scripts/security_unban.ps1` is t
 .\scripts\security_unban.ps1 -All                 # clear every CrowdSec ban
 ```
 
-Run it from the console, from the LAN, or over Tailscale — all three stay reachable when the public path is blocked. If your WAN IP changes (dynamic DNS), re-run the security installer to refresh the whitelist.
+Run it from the console, from the LAN, or over Tailscale — all three stay reachable when the public path is blocked. You do **not** need to re-run the installer when your WAN IP changes (dynamic DNS): the `Seedbox_CrowdSecWhitelistRefresh` SYSTEM task refreshes the whitelisted operator IP every 5 minutes via `scripts\update_crowdsec_whitelist.ps1`, restarting CrowdSec only when the address actually changed.
 
 ### Port exposure
 
@@ -251,6 +251,20 @@ Only what must be public is public. App ports are bound to `LocalSubnet`, becaus
 
 Forward **80, 443, and your `Ports.DelugeBT` port** (default `56881`) on your router.
 Set `Ports.DelugeBT` to a random port between 50000–60000 in `config.json` to avoid ISP throttling of well-known BitTorrent ports.
+
+### Install directory permissions
+
+`InstallDir` is **administrator-managed**. A directory created under a drive root inherits `Authenticated Users: Modify` + `Everyone: ReadAndExecute`, which would let any local user rewrite the service binaries (privilege escalation) or replace the tree and its secrets — so the installer breaks that inheritance and applies the `C:\Program Files` model instead: `Administrators`, `SYSTEM` and `seedbox-svc` have full control, `Authenticated Users` is read-only.
+
+`Paths.Downloads`, `Paths.Movies` and `Paths.TV` are deliberately re-opened for shared (`Authenticated Users: Modify`) write **when they live inside the install tree**, so Explorer/SMB file management and downloads keep working; media paths outside it are left untouched, and `secrets\` is never re-opened.
+
+The caveat: a **non-administrator** account that has to write somewhere else inside the install tree is now denied and needs an explicit grant — the installer prints the exact command:
+
+```powershell
+icacls "<InstallDir>" /grant "<account>:(OI)(CI)(M)"
+```
+
+If you keep the project checkout inside `InstallDir`, it becomes administrator-only too (the installer warns about this).
 
 ## Warning
 

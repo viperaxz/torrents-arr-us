@@ -43,7 +43,7 @@ Internet
      │                                         │
   Subdomain routing (Cloudflare mode)      Path routing (DuckDNS mode)
   jellyfin.domain.com    → :8096           /jellyfin    → :8096
-  jellyseerr.domain.com  → :5055           /jellyseerr  → :5055
+  jellyseerr.domain.com  → :5055           / (root)     → :5055
   sonarr.domain.com      → :8989           /sonarr      → :8989
   radarr.domain.com      → :7878           /radarr      → :7878
   prowlarr.domain.com    → :9696           /prowlarr    → :9696
@@ -51,6 +51,7 @@ Internet
   bazarr.domain.com      → :6767           /bazarr      → :6767
   grafana.domain.com     → :3000           /grafana     → :3000  (optional)
   domain.com             → static dashboard
+                                           /dashboard   → static dashboard
      │
      └── All backend services run as Windows Services under the "seedbox-svc" service account
 ```
@@ -98,7 +99,7 @@ Internet
 
 ### Dual DNS / Domain Modes
 - **Cloudflare mode**: Each app gets its own `app.yourdomain.com` subdomain. DNS A records are managed via the Cloudflare API.
-- **DuckDNS mode**: All apps share a single `*.duckdns.org` domain using URL path routing (`/sonarr`, `/radarr`, etc.). DuckDNS is updated via API.
+- **DuckDNS mode**: All apps share a single `*.duckdns.org` domain using URL path routing (`/sonarr`, `/radarr`, etc.). Jellyseerr is served at the site root and the dashboard at `/dashboard`, because Jellyseerr cannot run under a path prefix. DuckDNS is updated via API.
 
 ### Dynamic DNS Updater
 - A PowerShell script (`Update-CloudflareDNS.ps1` or `Update-DuckDNS.ps1`) is installed as a **Windows Scheduled Task** that runs every 5 minutes under the `seedbox-svc` account.
@@ -119,7 +120,9 @@ Internet
 - Creates a dedicated local Windows user `seedbox-svc` (no admin group, no interactive logon).
 - Grants it `SeServiceLogonRight` + `SeBatchLogonRight` via `secedit`.
 - All NSSM services run under this account (`ObjectName = .\seedbox-svc`).
-- ACLs are applied per-directory: each app only gets access to its own data and media paths.
+- **The install tree is administrator-managed.** A directory created under a drive root inherits `Authenticated Users: Modify` + `Everyone: ReadAndExecute`, which lets any local user rewrite the service binaries (escalation to `seedbox-svc`/LocalSystem) or replace the directory and its secrets. `Set-SeedboxInstallTreeAcl` therefore breaks that inheritance and applies the `C:\Program Files` model to `InstallDir`: `Administrators`, `SYSTEM` and `seedbox-svc` full control, `Authenticated Users` read-only (so non-elevated reads like `box check` still work). Explicit writable ACEs for broad principals (`Everyone`, `Authenticated Users`, `Users`, `Guests`, `INTERACTIVE`, `NETWORK`, `ANONYMOUS`) are removed; write ACEs for any *other* principal are kept but reported as a warning, because such an account can still replace binaries in the tree.
+- **Media paths are re-opened on purpose**: `Paths.Downloads`, `Paths.Movies` and `Paths.TV` get `Authenticated Users: Modify` again — but only when they live **inside** `InstallDir`, so Explorer/SMB file management keeps working. Media paths outside the install tree are left exactly as the operator set them, `secrets/` is never re-opened, and a media path that *is* the install dir is refused. Per-app grants are added on top (`Grant-SeedboxDirAccess -Rights FullControl` for an app's own data directory, `ReadAndExecute` on the media paths Jellyfin reads).
+- **Practical caveat**: a non-administrator process that has to write inside the install tree — other than in the media paths — is now denied and needs an explicit grant, e.g. `icacls "<InstallDir>" /grant "<account>:(OI)(CI)(M)"`. The installer prints that hint. If the project checkout itself lives inside `InstallDir`, it becomes administrator-only too, and `00_service_account.ps1` warns about it.
 - The `secrets/` directory has inheritance broken — only `Administrators`, `SYSTEM`, and `seedbox-svc (Read)` can access it.
 
 ### Security Layer
@@ -156,13 +159,14 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Recyclarr is downloaded at Layer 2 time and run to push these profiles into Sonarr/Radarr via their APIs.
 
 ### Public Indexer Configuration
-- Layer 2 auto-adds a curated set of 18+ free public indexers to Prowlarr via its API (1337x, Nyaa.si, The Pirate Bay, and others).
-- Indexers are declared in `config.json.example` under `Layer2.Prowlarr.Indexers` as `{Name, DefinitionName}` pairs — the list is fully customizable.
-- A `Layer2.MinimumSeeders` threshold (default 1) is applied globally to all indexers.
+- Layer 2 auto-adds the enabled entries of a curated indexer list to Prowlarr via its API — `config.json.example` ships 12 entries with 8 enabled (Nyaa.si, LimeTorrents, Knaben, and others).
+- Indexers are declared in `config.json.example` under `Layer2.Prowlarr.Indexers` as `{Name, DefinitionName, Enabled}` entries — the list is fully customizable, and only an explicit `"Enabled": false` skips an entry (a missing `Enabled` property is treated as enabled).
+- A `Layer2.MinimumSeeders` threshold (default 1) is applied globally to all indexers; it is only pushed when greater than 1, since 1 means "no minimum".
 
 ### Cloudflare CAPTCHA Bypass (Flaresolverr)
 - Flaresolverr is installed as an NSSM Windows service running a headless Chromium locally on port 8191.
 - Layer 2 registers it with Prowlarr as an indexer proxy via `/api/v1/indexerproxy`, enabling automatic routing of Cloudflare-protected trackers.
+- Prowlarr only uses an indexer proxy that carries at least one tag (`IndexerProxyDefinition.Enable` is `Tags.Any()`) **and** only hands it to indexers whose tags intersect the proxy's, so `configure_layer2_flaresolverr.ps1` creates/reuses a `flaresolverr` tag, puts it on the proxy and applies it (bulk tag edit, additive) to the indexers Prowlarr's schema flags as needing the solver — native definitions like `RuTracker.org` are listed explicitly because they carry no `info_flaresolverr` schema flag.
 - Flaresolverr binds to `127.0.0.1` only — it is never publicly exposed.
 
 ### Structured Debug Logging
@@ -174,7 +178,7 @@ CrowdSec splits into two independent components, and **both are required** — t
 ### Media Request Portal (Jellyseerr)
 - Jellyseerr is installed as an NSSM service (built from source — Node.js v22 + pnpm) and fully wired to Jellyfin, Sonarr, and Radarr during Layer 1.
 - Users browse a Netflix-style catalogue and request movies/TV shows; approved requests are forwarded directly to Radarr/Sonarr for download with no *arr UI access required.
-- In DuckDNS mode, the application URL is set to `https://<host>/jellyseerr` automatically; in Cloudflare mode it is `https://jellyseerr.<domain>`.
+- In DuckDNS mode, the application URL is set to `https://<host>` automatically (Jellyseerr is served at the site root); in Cloudflare mode it is `https://jellyseerr.<domain>`.
 
 ### Shared User Provisioning
 - A `Users` array in `config.json` is the single source of truth. Users are created in **Jellyfin** during Layer 1 and imported into **Jellyseerr** during Layer 2 — no duplicate admin work across apps.
@@ -208,7 +212,7 @@ CrowdSec splits into two independent components, and **both are required** — t
 
 ### Real-Debrid Integration (Zurg + rclone)
 - Enabled when `Apps.RealDebrid = true` and `RealDebrid.ApiKey` is set.
-- **Zurg** (`scripts/15_zurg.ps1`) — downloads the latest release from `debridmediamanager/zurg-public`; generates `config.yml` pointing at the RD API; creates an NSSM service under `seedbox-svc`. The rclone mount uses `zurg:__all__` to expose all torrents at the drive root — Jellyfin classifies movies vs shows by filename pattern.
+- **Zurg** (`scripts/15_zurg.ps1`) — downloads the latest release from `debridmediamanager/zurg-public`; generates `config.yml` pointing at the RD API; creates an NSSM service under `seedbox-svc`. The rclone mount uses `zurg:__all__` to expose all torrents at the drive root — Jellyfin classifies movies vs shows by filename pattern. The generated `config.yml` pins `host: 127.0.0.1` (Zurg's WebDAV endpoint is unauthenticated, so it is deliberately loopback-only) and gets an explicit ACL — full control for Administrators/SYSTEM, modify for `seedbox-svc` — because the file holds the Real-Debrid API token.
 - **rclone** (`scripts/16_rclone.ps1`) — installs WinFsp (required for FUSE-style mounts on Windows) via Chocolatey; downloads rclone from GitHub; creates one NSSM service: `rclone-rd-movies` mounts `zurg:__all__` at `<MountLetter>:\` (default `R:\`). TV shows are not provisioned as a separate mount because Zurg's WebDAV layer cannot reliably separate shows from movies — Jellyfin classifies the mounted content by filename pattern instead.
 - **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads).
 - **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`).
@@ -226,14 +230,14 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Output is written as `dashboard/current_status.json` — served statically by Caddy and consumed by the dashboard front-end UI.
 
 ### Prowlarr Private Tracker Support
-- Each entry in `Layer2.Prowlarr.Indexers` now supports an `Enabled: bool` field (defaults to `false`); indexers where `Enabled = false` are silently skipped during Layer 2 — the list in `config.json.example` includes 20+ public and private trackers, all disabled by default.
+- Each entry in `Layer2.Prowlarr.Indexers` supports an `Enabled: bool` field; only an explicit `"Enabled": false` skips an entry during Layer 2 — a *missing* `Enabled` property is treated as **enabled**, and the list in `config.json.example` ships 12 entries with 8 of them enabled (the four disabled ones are private trackers waiting for credentials).
 - Private trackers with authentication accept a per-indexer `Credentials` object: FileList (Username + Passkey), IPTorrents (Cookie + UserAgent), RuTracker (Username + Password), TorrentLeech (Username + Password + Alt2FAToken).
 - Each indexer can also declare `SeedRules: {Ratio, SeedTimeMinutes}` which is applied to Prowlarr's per-indexer seed criteria.
 
 ### Static Dashboard
 - A static HTML dashboard (`dashboard/index.html`) is generated from `templates/dashboard.html.template` at install time.
 - Displays clickable app cards for each enabled application, with URLs dynamically generated for the active domain mode.
-- Served by Caddy at the root domain (Cloudflare mode: `domain.com`; DuckDNS mode: `domain.duckdns.org/`) behind `basicauth`.
+- Served by Caddy behind `basicauth` at the root domain in Cloudflare mode (`domain.com`) and at `/dashboard` in DuckDNS mode, where Jellyseerr owns `/` (`domain.duckdns.org/dashboard`). If `Apps.Jellyseerr` is disabled the dashboard keeps `/` in DuckDNS mode, so the root is never a dead end.
 - The dashboard JavaScript polls `current_status.json` to display live service states, drive usage, and download activity.
 
 ### Complete Uninstaller
@@ -282,7 +286,7 @@ CrowdSec splits into two independent components, and **both are required** — t
   },
   "RealDebrid": {
     "ApiKey":      "...",  // Real-Debrid API key
-    "MountLetter": "R"     // movies on R:\, shows on S:\
+    "MountLetter": "R"     // the RD library is mounted on R:\
   },
   "LLM": {
     "Enabled":      false,       // publish an externally managed LLM via Caddy
@@ -313,13 +317,13 @@ CrowdSec splits into two independent components, and **both are required** — t
     "Radarr":  { "DownloadClients": [...], "RootFolders": [...] },
     "Prowlarr": {
       "Indexers": [
-        // Public trackers — set Enabled: true to add to Prowlarr
-        { "Name": "1337x",          "DefinitionName": "1337x",        "Enabled": false },
+        // Public trackers — only an explicit Enabled: false skips an entry
         { "Name": "Knaben",         "DefinitionName": "knaben",       "Enabled": true  },
-        { "Name": "Nyaa.si",        "DefinitionName": "nyaasi",       "Enabled": false },
-        { "Name": "The Pirate Bay", "DefinitionName": "thepiratebay", "Enabled": false },
-        // ... 20+ total; full list in config.json.example
-        // Private trackers — requires Credentials
+        { "Name": "LimeTorrents",   "DefinitionName": "limetorrents", "Enabled": true  },
+        { "Name": "Nyaa.si",        "DefinitionName": "nyaasi",       "Enabled": true  },
+        { "Name": "SubsPlease",     "DefinitionName": "subsplease",   "Enabled": true  },
+        // ... 12 entries total, 8 enabled; full list in config.json.example
+        // Private trackers — require Credentials, ship disabled
         {
           "Name": "FileList", "DefinitionName": "FileList.io", "Enabled": false,
           "Credentials": { "Username": "", "Passkey": "" },
@@ -333,7 +337,7 @@ CrowdSec splits into two independent components, and **both are required** — t
       ]
     },
     "OpenSubtitles": { "Username": "", "Password": "" },
-    "Bazarr":  { "TitloviUsername": "", "TitloviPassword": "" },
+    "Bazarr":  { "TitloviUsername": "", "TitloviPassword": "", "SubdlApiKey": "" },
     "Jellyfin": {
       "GPU": "nvidia_ada" | "nvidia_ampere" | "intel_uhd_12th" | "intel_arc" | "amd_rdna3" | ... | "",
       "MediaLibraries": [
@@ -378,7 +382,7 @@ master_install.ps1
 │   ├── 12_security.ps1               CrowdSec engine + Windows Firewall bouncer, abuse blocklists fetch
 │   ├── 13_status.ps1                 Register Seedbox_Status_Collector scheduled task, run initial collection
 │   ├── 14_grafana.ps1                [if Apps.Grafana] Download + install Grafana, Loki, Alloy; provision data source + dashboards; patch Caddyfile
-│   ├── 15_zurg.ps1                   [if Apps.RealDebrid] Download Zurg, generate zurg.yml, create NSSM service
+│   ├── 15_zurg.ps1                   [if Apps.RealDebrid] Download Zurg, generate config.yml, create NSSM service
 │   └── 16_rclone.ps1                 [if Apps.RealDebrid] Install WinFsp, download rclone, create mount service (movies)
 │
 ├── [Layer 1 — Auth, per-app]
@@ -418,7 +422,7 @@ Standalone Layer 2 runner. Can be invoked independently after Layer 1 to reconfi
 Full uninstaller with 8 numbered stages (see Feature Summary above). Accepts `-Force` to skip the confirmation prompt. Encrypts and saves the Caddy cert cache before removing services.
 
 #### `test-suite.ps1`
-Post-install smoke test. Checks all services are running, all expected ports are listening, Caddy HTTP redirects to HTTPS, API health endpoints respond with correct status codes, and DNS records resolve to the current public IP. Outputs PASS/FAIL/WARN per check with a final count.
+Post-install smoke test, and a modular runner rather than a fixed list of checks: it loads one module per service from `tests\` (`Test-Caddy.ps1`, `Test-Sonarr.ps1`, …) and each module reports three layers of checks — **Layer 1** health (service running, port bound, API ping, log validation), **Layer 2** integration (the wiring Layer 2 installed: Prowlarr→Sonarr/Radarr registration, Deluge client and root folders, Jellyfin libraries/users vs `config.json`, Bazarr base URLs, the FlareSolverr proxy) and **Layer 3** behaviour (a real action per service, e.g. an RSS Sync command, a paused magnet added and removed, a live indexer search). Accepts `-Service <Name>`, `-Layer <1|2|3>` and `-Quick` (Layer 1 only across all services); an unknown `-Service` exits 1 instead of reporting a green zero-check summary. Results are exported to `<InstallDir>\dashboard\test_results.json` and pushed to Loki when `Apps.Grafana = true`. See [Test Suite](#10-test-suite).
 
 ---
 
@@ -436,7 +440,8 @@ Creates and configures the **`seedbox-svc`** dedicated service account.
 - Creates the local user if absent; updates the password if it already exists.
 - Removes it from `Administrators` and `Users` groups.
 - Grants `SeServiceLogonRight` and `SeBatchLogonRight` by exporting the local security policy via `secedit`, patching the INF file, and reimporting it — handles both updating existing rights entries and injecting missing `[Privilege Rights]` sections.
-- Exports two ACL helper functions (`Grant-SeedboxDirAccess`, `Set-SecretsDirAcl`) into the global scope for use by all subsequent scripts.
+- Exports three ACL helper functions (`Grant-SeedboxDirAccess`, `Set-SecretsDirAcl`, `Set-SeedboxInstallTreeAcl`) into the global scope for use by all subsequent scripts.
+- **Locks down the install tree**: breaks the drive-root inheritance on `InstallDir` (`Administrators`/`SYSTEM`/`seedbox-svc` Full, `Authenticated Users` read-only), removes writable ACEs held by broad principals, and re-opens `Paths.Downloads` / `Movies` / `TV` for shared write when they live inside the tree. Prints the `icacls /grant` hint for a non-admin account that still needs to write there, and warns when the project checkout itself sits inside `InstallDir`. See [Service Account Isolation](#service-account-isolation).
 
 ---
 
@@ -455,7 +460,7 @@ The most complex installer — sets up the entire public-facing layer.
 
 #### `scripts/02_jellyfin.ps1`
 - Installs Jellyfin via Chocolatey; if the package is already present but the service is missing, forces a reinstall.
-- Writes `network.xml` into `C:\ProgramData\Jellyfin\Server\config\` to pre-configure the HTTP port and `BaseUrl` (`""` for subdomain mode, `/jellyfin` for DuckDNS path mode) before first run.
+- Writes `network.xml` into `C:\ProgramData\Jellyfin\Server\config\` to pre-configure the HTTP port and `BaseUrl` (`""` for subdomain mode, `/jellyfin` for DuckDNS path mode) before first run. If the file already exists (Chocolatey starts the service once, so Jellyfin writes it itself), the port, `BaseUrl` and `RequireHttps` are re-aligned to `config.json` instead.
 - Switches the Windows service `ObjectName` to `seedbox-svc` after the data directory is created.
 - Uses a lock file (`.locks/.jellyfin.lock`) to skip reinstall on subsequent runs.
 
@@ -474,14 +479,14 @@ Identical pattern to Sonarr/Radarr. Fetches from `github.com/Prowlarr/Prowlarr`,
 
 #### `scripts/07_deluge.ps1`
 - Installs `deluge` via Chocolatey, locates `deluged.exe` and `deluge-web.exe`.
-- Generates a **cryptographically random 32-char base64 password** (`secrets/deluge_auth.txt`) on first install. Subsequent runs read the existing password.
+- Writes `<InstallDir>\secrets\deluge_auth.txt` on first install — the password is `General.AdminPassword` from `config.json`, deliberately reused so a single credential covers the dashboard (Caddy basicauth), the Deluge Web UI and the daemon. It is **not** randomly generated. Subsequent runs read the existing file. `web.conf` is written with `pwd_salt`/`pwd_sha1` derived from the same password, so the Web UI works on first load.
 - Writes Deluge config files (`auth`, `core.conf`, `web.conf`) in the data directory (`Deluge-data/`).
 - Creates two NSSM services: `DelugeDaemon` (daemon on port 58846, 127.0.0.1 only) and `DelugeWeb` (web UI on port 8112, 127.0.0.1 only).
 - Caddy proxies the Web UI over HTTPS; the daemon port is never directly exposed.
-- Opens firewall rules for BitTorrent ports (6881 TCP+UDP), not for the daemon or web ports.
+- Opens firewall rules for the BitTorrent peer port (`Ports.DelugeBT`, default 56881, TCP+UDP), not for the daemon or web ports.
 
 #### `scripts/08_ffmpeg.ps1`
-Minimal script. Installs ffmpeg via Chocolatey if not already present. Verifies the installation by running `ffmpeg -version` and printing the output. ffmpeg is required by Jellyfin for software transcoding.
+Minimal script. Installs ffmpeg via Chocolatey if not already present. Verifies the installation by running `ffmpeg -version` and printing the output. If Chocolatey reports no ffmpeg package after the install attempt the script exits 1 and deliberately writes neither the lock file nor the ledger entry, so a transient Chocolatey/network failure is retried by the next `master_install.ps1` instead of being reported as already installed. ffmpeg is required by Jellyfin for software transcoding.
 
 #### `scripts/10_flaresolverr.ps1`
 - Downloads the latest `flaresolverr_windows_x64.zip` from GitHub releases into `bin/` (cached by version tag).
@@ -509,11 +514,11 @@ Also exposed as `grafana_enable.ps1` (root-level) — sets `Apps.Grafana = true`
 #### `scripts/15_zurg.ps1`
 Installs Zurg, the Real-Debrid WebDAV bridge. Enabled when `Apps.RealDebrid = true` and `RealDebrid.ApiKey` is non-empty.
 - Downloads the latest Windows amd64 binary from `debridmediamanager/zurg-public` GitHub releases; caches in `bin/`.
-- Generates `zurg.yml` from a template with `__all__` mount path (no regex filters — workaround for the `compilePattern()` panic in v0.9.3-final; see memory entry `project_zurg_bug.md`).
+- Generates `config.yml` in the Zurg install directory with the `__all__` mount path (no regex filters — workaround for the `compilePattern()` panic in v0.9.3-final; see memory entry `project_zurg_bug.md`) and pins `host: 127.0.0.1`, so the unauthenticated WebDAV endpoint never listens on the LAN. The file holds the Real-Debrid API token, so it is written BOM-free and given an explicit ACL (Administrators/SYSTEM full control, `seedbox-svc` modify — Zurg rewrites the file on startup).
 - Creates an NSSM service under `seedbox-svc`; waits up to 30 seconds for the WebDAV endpoint to respond.
 
 #### `scripts/16_rclone.ps1`
-Installs rclone and creates two NSSM mount services. Enabled when `Apps.RealDebrid = true`.
+Installs rclone and creates one NSSM mount service. Enabled when `Apps.RealDebrid = true`.
 - Installs **WinFsp** via Chocolatey (required for FUSE-style drive mounts on Windows).
 - Downloads rclone from GitHub releases; creates a minimal `rclone.conf` pointing at the Zurg WebDAV endpoint (`http://127.0.0.1:9999`).
 - Creates `rclone-rd-movies` service: mounts `zurg:__all__` at `<MountLetter>:\` (default `R:\`).
@@ -536,7 +541,7 @@ The most involved installer due to Python dependencies.
 - Runs `pip install webrtcvad-wheels` first; if that fails (no MSVC build tools), it falls back to installing requirements without `webrtcvad` (subtitle sync via `alass` instead of `ffsubsync`).
 - Creates an NSSM service running `python.exe bazarr.py --no-update -c <DataDir>`.
 - Starts Bazarr and waits up to 120 seconds for `config.yaml` to appear, then waits for the Bazarr API to respond (up to 90 more seconds) before stopping the service. This two-phase wait is required because Bazarr performs multiple `config.yaml` write passes during startup initialization; stopping before the API is up causes the subsequent edit to be overwritten on the next start.
-- In DuckDNS mode, stops the service, edits `config.yaml` using `[System.IO.File]::WriteAllText` with `UTF8Encoding($false)` (BOM-free) to set `base_url: /bazarr`, then restarts. `Set-Content -Encoding UTF8` must not be used here — PowerShell 5.1 writes a UTF-8 BOM, which causes Python's YAML parser to reset all settings to defaults on load.
+- In DuckDNS mode, stops the service, edits `config.yaml` using `[System.IO.File]::WriteAllText` with `UTF8Encoding($false)` (BOM-free) to set `base_url: /bazarr`, then restarts. `Set-Content -Encoding UTF8` must not be used here — PowerShell 5.1 writes a UTF-8 BOM, which causes Python's YAML parser to reset all settings to defaults on load. The edit reads the file with `Get-Content -Encoding UTF8` as well: PowerShell 5.1's default ANSI decoder mangles every non-ASCII value (e.g. Romanian diacritics), and the mangled text would then be written back as UTF-8. `configure_layer1_bazarr.ps1` reads `config.yaml` the same way for the same reason.
 
 ---
 
@@ -580,19 +585,22 @@ All three follow the same robust pattern:
 Connects Sonarr to the rest of the stack:
 - **Root folders**: adds configured paths via `/api/v3/rootFolder`, skipping if already present.
 - **Download clients**: fetches the Deluge schema from Sonarr's `/api/v3/downloadclient/schema`, deep-clones it, and fills in host/port/password/category. Creates or updates the download client via POST/PUT.
-- **Indexer proxies**: attempts to configure Prowlarr as an indexer proxy via `/api/v3/indexerproxy`; gracefully skips if the endpoint is not available (removed in Sonarr v4 — Prowlarr sync is handled by `configure_layer2_prowlarr.ps1` instead).
+- **Seed criteria**: walks Sonarr's synced indexers and writes `seedCriteria.seedRatio` — `Layer2.PublicTrackerSeedRatio` for public indexers, cleared (unlimited) for private ones, and left untouched for indexers that declare `SeedRules` because `configure_layer2_prowlarr.ps1` already pushed their per-tracker ratio and seed time.
 - **Naming scheme**: applies TRaSH-recommended episode and season folder format strings.
 - **Media management**: sets `downloadPropersAndRepacks=doNotPrefer`.
+- **Jellyfin notification**: creates or updates the `MediaBrowser` connection (host `127.0.0.1`, Jellyfin port, API key from `secrets\jellyfin_api_key.txt`, URL base matching the domain mode, `updateLibrary=true`) so Jellyfin refreshes its library on import. Skipped with a warning when Jellyfin is disabled or its API key file is missing. There is no `/api/v3/indexerproxy` step any more — Sonarr v4 removed that endpoint and Prowlarr sync is handled by `configure_layer2_prowlarr.ps1`.
+- **Refresh hook**: registers the Jellyfin series-refresh Custom Script connection (see [Sonarr → Jellyfin Auto-Repair Hook](#sonarr--jellyfin-auto-repair-hook)), re-pointing an existing connection if the project path changed.
 
 #### `scripts/configure_layer2_radarr.ps1`
-Same as Sonarr's Layer 2, adapted for Radarr: `/api/v3/rootFolder`, download client, naming scheme, media management.
+Same as Sonarr's Layer 2, adapted for Radarr: `/api/v3/rootFolder`, download client, seed criteria, naming scheme, media management, and the Jellyfin (MediaBrowser) notification. It has no equivalent of Sonarr's post-import refresh hook.
 
 
 #### `scripts/configure_layer2_recyclarr.ps1`
 - Downloads `recyclarr.exe` from GitHub if not present in the `recyclarr/` directory.
 - Reads Sonarr and Radarr API keys and writes `%APPDATA%\recyclarr\secrets.yml` with base URLs that include the path prefix in DuckDNS mode (e.g., `http://127.0.0.1:8989/sonarr`). In Cloudflare mode the prefix is empty.
 - Launches Recyclarr in a hidden process window (required because Recyclarr uses Spectre.Console which calls `SetConsoleMode()` on its stdout handle — this fails when stdout is a pipe).
-- After sync completes, finds and tails the newly created debug log, filtering to INFO/WARN/ERROR lines.
+- Writes a per-run `%APPDATA%\recyclarr\win-seedbox.yml` (and passes it with `-c`) that keeps only the top-level sections whose API keys were actually read. `recyclarr.yml` references every secret unconditionally with `!secret`, and Recyclarr resolves all of them before syncing, so one instance without credentials would abort the whole run; the generated file therefore omits it entirely and deliberately does not use the default `recyclarr.yml` name, so a manual `recyclarr sync` still picks up the user's own config.
+- After sync completes, finds and tails the newly created debug log, filtering to INFO/WARN/ERROR lines. Recyclarr exits 0 even when it cannot parse the config, so success is decided from that log (`Config parsing failed` / `Exiting due to fatal error`) rather than from the exit code.
 
 #### `scripts/configure_layer2_jellyfin_libraries.ps1`
 - Authenticates against the Jellyfin API using admin credentials.
@@ -616,7 +624,7 @@ Same as Sonarr's Layer 2, adapted for Radarr: `/api/v3/rootFolder`, download cli
 Connects Prowlarr to Sonarr and Radarr:
 - Reads both apps' API keys from their `config.xml` files.
 - Uses Prowlarr's `/api/v1/applications` endpoint to register Sonarr and Radarr with `syncLevel=fullSync`.
-- If `Layer2.Prowlarr.Indexers` is configured, fetches the indexer schema and adds each indexer by `definitionName`. Applies `Layer2.MinimumSeeders` globally. Handles known error cases gracefully: FlareSolverr-protected indexers (logged as warning, not error), timeouts (logged, not fatal).
+- If `Layer2.Prowlarr.Indexers` is configured, fetches the indexer schema and adds each enabled indexer by `definitionName`. FlareSolverr-protected indexers are added *disabled* with the `flaresolverr` tag and enabled afterwards through a direct SQLite update (Prowlarr is stopped for it and restarted, then the flags are read back); indexers that time out are skipped non-fatally. It then pushes `Layer2.MinimumSeeders` (when > 1) and each indexer's `SeedRules` into the synced Sonarr/Radarr indexers.
 
 #### `scripts/configure_layer2_bazarr.ps1`
 Full integration configuration:
@@ -653,7 +661,7 @@ Jellyseerr v3.3.0 ships no pre-built Windows binary, so the installer builds fro
 Drives the full Jellyseerr first-run setup via its REST API (no browser interaction):
 1. **Auth**: `POST /api/v1/auth/jellyfin` with `serverType=2` (JELLYFIN) — simultaneously creates the Jellyseerr admin and registers the Jellyfin server connection.
 2. **Initialize**: `POST /api/v1/settings/initialize` — sets `public.initialized=true`. Without this, the Next.js app redirects every page to `/setup`.
-3. **Application URL**: `POST /api/v1/settings/main` with `applicationUrl` (DuckDNS: `https://<host>/jellyseerr`; Cloudflare: `https://jellyseerr.<domain>`).
+3. **Application URL**: `POST /api/v1/settings/main` with `applicationUrl` (DuckDNS: `https://<host>`, since Jellyseerr owns the site root; Cloudflare: `https://jellyseerr.<domain>`).
 4. **Sonarr connection**: `POST /api/v1/settings/sonarr` — fetches the first quality profile from Sonarr's own API to populate the required `activeProfileId` + `activeProfileName` fields; also requires `is4k`, `activeDirectory`, and `enableSeasonFolders`.
 5. **Radarr connection**: same pattern; also requires `minimumAvailability` (`"released"`).
 6. **Default permissions**: `POST /api/v1/settings/main` with `defaultPermissions=32` (REQUEST only).
@@ -696,7 +704,7 @@ The recovery tool for a self-inflicted ban. Three independent mechanisms can blo
 Intended to be run locally — console, LAN, or Tailscale — all of which stay reachable by design when the public path is blocked.
 
 #### Firewall exposure model
-Only Caddy (80/443) and the BitTorrent peer port (6881) are open to the internet. Application ports (`8989`, `7878`, `9696`, `6767`, `5055`) are created with `-RemoteAddress LocalSubnet`: Caddy reaches them over loopback, which is exempt from Windows Firewall, so a world-open rule buys nothing and costs two things at once — it exposes each app's own login page on its raw port, **bypassing Caddy's basic-auth**, and it bypasses CrowdSec, whose only HTTP datasource is the Caddy access log. Flaresolverr gets **no rule at all**: it is started with `HOST=127.0.0.1`, so an inbound rule would only expose a headless Chromium that performs arbitrary fetches on request; `10_flaresolverr.ps1` actively removes the rule left behind by older installs.
+Only Caddy (80/443) and the BitTorrent peer port (`Ports.DelugeBT`, default 56881) are open to the internet. Application ports (`8989`, `7878`, `9696`, `6767`, `5055`) are created with `-RemoteAddress LocalSubnet`: Caddy reaches them over loopback, which is exempt from Windows Firewall, so a world-open rule buys nothing and costs two things at once — it exposes each app's own login page on its raw port, **bypassing Caddy's basic-auth**, and it bypasses CrowdSec, whose only HTTP datasource is the Caddy access log. Flaresolverr gets **no rule at all**: it is started with `HOST=127.0.0.1`, so an inbound rule would only expose a headless Chromium that performs arbitrary fetches on request; `10_flaresolverr.ps1` actively removes the rule left behind by older installs.
 
 #### `scripts/collect_status.ps1`
 Collects server health metrics and writes them as `dashboard/current_status.json`:
@@ -747,10 +755,12 @@ Two templates exist depending on domain mode:
 | Template | Mode | Routing |
 |---|---|---|
 | `Caddyfile_cloudflare.template` | Cloudflare | Each app on its own subdomain (`app.domain.com`) |
-| `Caddyfile_duckdns.template` | DuckDNS | All apps on path prefixes (`domain/app`) |
+| `Caddyfile_duckdns.template` | DuckDNS | All apps on path prefixes (`domain/app`); Jellyseerr on the root, dashboard at `/dashboard` |
 | `Caddyfile.template` | Generic | Not currently used by installer |
 
 When `LLM.Enabled` is set, an extra `{$LLM_BLOCK}` placeholder renders the LLM proxy rules: `llm.<domain>` with a `/v1` bearer gate and basicauth-gated UI in Cloudflare mode; API-only `/llm/v1` in DuckDNS mode (the backend UI is not exposed in path mode).
+
+The DuckDNS template's site root is rendered from a second placeholder, `{$ROOT_BLOCK}`, which `01_webserver.ps1` fills in: with `Apps.Jellyseerr` enabled Jellyseerr becomes the catch-all for `/` and the dashboard moves to `/dashboard`; without it the dashboard keeps `/` so the root is never a dead end. In Cloudflare mode the placeholder stays empty and the dashboard remains on the bare domain.
 
 The Cloudflare Caddyfile illustrates the security split:
 - The **dashboard** (`domain.com`) is behind `basicauth`.
@@ -760,7 +770,7 @@ The Cloudflare Caddyfile illustrates the security split:
 
 **Caddy access logging**: Both templates include a `log { output file ... format json }` block in every server block, writing JSON-formatted request logs to `<InstallDir>/logs/caddy-access.log`. The log is consumed by CrowdSec's `crowdsecurity/caddy-logs` parser, which expects exactly these default JSON keys — changing `format json` to another formatter would silently break detection for every proxied service at once. Log rotation is handled by Caddy directly (10 MB roll size, 3 files kept).
 
-**Jellyseerr DuckDNS routing note**: Jellyseerr v3.3.0 has no `basePath` support — Next.js server-side redirects hardcode paths like `/login`, `/setup`, `/requests` without any prefix. The DuckDNS template therefore includes two layers of Caddy rules: `handle_path /jellyseerr*` (strips the prefix for the main entry point) and explicit `handle /login*`, `handle /setup*`, etc. blocks for all page routes the server may redirect to. The static asset paths (`/_next*`, `/api*`, `/imageproxy*`, `/avatarproxy*`) are also routed directly because the browser requests them without the `/jellyseerr` prefix after the first page load.
+**Jellyseerr DuckDNS routing note**: Jellyseerr v3.3.0 has no `basePath` support — Next.js server-side redirects and its own navigation hardcode absolute paths (`/login`, `/_next`, `/api`, `/movie/…`, `/tv/…`, `/settings`, `/discover`, `/search`, `/person/…`, `/collection/…`, plus `/favicon.ico`, `/sw.js` and `/site.webmanifest`). In DuckDNS mode Jellyseerr is therefore given the **site root** instead of a path prefix, so all of those paths resolve naturally and no per-route patching is needed. Consequently the dashboard moved to **`https://<host>/dashboard`** (still basicauth-gated), and a `handle_path /jellyseerr*` alias is kept so existing `/jellyseerr` links and bookmarks keep working — it strips the prefix and proxies to Jellyseerr. If `Apps.Jellyseerr` is disabled the dashboard keeps `/` so the root is never a dead end.
 
 ### TLS Modes
 
@@ -777,9 +787,10 @@ The Cloudflare Caddyfile illustrates the security split:
 | Concern | Mechanism |
 |---|---|
 | **Service isolation** | `seedbox-svc` local account, no admin group, no interactive logon |
-| **Least-privilege filesystem** | ACL grants per app data directory; media paths are `ReadAndExecute` only |
+| **Install-tree lockdown** | `InstallDir` inherits nothing from the drive root: `Administrators`/`SYSTEM`/`seedbox-svc` Full + `Authenticated Users` read-only, with writable ACEs for broad principals removed. A non-admin process writing inside the tree needs an explicit `icacls /grant`; `Paths.Downloads`/`Movies`/`TV` are re-opened for shared write, `secrets\` never is |
+| **Least-privilege filesystem** | Per-directory ACL grants on top of that: each app gets `FullControl` on its own data directory, and only `ReadAndExecute` on the media paths it reads |
 | **Secret storage** | API tokens in `InstallDir\secrets\` with inheritance broken; only `seedbox-svc (Read)` + Administrators |
-| **Deluge daemon** | Binds `127.0.0.1` only; random 32-char password; only Caddy proxies the Web UI |
+| **Deluge daemon** | Binds `127.0.0.1` only; password is `General.AdminPassword` (the single admin credential, deliberately reused); only Caddy proxies the Web UI |
 | **Caddy auth** | bcrypt-hashed credentials (`caddy hash-password`) embedded in Caddyfile |
 | **App auth** | Forms-based authentication configured programmatically on all *arr apps and Bazarr |
 | **Cert persistence** | `caddy-data.enc` is AES-256-CBC encrypted with the AdminPassword before storage in the repo |
@@ -839,16 +850,24 @@ Both are registered as a Windows Scheduled Task (`Seedbox_Cloudflare_Updater` / 
 
 ## 10. Test Suite
 
-**`test-suite.ps1`** — an administrator-required validation script that can be run after installation.
+**`test-suite.ps1`** — an administrator-required validation script, and a modular runner: it loads one module per service from `tests\` and filters by service and by layer.
 
-Checks performed:
-1. **Services**: Caddy, Sonarr, Radarr, Prowlarr, Jellyfin (tries 3 service name variants), Deluge — all must be `Running`.
-2. **Listening ports**: 80, 443, and all configured app ports must be bound.
-3. **TLS redirect**: HTTP request to port 80 must return a redirect to HTTPS.
-4. **API health**: `GET /api/v3/system/status` for Sonarr/Radarr/Prowlarr with API key authentication must return HTTP 200.
-5. **DNS resolution** (skipped with `-Quick`): configured subdomains must resolve to the current public IP.
+```powershell
+.\test-suite.ps1                          # all services, all layers
+.\test-suite.ps1 -Service Sonarr          # one service, all layers
+.\test-suite.ps1 -Service Sonarr -Layer 2 # one service, one layer
+.\test-suite.ps1 -Quick                   # Layer 1 only, across all services
+```
 
-Output uses `[PASS]` / `[FAIL]` / `[WARN]` lines per check, with a final summary count.
+Modules: Caddy, Jellyfin, Sonarr, Radarr, Prowlarr, Deluge, Bazarr, Flaresolverr, Jellyseerr, Security, Grafana, RealDebrid, Update.
+
+Layers, consistent across modules:
+
+1. **Layer 1 — health**: service `Running`, port bound, API ping and log validation — this is what `-Quick` runs (`Test-Update.ps1` checks local files instead of a service).
+2. **Layer 2 — integration**: the wiring Layer 2 installed — Prowlarr↔Sonarr/Radarr registration and the FlareSolverr proxy, Deluge accepted by the *arr download clients plus root folders, Jellyfin libraries and users matching `config.json`, Bazarr base URLs/language profiles/enabled providers, Jellyseerr connections.
+3. **Layer 3 — behaviour**: a real action per service — an RSS Sync command, a paused magnet added and removed in Deluge, a live indexer search, provider credential status, a non-empty Real-Debrid mount, log lines in Loki.
+
+An unknown `-Service` exits 1 rather than running zero modules. Results are written to `<InstallDir>\dashboard\test_results.json` and pushed to Loki when `Apps.Grafana = true`. Output uses `[PASS]` / `[FAIL]` / `[WARN]` / `[SKIP]` lines per check, with a final summary count.
 
 ---
 
@@ -856,7 +875,7 @@ Output uses `[PASS]` / `[FAIL]` / `[WARN]` lines per check, with a final summary
 
 **`scripts/sanity_check.py`** — a Python script that drives the full media pipeline via REST APIs after install, verifying each app is correctly wired to the next.
 
-Unlike `test-suite.ps1` (which only confirms services are running and ports are open), the sanity check performs real operations — adding content, triggering searches, and polling for results — catching misconfiguration that the installer cannot detect.
+Unlike `test-suite.ps1` (whose Layer 1 only confirms services are running and ports are open), the sanity check performs real operations — adding content, triggering searches, and polling for results — catching misconfiguration that the installer cannot detect.
 
 ### Configuration
 
@@ -876,11 +895,11 @@ Default test targets: *The Godfather* (1972) for Radarr and *Friends* S01 for So
 | 0 | Infrastructure | Service states, API health for all apps, Prowlarr→Sonarr/Radarr registration, FlareSolverr proxy, root folders, download clients, quality profiles, disk space |
 | 1 | Radarr | Adds a movie, triggers `MoviesSearch`, polls history/queue for a `grabbed` event; falls back to interactive release search if auto-grab doesn't fire within 60 s |
 | 2 | Sonarr | Adds a series, pins only S01E01 as monitored (prevents season-wide grabs), triggers `EpisodeSearch`, polls for grab; same fallback |
-| 3 | Deluge | Polls `core.get_torrents_status` every 5 s up to `DownloadPollSecs` (default 300 s) for an active download |
+| 3 | Deluge | Verifies the Web UI RPC: `auth.login` succeeds and the daemon host reports `Online` (`web.get_hosts` / `web.get_host_status`). It does **not** poll `core.get_torrents_status` any more, so no torrent hashes are recorded; `DownloadPollSecs` (default 300) is still read from `sanity_config.json` but unused |
 | 4 | Jellyfin | Polls `GET /Users/{id}/Items` and `GET /Shows/{seriesId}/Episodes` every 30 s up to `ImportPollSecs` (default 1800 s) for the downloaded media; auto-runs the season hierarchy repair if needed |
 | 5 | Bazarr | Checks health, Sonarr/Radarr connection status, provider count, and wanted subtitle queue |
 
-Steps 4 and 5 are non-fatal (import/download timing is unpredictable). Steps 0–3 return exit code 1 on failure.
+Steps 4 and 5 never abort the run (import/download timing is unpredictable). The exit code is not step-based: the script exits 1 whenever any recorded check is a `FAIL`, including steps 4 and 5.
 
 ### Usage
 
@@ -900,7 +919,9 @@ python scripts/sanity_check.py --steps 4,5
 
 ### Cleanup
 
-After the run, the script removes any movie/series it added from Radarr/Sonarr and cancels the corresponding Deluge downloads. Pass `--no-cleanup` to skip this (useful when debugging a failed run). Content that already existed in the library before the run is never deleted.
+After the run, the script removes any movie/series it added from Radarr/Sonarr and — when it has torrent hashes to cancel — deletes the corresponding Deluge downloads. Pass `--no-cleanup` to skip this (useful when debugging a failed run). Content that already existed in the library before the run is never deleted.
+
+**Known gap**: nothing populates `added["deluge_hashes"]` any more, so the Deluge-cancellation branch is dead code — cleanup currently only removes the Radarr/Sonarr entries (with `deleteFiles=true`, which still removes the downloaded files).
 
 ### Dependencies
 

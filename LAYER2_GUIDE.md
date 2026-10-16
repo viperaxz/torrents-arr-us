@@ -44,16 +44,19 @@ Each script is idempotent — it checks for existing configuration and only adds
 ### `configure_layer2_sonarr.ps1` / `configure_layer2_radarr.ps1`
 - Adds the configured root folder (TV / Movies) via the API.
 - Adds Deluge as a download client (reads the password from `secrets\deluge_auth.txt`).
+- Applies seed criteria to the synced indexers: `Layer2.PublicTrackerSeedRatio` for public trackers, unlimited for private ones, leaving `SeedRules` indexers to the values `configure_layer2_prowlarr.ps1` already pushed.
 - Applies TRaSH-recommended naming formats and media management settings.
+- Registers the Jellyfin (MediaBrowser) notification so Jellyfin refreshes its library on import (Sonarr additionally registers the post-import series-refresh hook).
 
 ### `configure_layer2_recyclarr.ps1`
 - Downloads `recyclarr.exe` from GitHub if not present.
 - Writes `%APPDATA%\recyclarr\secrets.yml` with Sonarr/Radarr API keys and base URLs.
-- Runs `recyclarr sync` to push TRaSH quality profiles and custom format scoring.
+- Writes a per-run `%APPDATA%\recyclarr\win-seedbox.yml` holding only the sections whose keys were actually read, and syncs with `-c` against it. Recyclarr aborts on an undefined `!secret`, so a service without credentials must not appear in the config at all.
+- Runs `recyclarr sync` to push TRaSH quality profiles and custom format scoring. Recyclarr exits 0 even when it cannot parse the config, so the script treats `Config parsing failed` / `Exiting due to fatal error` in its debug log as the real failure signal.
 
 ### `configure_layer2_prowlarr.ps1`
 - Registers Sonarr and Radarr as applications in Prowlarr (`syncLevel=fullSync`).
-- Adds indexers from `config.json → Layer2.Prowlarr.Indexers`. Skips FlareSolverr-protected indexers with a warning; skips indexers that time out (non-fatal).
+- Adds indexers from `config.json → Layer2.Prowlarr.Indexers` that are not explicitly `"Enabled": false` (a missing `Enabled` property counts as enabled). FlareSolverr-protected indexers are added disabled with the `flaresolverr` tag and enabled afterwards via a direct SQLite update; indexers that time out are skipped (non-fatal).
 
 ### `configure_layer2_jellyfin_libraries.ps1`
 - Creates Movies and TV Shows libraries at the configured paths.
@@ -65,7 +68,7 @@ Each script is idempotent — it checks for existing configuration and only adds
 
 ### `configure_layer2_bazarr.ps1`
 - Connects Bazarr to Sonarr and Radarr using their API keys.
-- Enables subtitle providers: opensubtitlescom, yifysubtitles, embeddedsubtitles, titlovi, subdl, subsource, gestdown.
+- Enables subtitle providers: opensubtitlescom, yifysubtitles, embeddedsubtitles, gestdown — plus titlovi and subdl, which are only enabled when their credentials/API key are configured. subsource is discontinued and is never enabled.
 - Creates three language profiles: **English** (1), **Romanian** (2), **English + Romanian** (3).
 - Sets auto-download defaults for both movies and series (profile 3).
 - Enables subtitle synchronisation (alass/ffsubsync).
@@ -103,20 +106,20 @@ All Layer 2 settings live under `"Layer2"` in `config.json`.
 }
 ```
 
-`definitionName` must match Prowlarr's internal indexer identifier (visible in Prowlarr's indexer schema). FlareSolverr-protected indexers are skipped automatically.
+`definitionName` must match Prowlarr's internal indexer identifier (visible in Prowlarr's indexer schema). Each entry also takes an `Enabled` flag; only an explicit `false` skips it, so an entry with no `Enabled` property is added. FlareSolverr-protected indexers are handled automatically.
 
 ### Bazarr
 
 ```json
+"OpenSubtitles": { "Username": "myuser", "Password": "mypass" },  // consumed by Bazarr
 "Bazarr": {
-  "OpenSubtitlesComUsername": "myuser",
-  "OpenSubtitlesComPassword": "mypass",
   "TitloviUsername": "",
-  "TitloviPassword": ""
+  "TitloviPassword": "",
+  "SubdlApiKey": ""
 }
 ```
 
-Credentials are optional. If omitted, the providers are still enabled but will use the anonymous quota. Add credentials for full download quotas. Titlovi is required for Romanian subtitles.
+Credentials are optional. opensubtitlescom, yifysubtitles, embeddedsubtitles and gestdown are always enabled; if OpenSubtitles.com credentials are omitted they simply use the anonymous quota. **titlovi and subdl are only enabled when their credentials are present** (enabling them without an API key makes Bazarr throttle them with `ConfigurationError` and retry every 12 hours), and subsource is never enabled because it is discontinued. Titlovi is required for Romanian subtitles.
 
 ## Workflow After First Install
 
@@ -141,7 +144,7 @@ Credentials are optional. If omitted, the providers are still enabled but will u
 
 ### Bazarr shows 500 on the providers page
 
-- Check `C:\ProgramData\Bazarr\bazarr.log` for `KeyError` or similar.
+- Check `C:\ProgramData\Bazarr\log\bazarr.log` for `KeyError` or similar.
 - Re-run `configure_layer2_bazarr.ps1` to re-push the language profiles.
 
 ### Recyclarr sync fails
