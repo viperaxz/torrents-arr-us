@@ -9,9 +9,13 @@ Steps:
   0  Infrastructure  — services, APIs, Prowlarr wiring, disk space
   1  Radarr          — add movie, trigger search, verify grab / release results
   2  Sonarr          — add series S01, trigger search, verify grab / release results
-  3  Deluge           — poll for active downloads matching the grabs
+  3  Deluge          — poll the daemon until the grabs appear (DownloadPollSecs),
+                       recording the torrent hashes cleanup() cancels
   4  Jellyfin        — poll for imported media (long timeout — download takes time)
   5  Bazarr          — subtitle provider health, wanted queue
+
+Cleanup removes any movie/series this run added and cancels the Deluge downloads
+it created (the hashes step 3 recorded) — use --no-cleanup to keep them.
 
 Run individual steps during development:
     python sanity_check.py --steps 0          # infra only
@@ -934,6 +938,50 @@ def step2_sonarr(cfg: Dict, keys: Dict, added: Dict) -> bool:
 
 
 # --- Step 3: Deluge -----------------------------------------------------------
+_DELUGE_POLL_INTERVAL = 5  # seconds between core.get_torrents_status polls
+_DELUGE_STATUS_KEYS   = ["name", "state", "progress", "time_added"]
+_INFOHASH_RE          = re.compile(r"\A[0-9a-fA-F]{40}\Z")
+# Epoch seconds at process start.  Steps 1/2 hand releases to Deluge through
+# Radarr/Sonarr, so a torrent the daemon added before this point is the
+# operator's, not this run's, and cleanup() must leave it alone.
+_RUN_START            = time.time()
+_RUN_START_SLACK      = 60
+
+
+def _norm_title(text: Any) -> str:
+    """Lower-case `text` and drop everything that is not a letter or a digit."""
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _is_check_target(app: str, rec: Dict, target_id: Optional[int], title: str) -> bool:
+    """True when a Radarr/Sonarr queue record belongs to the sanity movie/series."""
+    id_key = "movieId" if app == "Radarr" else "seriesId"
+    if target_id is not None and rec.get(id_key) == target_id:
+        return True
+    wanted = _norm_title(title)
+    return bool(wanted) and wanted in _norm_title(rec.get("title"))
+
+
+def _queue_records(cfg: Dict, app: str, api_key: str, params: Dict) -> List[Dict]:
+    """One page of `app`'s download queue; [] when the *arr API is unreachable."""
+    try:
+        r = requests.get(f"{_url(cfg, app)}/api/v3/queue",
+                         headers={"X-Api-Key": api_key}, params=params, timeout=15)
+        r.raise_for_status()
+        records = r.json().get("records", [])
+        return records if isinstance(records, list) else []
+    except Exception:
+        return []
+
+
+def _pct(value: Any) -> str:
+    """Format a Deluge progress value (0-100) for display."""
+    try:
+        return f"{float(value):.0f}%"
+    except (TypeError, ValueError):
+        return "?"
+
+
 def step3_deluge(cfg: Dict, keys: Dict, added: Dict) -> bool:
     head("Step 3 -- Deluge: confirm download activity")
 
@@ -969,21 +1017,129 @@ def step3_deluge(cfg: Dict, keys: Dict, added: Dict) -> bool:
     # Verify daemon is connected through the Web UI
     try:
         hosts = _rpc("web.get_hosts") or []
-        if hosts:
-            host_id = hosts[0][0]
-            status = _rpc("web.get_host_status", [host_id])
-            if status and len(status) >= 2 and status[1] == "Online":
-                record("Deluge", "PASS", f"Web UI connected to daemon v{status[2]} (host online)")
-                return True
-            else:
-                record("Deluge", "WARN", f"Daemon host status: {status}")
-                return False
-        else:
+        if not hosts:
             record("Deluge", "FAIL", "No daemon hosts configured in Web UI")
             return False
+        host_id = hosts[0][0]
+        status = _rpc("web.get_host_status", [host_id])
+        if not (status and len(status) >= 2) or status[1] != "Online":
+            record("Deluge", "WARN", f"Daemon host status: {status}")
+            return False
+        daemon_ver = status[2] if len(status) > 2 else "?"
+        record("Deluge", "PASS", f"Web UI connected to daemon v{daemon_ver} (host online)")
     except Exception as exc:
         record("Deluge", "FAIL", f"Could not verify daemon connection: {exc}")
         return False
+
+    # ── Poll the daemon for the downloads this run created ────────────────────
+    # Radarr/Sonarr hand a release to the download client and report the id it
+    # returned as `downloadId`; for Deluge that is the torrent infohash, and it
+    # is the only thing cleanup() is ever allowed to cancel.  `added` is filled
+    # in by steps 1/2, so when it is populated each torrent can also be dated
+    # from Deluge's own `time_added` and anything older than this run is left
+    # untouched.  Running step 3 on its own there is nothing to date against,
+    # and every queued download for the test titles is taken as ours.
+    try:
+        poll_secs = int(cfg.get("download_poll_secs", 300))
+    except (TypeError, ValueError):
+        poll_secs = 300
+    strict = bool(added.get("radarr_movie_id") or added.get("sonarr_series_id"))
+    since  = _RUN_START - _RUN_START_SLACK
+
+    candidates: Dict[str, Dict[str, str]] = {}
+    for app, key_name, target_id, wanted in (
+        ("Radarr", "radarr", added.get("radarr_movie_id"), cfg["sanity_movie"]),
+        ("Sonarr", "sonarr", added.get("sonarr_series_id"), cfg["sanity_series"]),
+    ):
+        api_key = keys.get(key_name)
+        if not api_key:
+            continue
+        params: Dict[str, Any] = {"page": 1, "pageSize": 200}
+        if target_id is not None:
+            # Narrowed server-side, then matched again below so an ignored or
+            # renamed filter parameter can never pull in another title.
+            params["movieIds" if app == "Radarr" else "seriesIds"] = [target_id]
+        for rec in _queue_records(cfg, app, api_key, params):
+            if not _is_check_target(app, rec, target_id, wanted):
+                continue
+            raw_id = rec.get("downloadId")
+            if not isinstance(raw_id, str) or not _INFOHASH_RE.match(raw_id.strip()):
+                continue  # not a Deluge infohash (e.g. a Usenet client id)
+            torrent_hash = raw_id.strip().upper()
+            if torrent_hash not in candidates:
+                candidates[torrent_hash] = {"name": rec.get("title") or torrent_hash}
+
+    if not candidates:
+        record("Deluge", "WARN",
+               f"Daemon online, but Radarr/Sonarr have no queued download for "
+               f"'{cfg['sanity_movie']}' / '{cfg['sanity_series']}' — run steps 1,2 "
+               f"first, or the grabs were already imported")
+        return False
+
+    print(f"  Polling core.get_torrents_status for {len(candidates)} grab(s) "
+          f"(up to {poll_secs} s)...")
+    pending   = list(candidates)
+    recorded  = added.setdefault("deluge_hashes", [])
+    deadline  = time.time() + max(0, poll_secs)
+    rpc_error = ""
+    kept      = 0    # grabs the daemon already held before this run started
+
+    while pending:
+        try:
+            torrents = _rpc("core.get_torrents_status",
+                            [{"id": list(pending)}, _DELUGE_STATUS_KEYS]) or {}
+        except Exception as exc:
+            rpc_error = str(exc)
+            break
+        found = {str(k).upper(): v or {} for k, v in torrents.items()}
+        for torrent_hash in list(pending):
+            if torrent_hash not in found:
+                continue
+            pending.remove(torrent_hash)
+            info = found[torrent_hash]
+            print(f"  In Deluge: {info.get('name') or candidates[torrent_hash]['name']} "
+                  f"({info.get('state', '?')}, {_pct(info.get('progress'))}) "
+                  f"[{torrent_hash[:12]}...]")
+            try:
+                added_at = float(info.get("time_added"))
+            except (TypeError, ValueError):
+                added_at = None
+            if strict and added_at is not None and added_at < since:
+                kept += 1
+                print("    -> added before this run — not cancelled")
+                continue
+            # Recorded the moment it is seen, so an interrupt or a later failure
+            # still lets cleanup() cancel exactly this torrent.
+            recorded.append(torrent_hash)
+        if not pending or time.time() >= deadline:
+            break
+        time.sleep(min(_DELUGE_POLL_INTERVAL, max(0.0, deadline - time.time())))
+
+    note = f"; {kept} predate this run and are left alone" if kept else ""
+    if not pending:
+        record("Deluge", "PASS",
+               f"All {len(candidates)} grabbed download(s) are in Deluge{note}")
+        return True
+
+    if rpc_error:
+        record("Deluge", "WARN",
+               f"Daemon online, but core.get_torrents_status failed ({rpc_error}) — "
+               f"could not confirm {len(pending)} of {len(candidates)} grab(s); "
+               f"they will not be cancelled")
+        return False
+
+    if len(pending) < len(candidates):
+        missing = ", ".join(candidates[h]["name"][:40] for h in pending)
+        record("Deluge", "WARN",
+               f"{len(candidates) - len(pending)} of {len(candidates)} grabbed "
+               f"download(s) were in Deluge within {poll_secs} s{note}; "
+               f"missing: {missing}")
+        return False
+
+    record("Deluge", "FAIL",
+           f"None of the {len(candidates)} grab(s) reached Deluge within "
+           f"{poll_secs} s — check the Deluge download client in Radarr/Sonarr")
+    return False
 
 
 # ─── Step 4: Jellyfin ─────────────────────────────────────────────────────────
@@ -1341,17 +1497,26 @@ def cleanup(cfg: Dict, keys: Dict, added: Dict) -> None:
             record("Cleanup", "WARN", "Deluge login failed -- cannot cancel downloads")
             return
         removed = 0
+        failed: List[str] = []
         for h in hashes:
             try:
                 resp = session.post(rpc_url, json={
                     "method":"core.remove_torrent","params":[h, True],"id":2
                 }, timeout=5)
-                if not resp.json().get("error"):
+                err = resp.json().get("error")
+                if err:
+                    failed.append(f"{h[:12]}…: "
+                                  f"{err.get('message', err) if isinstance(err, dict) else err}")
+                else:
                     removed += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                failed.append(f"{h[:12]}…: {exc}")
         if removed:
-            record("Cleanup", "PASS", f"Cancelled {len(hashes)} Deluge download(s)")
+            record("Cleanup", "PASS",
+                   f"Cancelled {removed}/{len(hashes)} Deluge download(s) created by the check")
+        if failed:
+            record("Cleanup", "WARN",
+                   "Could not cancel Deluge download(s): " + "; ".join(failed))
 
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
@@ -1384,7 +1549,7 @@ def main() -> None:
             "  0  Infrastructure  (services, APIs, Prowlarr wiring, disk space)\n"
             "  1  Radarr          (add movie, search, verify grab)\n"
             "  2  Sonarr          (add series S01, search, verify grab)\n"
-            "  3  Deluge           (poll for active downloads)\n"
+            "  3  Deluge          (poll the daemon for the grabs; cancels what it created)\n"
             "  4  Jellyfin        (poll for imported media — long timeout)\n"
             "  5  Bazarr          (subtitle provider health, wanted queue)\n"
         ),
@@ -1395,7 +1560,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--no-cleanup", action="store_true",
-        help="Skip cleanup after run (leave added movie/series for inspection)",
+        help="Skip cleanup after run (leave the added movie/series and the Deluge "
+             "downloads created by the check for inspection)",
     )
     parser.add_argument(
         "--config", default=None,
