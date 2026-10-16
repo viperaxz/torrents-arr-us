@@ -235,10 +235,20 @@ if ($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0
 $SeedRatio = if ($Config.Layer2.PSObject.Properties['PublicTrackerSeedRatio'] -and $null -ne $Config.Layer2.PublicTrackerSeedRatio) {
     [double]$Config.Layer2.PublicTrackerSeedRatio
 } else { 1.0 }
-$PublicIndexerNames = @($Config.Layer2.Prowlarr.Indexers | ForEach-Object { $_.Name })
-Write-DebugLog "VAR SeedRatio=$SeedRatio PublicIndexers=$($PublicIndexerNames.Count)"
+$PublicIndexerNames = @($Config.Layer2.Prowlarr.Indexers |
+    Where-Object { -not ($_.PSObject.Properties['SeedRules'] -and $_.SeedRules) } |
+    ForEach-Object { $_.Name })
+# Indexers that declare SeedRules are private trackers: configure_layer2_prowlarr.ps1
+# already pushed their per-indexer ratio + seed time into this app (it runs before
+# this script), so their ratio must not be overwritten with the public-tracker
+# default here.
+$SeedRuleIndexerNames = @($Config.Layer2.Prowlarr.Indexers |
+    Where-Object { $_.PSObject.Properties['SeedRules'] -and $_.SeedRules } |
+    ForEach-Object { $_.Name })
+$ConfiguredIndexerNames = @($Config.Layer2.Prowlarr.Indexers | ForEach-Object { $_.Name })
+Write-DebugLog "VAR SeedRatio=$SeedRatio PublicIndexers=$($PublicIndexerNames.Count) SeedRuleIndexers=$($SeedRuleIndexerNames.Count)"
 
-if ($SeedRatio -and $PublicIndexerNames.Count -gt 0) {
+if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
     Write-Host "  -> Configuring seed criteria (public ratio=$SeedRatio)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Configuring seed criteria: ratio=$SeedRatio"
     try {
@@ -248,6 +258,10 @@ if ($SeedRatio -and $PublicIndexerNames.Count -gt 0) {
 
         foreach ($idx in $radarrIndexers) {
             $baseName   = $idx.name -replace '\s*\(Prowlarr\)\s*$', ''
+            if ($SeedRuleIndexerNames -contains $baseName) {
+                Write-DebugLog "VAR indexer '$($idx.name)' declares SeedRules -- ratio/seed time left as applied by configure_layer2_prowlarr.ps1"
+                continue
+            }
             $isPublic   = $PublicIndexerNames -contains $baseName
             $ratioField = $idx.fields | Where-Object { $_.name -eq "seedCriteria.seedRatio" }
             if (-not $ratioField) { continue }
@@ -351,9 +365,13 @@ if ($Config.Apps.Jellyfin -eq $true) {
             } else {
                 $existingNotifs = @()
                 try {
-                    $existingNotifs = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
-                        -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop)
-                    Write-DebugLog "VAR existing notifications=$($existingNotifs.Count)"
+                    # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses
+                    # the whole response array into ONE element, so the loop below would
+                    # hand $jfNotif the array itself and $jfNotif.id would read back as
+                    # "11 12 13" -- pointing the update PUT at a non-existent id.
+                    $existingNotifs = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
+                        -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+                    Write-DebugLog "VAR existing notifications=$(@($existingNotifs).Count)"
                 } catch { Write-DebugLog "WARN" "Could not fetch existing notifications: $_" }
                 $jfNotif = $null
                 foreach ($n in $existingNotifs) {

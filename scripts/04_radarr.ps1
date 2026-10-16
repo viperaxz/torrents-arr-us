@@ -142,8 +142,15 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
                     $node = $xml.CreateElement("UrlBase"); $node.InnerText = "/$AppLower"
                     $xml.Config.AppendChild($node) | Out-Null
                 } else { $xml.Config.UrlBase = "/$AppLower" }
-            } elseif ($null -ne $xml.Config.UrlBase) {
-                $xml.Config.RemoveChild($xml.Config.UrlBase) | Out-Null
+            } else {
+                # PowerShell's XML adapter hands back an element's text (a String),
+                # not a node, so RemoveChild($xml.Config.UrlBase) throws
+                # ("cannot convert ... to type System.Xml.XmlNode"). That exception
+                # aborted the whole re-align before $xml.Save(), leaving a stale
+                # UrlBase (and the old port) behind after a DuckDNS -> Cloudflare
+                # reinstall. Remove the node itself instead.
+                $urlBaseNode = $xml.Config.SelectSingleNode("UrlBase")
+                if ($urlBaseNode) { $xml.Config.RemoveChild($urlBaseNode) | Out-Null }
             }
             $xml.Save($ConfigXml)
             Write-DebugLog "INFO" "Restored config.xml re-aligned: port=$AppPort"
