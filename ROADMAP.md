@@ -13,6 +13,21 @@ A 16-agent parallel audit fixed ~150 defects across 66 files, and a follow-up ro
 
 **Won't fix (accepted)** — the `/jellyseerr` path alias is rendered unconditionally and so 502s when `Apps.Jellyseerr = false`; and there is still no test module for ffmpeg.
 
+**Observed during the first real install run (fixed)**
+
+The first end-to-end install failed at the Caddy step for a reason no amount of static review would have found: **community.chocolatey.org's OData query endpoints were intermittently returning `503 Service Unavailable` / `504 Gateway Timeout` / connection timeouts**, while the feed root kept answering `200`. `choco install <id>` has to query that endpoint to resolve a package, so a roughly 30-second upstream blip aborted a 40-minute install. Measured against the live feed during the failure window, a single package query failed **5 times out of 8** for `winfsp` and 2 of 8 for `python312`.
+
+Two things made it far worse than it needed to be, and both are now fixed:
+
+- **`choco install` exits 0 after installing nothing.** It prints `Chocolatey installed 0/0 packages.` and returns success, so the exit code is not authoritative — the existing post-install verification was the only reason the failure was caught at all.
+- **The error was invisible.** Every call site piped choco to `| Out-Null`, so `Failed to fetch results from V2 feed ... 503 (Service Unavailable)` never reached the debug log. The same is true of a completely unreachable feed, where choco emits `Unable to load the service index for source ...` / `A connection attempt failed ...` **and still exits 0**.
+
+A second, genuinely separate bug was reproduced at the same time: **`master_uninstall.ps1` aborted at phase 7 of 8** with `The term 'choco' is not recognized`. A shell opened *before* Chocolatey was installed never sees `chocolatey\bin` even though the Machine PATH now names it, because a process reads PATH only at startup — so the uninstaller died halfway through and left the machine in a half-removed state.
+
+Both are addressed by the new `scripts/choco_helpers.ps1`, wired into 12 files (~30 call sites): `Resolve-ChocoExe` (Get-Command → the standard install path → rebuild PATH from the registry, so a stale shell can no longer break an uninstall) and `Invoke-Choco` (retry with exponential backoff, always capturing and logging the real output). Retry triggers on the transient class — the two real signatures above, plus 502/429/rate-limiting and the common connection-failure strings — and on a failure with *empty* output, which is what the original outage actually produced; a bad package id or a checksum mismatch still fails fast, and negative controls confirm that. `Get-ChocoInstalledVersion` keeps the local-lookup contract (`list --local-only --exact`) the installers already depend on.
+
+`MaxAttempts` defaults to **6** because of the measured failure rate: at 5-in-8, four attempts still fails about 15% of the time, while six brings it under 6%. Note the cost asymmetry — a fast `503` retries in about a second, but a *fully unreachable* source costs ~140 s per attempt (choco's own HTTP timeout), so that scenario now takes roughly 14 minutes before failing loudly with the captured reason, rather than failing silently.
+
 **Verification gaps — validate these first**
 
 - **The install-tree ACL lockdown has never been exercised through a real install.** `00_service_account.ps1` closes the inherited `Authenticated Users: Modify` on `InstallDir` (previously any local user could read credential files and *rewrite service executables*). The allow/deny behaviour was proven with a real temporary unprivileged account (16 operations, live), but not through a full install cycle. Watch for anything run **unelevated** that writes inside `InstallDir` — `test-suite.ps1` now requires elevation and says so; `.locks\` is deliberately left locked (a user-writable ledger could suppress a security update) and its denial is handled.
