@@ -125,6 +125,28 @@ $newCfg.password               = $Password
 if ($newCfg.PSObject.Properties["passwordConfirmation"]) {
     $newCfg.passwordConfirmation = $Password
 }
+
+# The project owns updates, so stop the app from updating itself silently.
+# versions.json is the single source of truth, and `box update` applies versions
+# through a rolling swap with a health gate, rollback and a ledger write. With
+# updateAutomatically left on, the app installs upstream builds on its own that
+# neither versions.json nor installed_versions.json knows about -- after which
+# `box check` reports "current" for a binary that is actually newer and
+# `box update` will not correct it. Bazarr already runs with --no-update for the
+# same reason; the *arr apps need it set explicitly.
+#
+# Only updateAutomatically is set. updateMechanism IS accepted by this API and
+# reads back as changed, but the app resets it to "builtIn" on every startup, so
+# it cannot be pinned from here (measured: it reverts across a restart, and this
+# script restarts the service two steps below). A manual "Install" click in the
+# UI therefore remains possible, but that is a deliberate user action rather than
+# a silent one, which is what this setting controls.
+#
+# Guarded because this PUT also carries the authentication settings: a field
+# renamed by a future upstream release must not take those down with it. The
+# "New update is available" health notice is unaffected either way -- it comes
+# from the periodic update check, which exposes no API switch.
+if ($newCfg.PSObject.Properties['updateAutomatically']) { $newCfg.updateAutomatically = $false }
 Write-DebugLog "VAR authMethod '$beforeAuth' -> 'forms' username='$Username' password=[REDACTED]"
 
 # -- 7. PUT new config ---------------------------------------------------------

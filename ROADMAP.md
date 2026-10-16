@@ -13,6 +13,13 @@ A 16-agent parallel audit fixed ~150 defects across 66 files, and a follow-up ro
 
 **Won't fix (accepted)** — the `/jellyseerr` path alias is rendered unconditionally and so 502s when `Apps.Jellyseerr = false`; and there is still no test module for ffmpeg.
 
+**Expected after a fresh install (not defects)**
+
+Two things show up in the *arr UIs right after an install and are worth recognising so they are not chased as bugs:
+
+- **"New update is available"** on Sonarr, Radarr and Prowlarr. This is by design: `versions.json` pins a known-good version and the weekly Action is what bumps it, so the app is routinely a little behind upstream. The notice comes from the app's own periodic update *check*, which exposes no API switch, so it cannot be suppressed — and it would be wrong to try, since it is accurate. What matters is that the app cannot act on it: `configure_layer1_*.ps1` sets `updateAutomatically = false`, so the upgrade path stays `box update` (rolling swap + health gate + rollback + ledger). Note `updateMechanism` cannot be pinned either — the apps reset it to `builtIn` at startup — so a manual in-app "Install" remains clickable. Prefer `box update`.
+- **"Indexers unavailable due to failures: <name> (Prowlarr)"** in Sonarr. On a fresh install the *arr apps test and RSS-sync every newly added indexer at once, and a rate-limited private tracker answers **429 TooManyRequests**; Sonarr then disables that indexer for a short window. It clears itself: observed on a real install as a burst at 22:18–22:19 followed by `Total of 100 reports were found` for the same indexer at 22:26, with the health warning gone and nothing to repair. Only investigate if it persists past the disable window or Prowlarr's own test (`POST /api/v1/indexer/test`) also fails.
+
 **Observed during the first real install run (fixed)**
 
 The first end-to-end install failed at the Caddy step for a reason no amount of static review would have found: **community.chocolatey.org's OData query endpoints were intermittently returning `503 Service Unavailable` / `504 Gateway Timeout` / connection timeouts**, while the feed root kept answering `200`. `choco install <id>` has to query that endpoint to resolve a package, so a roughly 30-second upstream blip aborted a 40-minute install. Measured against the live feed during the failure window, a single package query failed **5 times out of 8** for `winfsp` and 2 of 8 for `python312`.
