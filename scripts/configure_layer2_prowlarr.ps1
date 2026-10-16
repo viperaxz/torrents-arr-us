@@ -36,6 +36,22 @@ Write-DebugLog "VAR AppName=$AppName Port=$Port Enabled=$Enabled DomainMode=$Dom
 Write-DebugLog "VAR ProwlarrSelfUrl=$ProwlarrSelfUrl"
 Write-DebugLog "VAR ProwlarrUrlBase=$ProwlarrUrlBase SonarrUrlBase=$SonarrUrlBase RadarrUrlBase=$RadarrUrlBase"
 
+function Set-ApiFieldValue {
+    # PS5.1: the *arr API omits the "value" key entirely for a field that is
+    # unset, and ConvertFrom-Json then produces an object with no such property,
+    # so a plain "$field.value = x" throws:
+    #   Exception setting "value": "The property 'value' cannot be found on this
+    #   object. Verify that the property exists and can be set."
+    # That is exactly the common case for seedRatio/seedTime -- most indexers
+    # leave them empty, which is when the installer most needs to set them, so
+    # the seed-rule step failed for nearly every indexer. Add the property when
+    # it is missing and assign in place otherwise. Only called for fields we are
+    # actually setting, so unset fields are never serialized as JSON null.
+    param($Field, $Value)
+    if ($Field.PSObject.Properties.Name -contains 'value') { $Field.value = $Value }
+    else { $Field | Add-Member -MemberType NoteProperty -Name 'value' -Value $Value -Force }
+}
+
 if (-not $Enabled) {
     Write-Host "[$AppName] Skipped per configuration." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "$AppName skipped (not enabled)"
@@ -646,7 +662,7 @@ if ($minSeeders -gt 1) {
             foreach ($idx in $idxList) {
                 $f = $idx.fields | Where-Object { $_.name -eq "minimumSeeders" }
                 if (-not $f -or [int]$f.value -eq $minSeeders) { continue }
-                $f.value = $minSeeders
+                Set-ApiFieldValue -Field $f -Value $minSeeders
                 try {
                     Invoke-RestMethod "$appBase/api/v3/indexer/$($idx.id)" `
                         -Method Put -Headers $appHdrs `
@@ -741,10 +757,10 @@ if ($seedRulesMap.Count -gt 0) {
 
                 foreach ($field in $syncedIdx.fields) {
                     if ($field.name -eq "seedCriteria.seedRatio" -and $null -ne $rules.Ratio) {
-                        if ($field.value -ne $rules.Ratio) { $field.value = $rules.Ratio; $changed = $true }
+                        if ($field.value -ne $rules.Ratio) { Set-ApiFieldValue -Field $field -Value $rules.Ratio; $changed = $true }
                     }
                     if ($field.name -eq "seedCriteria.seedTime" -and $null -ne $rules.SeedTimeMinutes) {
-                        if ($field.value -ne $rules.SeedTimeMinutes) { $field.value = $rules.SeedTimeMinutes; $changed = $true }
+                        if ($field.value -ne $rules.SeedTimeMinutes) { Set-ApiFieldValue -Field $field -Value $rules.SeedTimeMinutes; $changed = $true }
                     }
                 }
 
