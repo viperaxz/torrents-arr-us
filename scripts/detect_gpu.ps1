@@ -18,24 +18,41 @@ function Get-NvidiaFamily([string]$name) {
 }
 
 function Get-AmdFamily([string]$name) {
+    # First match wins, so the specific RX model ranges come before the broad ones.
     switch -Regex ($name) {
-        'RX\s*9\d\d\d'                { return 'amd_rdna4' }
-        'RX\s*7\d\d\d'                { return 'amd_rdna3' }
-        'RX\s*6\d\d\d'                { return 'amd_rdna2' }
-        'RX\s*5[5-9]\d\d'             { return 'amd_rdna1' }
-        'RX\s*[45]\d\d'               { return 'amd_gcn4'  }
-        default                       { return 'amd_rdna1' }
+        # RDNA 4 - RX 9000 series (Navi 4x)
+        'RX\s*9\d\d\d'                          { return 'amd_rdna4' }
+        # RDNA 3 / 3.5 - RX 7000 series (Navi 3x) and Radeon 700M/800M iGPUs (Phoenix/Strix)
+        'RX\s*7\d\d\d|Radeon.*\b(7\d\dM|8\d\dM|80\d\dS)\b' { return 'amd_rdna3' }
+        # RDNA 2 - RX 6000 series (Navi 2x) and Radeon 600M iGPUs (Rembrandt/Mendocino)
+        'RX\s*6\d\d\d|Radeon.*\b6\d\dM\b'       { return 'amd_rdna2' }
+        # RDNA 1 - RX 5300 and RX 5500-5700 (Navi 1x); must precede the RX 4xx/5xx GCN rule
+        'RX\s*53\d\d|RX\s*5[5-9]\d\d'           { return 'amd_rdna1' }
+        # GCN 4th gen (Polaris) - RX 400/500 series: H.264 encode only, no HEVC encode
+        'RX\s*[45]\d\d'                         { return 'amd_gcn4'  }
+        # Vega (GCN 5th gen / VCN 1.0) and Radeon VII - no AV1, kept on the conservative profile
+        'Vega|Radeon\s*VII'                     { return 'amd_gcn4'  }
+        # Unmatched AMD (generic "Radeon Graphics", pre-GCN, OEM renames): assume the oldest
+        # supported generation. amd_rdna1 would promise HEVC encode the card may not have.
+        default                                 { return 'amd_gcn4'  }
     }
 }
 
 function Get-IntelFamily([string]$name) {
+    # First match wins. Newer/more specific families (Arc, Iris Xe = 11th gen, UHD 7xx =
+    # 12th gen) are listed before the older ones; the legacy "Iris ... Graphics <number>"
+    # rule is listed before the unnumbered Ice Lake "Iris Plus" rule so 8th/9th gen Iris
+    # CPU parts still resolve to intel_uhd_8th. Intel inserts "(R)"/"(TM)" tokens and a
+    # "Graphics" infix into adapter names, so the patterns tolerate both.
     switch -Regex ($name) {
-        'Arc'                          { return 'intel_arc'      }
-        'Iris\s*Xe'                    { return 'intel_uhd_11th' }
-        'UHD\s*7[0-9]\d'              { return 'intel_uhd_12th' }
-        'UHD\s*6[2-9]\d'              { return 'intel_uhd_8th'  }
-        'HD\s*[56]\d\d'               { return 'intel_hd'        }
-        default                       { return 'intel_uhd_8th'   }
+        'Arc'                                   { return 'intel_arc'      }
+        'Iris(\(R\)|\(TM\))?\s*Xe'              { return 'intel_uhd_11th' }
+        'UHD\s*(Graphics\s*)?7[0-9]\d'          { return 'intel_uhd_12th' }
+        'Iris.*Graphics\s*\d'                   { return 'intel_uhd_8th'  }
+        'Iris.*Plus'                            { return 'intel_uhd_10th' }
+        'UHD\s*(Graphics\s*)?6[2-9]\d'          { return 'intel_uhd_8th'  }
+        'HD\s*[56]\d\d'                         { return 'intel_hd'       }
+        default                                 { return 'intel_uhd_8th'  }
     }
 }
 

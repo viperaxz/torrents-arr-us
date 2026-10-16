@@ -57,12 +57,15 @@ if ($GPU -notmatch '_') {
         }
     }
     if ($GPU -notmatch '_') {
-        # Detection failed or no dedicated GPU found; use conservative safe fallbacks
+        # Detection failed or no dedicated GPU found; use conservative safe fallbacks.
+        # These must stay in step with detect_gpu.ps1's defaults: 'amd' used to map
+        # to amd_rdna1, which promised HEVC encode to Vega-class and unknown parts.
+        # amd_gcn4 is the AMD analogue of nvidia_pascal / intel_uhd_8th - H.264 only.
         $GPU = switch ($GPU.ToLower()) {
             'nvidia' { 'nvidia_pascal'  }
             'intel'  { 'intel_uhd_8th'  }
-            'amd'    { 'amd_rdna1'       }
-            default  { 'cpu'             }
+            'amd'    { 'amd_gcn4'       }
+            default  { 'cpu'            }
         }
         Write-Host "  -> GPU family detection not available; using safe fallback: $GPU" -ForegroundColor Yellow
         Write-DebugLog "WARN" "Falling back to conservative family slug '$GPU'"
