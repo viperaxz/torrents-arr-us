@@ -121,6 +121,21 @@ $PythonExe = $null
 function Test-PythonCandidate {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return $null }
+
+    # The interpreter must be readable by the account the Bazarr service runs as
+    # ($SvcUser), not merely by the operator running this installer. A Python
+    # installed per-user -- python.org's default when not elevated, winget, or
+    # the Microsoft Store alias -- lives under C:\Users\<name>\ and grants no
+    # access to any other account. NSSM then fails the service instantly with a
+    # 0-byte stderr log and Win32 exit code 1066, which is extremely hard to
+    # diagnose from the installer output. Reject these so Step 4 installs the
+    # machine-wide python312 package (C:\Python312) instead.
+    $usersRoot = Join-Path $env:SystemDrive 'Users'
+    if ($Path -like "$usersRoot\*" -or $Path -like '*\WindowsApps\*') {
+        Write-DebugLog "WARN" "Python candidate rejected -- not readable by service account '$SvcUser': $Path"
+        return $null
+    }
+
     try {
         $verOut = & $Path --version 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -129,6 +144,28 @@ function Test-PythonCandidate {
             $minor = [int]$Matches[2]
             $patch = [int]$Matches[3]
             if ($major -eq 3 -and $minor -ge 9) {
+                # Bazarr installs its dependencies with pip, so an interpreter
+                # without a working pip is not usable even though "python
+                # --version" succeeds. A half-finished python.org install leaves
+                # exactly that behind: on this machine `choco install python312`
+                # exited 1603 and left C:\Python312\python.exe with no standard
+                # library and no pip at all, so accepting it bound the service to
+                # an interpreter that could never run. Verify pip really works.
+                $pipOk = $false
+                $savedEap = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $null = & $Path -m pip --version 2>&1
+                    $pipOk = ($LASTEXITCODE -eq 0)
+                } catch {
+                    $pipOk = $false
+                } finally {
+                    $ErrorActionPreference = $savedEap
+                }
+                if (-not $pipOk) {
+                    Write-DebugLog "WARN" "Python candidate rejected -- no working pip (incomplete install?): $Path"
+                    return $null
+                }
                 return [PSCustomObject]@{ Path=$Path; Major=$major; Minor=$minor; Patch=$patch; VersionStr="$major.$minor.$patch" }
             }
         }
@@ -404,6 +441,16 @@ if (-not $svcExists) {
     Write-DebugLog "INFO" "NSSM service '$AppName' created. stdoutLog=$(Join-Path $DataDir 'bazarr-stdout.log')"
 } else {
     Write-DebugLog "INFO" "NSSM service '$AppName' already exists"
+    # Self-heal a service bound to the wrong interpreter. Earlier versions could
+    # point the service at a per-user Python the service account cannot read; a
+    # re-run must repair that rather than keep the broken binary path.
+    $svcParams = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$AppName\Parameters" -ErrorAction SilentlyContinue
+    $svcApp = if ($svcParams) { $svcParams.Application } else { $null }
+    if ($svcApp -and $svcApp.Trim('"') -ne $PythonExe) {
+        Write-Host "  -> Service pointed at '$svcApp'; correcting to '$PythonExe'." -ForegroundColor Yellow
+        Write-DebugLog "WARN" "$AppName service Application was '$svcApp', resetting to '$PythonExe'"
+        nssm set $AppName Application "`"$PythonExe`"" | Out-Null
+    }
 }
 
 # -- 7. Firewall ---------------------------------------------------------------
@@ -492,8 +539,16 @@ if ($svc -and $svc.Status -eq "Running") {
     Write-Host "  -> $AppName running on port $AppPort." -ForegroundColor Green
     Write-DebugLog "INFO" "$AppName is Running on port $AppPort"
 } else {
-    Write-Warning "  -> $AppName may not have started. Check $DataDir\bazarr-stderr.log"
-    Write-DebugLog "WARN" "$AppName may not be running. Check $DataDir\bazarr-stderr.log"
+    # Do NOT record success for a service that never started. Writing the lock
+    # file and the ledger entry here used to make a broken Bazarr permanent: the
+    # next master_install.ps1 run saw "Already installed. Skipping." and never
+    # repaired it. Leaving both unwritten means a re-run genuinely retries, and
+    # exit 1 makes master_install.ps1 report FAILED -- it continues with the
+    # other apps and skips only this app's configure step.
+    Write-Host "  -> $AppName did NOT reach Running. Not recording it as installed." -ForegroundColor Red
+    Write-Warning "  -> $AppName failed to start. Check $DataDir\bazarr-stderr.log"
+    Write-DebugLog "ERROR" "$AppName did not reach Running (status=$(if ($svc) { $svc.Status } else { 'NOT FOUND' })); lock file and ledger NOT written so a re-run retries"
+    exit 1
 }
 
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
