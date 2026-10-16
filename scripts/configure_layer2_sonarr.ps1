@@ -249,10 +249,20 @@ if ($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0
 $SeedRatio = if ($Config.Layer2.PSObject.Properties['PublicTrackerSeedRatio'] -and $null -ne $Config.Layer2.PublicTrackerSeedRatio) {
     [double]$Config.Layer2.PublicTrackerSeedRatio
 } else { 1.0 }
-$PublicIndexerNames = @($Config.Layer2.Prowlarr.Indexers | ForEach-Object { $_.Name })
-Write-DebugLog "VAR SeedRatio=$SeedRatio PublicIndexers=$($PublicIndexerNames.Count)"
+$PublicIndexerNames = @($Config.Layer2.Prowlarr.Indexers |
+    Where-Object { -not ($_.PSObject.Properties['SeedRules'] -and $_.SeedRules) } |
+    ForEach-Object { $_.Name })
+# Indexers that declare SeedRules are private trackers: configure_layer2_prowlarr.ps1
+# already pushed their per-indexer ratio + seed time into this app (it runs before
+# this script), so their ratio must not be overwritten with the public-tracker
+# default here.
+$SeedRuleIndexerNames = @($Config.Layer2.Prowlarr.Indexers |
+    Where-Object { $_.PSObject.Properties['SeedRules'] -and $_.SeedRules } |
+    ForEach-Object { $_.Name })
+$ConfiguredIndexerNames = @($Config.Layer2.Prowlarr.Indexers | ForEach-Object { $_.Name })
+Write-DebugLog "VAR SeedRatio=$SeedRatio PublicIndexers=$($PublicIndexerNames.Count) SeedRuleIndexers=$($SeedRuleIndexerNames.Count)"
 
-if ($SeedRatio -and $PublicIndexerNames.Count -gt 0) {
+if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
     Write-Host "  -> Configuring seed criteria (public ratio=$SeedRatio)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Configuring seed criteria: ratio=$SeedRatio for $($PublicIndexerNames.Count) public indexers"
 
@@ -263,6 +273,10 @@ if ($SeedRatio -and $PublicIndexerNames.Count -gt 0) {
 
         foreach ($idx in $sonarrIndexers) {
             $baseName   = $idx.name -replace '\s*\(Prowlarr\)\s*$', ''
+            if ($SeedRuleIndexerNames -contains $baseName) {
+                Write-DebugLog "VAR indexer '$($idx.name)' declares SeedRules -- ratio/seed time left as applied by configure_layer2_prowlarr.ps1"
+                continue
+            }
             $isPublic   = $PublicIndexerNames -contains $baseName
             $ratioField = $idx.fields | Where-Object { $_.name -eq "seedCriteria.seedRatio" }
             if (-not $ratioField) { continue }
@@ -373,9 +387,13 @@ if ($Config.Apps.Jellyfin -eq $true) {
             } else {
                 $existingNotifs = @()
                 try {
-                    $existingNotifs = @(Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
-                        -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop)
-                    Write-DebugLog "VAR existing notifications=$($existingNotifs.Count)"
+                    # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses
+                    # the whole response array into ONE element, so the loop below would
+                    # hand $jfNotif the array itself and $jfNotif.id would read back as
+                    # "11 12 13" -- pointing the update PUT at a non-existent id.
+                    $existingNotifs = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
+                        -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+                    Write-DebugLog "VAR existing notifications=$(@($existingNotifs).Count)"
                 } catch { Write-DebugLog "WARN" "Could not fetch existing notifications: $_" }
                 $jfNotif = $null
                 foreach ($n in $existingNotifs) {
@@ -468,6 +486,13 @@ if ($Config.Apps.Jellyfin -eq $true) {
 # metadata finishes  --  leaving the season detached from the series. This custom
 # script fires on every OnDownload event, waits 45 s, then calls
 # Items/{seriesId}/Refresh so the hierarchy is always correct.
+#
+# The hook runs as seedbox-svc, which must NOT be able to read config.json (it
+# holds every credential in the stack).  It therefore gets a purpose-built sidecar
+# in the ACL-protected secrets directory -- base URL, Jellyfin API key and admin
+# user id, nothing else -- and both the script and its wrapper are deployed into
+# InstallDir, which is already that account's own directory.  No ACL anywhere is
+# widened for this hook.
 $RefreshScriptSrc = Join-Path $PSScriptRoot "sonarr_jellyfin_refresh.py"
 Write-DebugLog "VAR RefreshScriptSrc=$RefreshScriptSrc (exists=$(Test-Path $RefreshScriptSrc))"
 
@@ -490,28 +515,113 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
 
     if ($PythonExe -and (Test-Path $PythonExe)) {
         Write-Host "  -> Registering Jellyfin series refresh hook..." -ForegroundColor Gray
-
-        # Copy scripts to InstallDir so seedbox-svc can execute them
-        $InstallDir    = $Config.General.InstallDir
-        $RefreshPy     = Join-Path $InstallDir "sonarr_jellyfin_refresh.py"
-        $RefreshCmd    = Join-Path $InstallDir "sonarr_jellyfin_refresh.cmd"
-        Copy-Item $RefreshScriptSrc $RefreshPy -Force
-        $cmdContent = "@echo off`r`n`"$PythonExe`" `"$RefreshPy`"`r`n"
-        [System.IO.File]::WriteAllText($RefreshCmd, $cmdContent, [System.Text.Encoding]::ASCII)
-        $RefreshScript = $RefreshCmd
-        Write-DebugLog "INFO" "Refresh script deployed to $RefreshScript"
-
         try {
-            $existingScripts = @(Invoke-RestMethod `
-                -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
-                -Headers @{"X-Api-Key"=$ApiKey} -UseBasicParsing -ErrorAction Stop)
-            $hookExists = $existingScripts | Where-Object {
-                $_.implementation -eq "CustomScript" -and
-                ($_.fields | Where-Object { $_.name -eq "path" -and $_.value -like "*sonarr_jellyfin_refresh*" })
+            # -- 9a. Resolve what the hook needs: no config.json, no password ----
+            $InstallDir      = $Config.General.InstallDir
+            $JellyfinKeyFile = Join-Path $InstallDir "secrets\jellyfin_api_key.txt"
+            Write-DebugLog "VAR JellyfinKeyFile=$JellyfinKeyFile (exists=$(Test-Path $JellyfinKeyFile))"
+            if (-not (Test-Path $JellyfinKeyFile)) {
+                throw "Jellyfin API key not found at '$JellyfinKeyFile' -- re-run scripts\configure_layer2_jellyfin_libraries.ps1 (it writes the key), then re-run this script"
             }
-            Write-DebugLog "VAR JellyfinRefreshHook exists=$($null -ne $hookExists)"
+            $JellyfinApiKey = ([System.IO.File]::ReadAllText($JellyfinKeyFile, [System.Text.Encoding]::UTF8)).TrimStart([char]0xFEFF).Trim()
+            if (-not $JellyfinApiKey) {
+                throw "Jellyfin API key file '$JellyfinKeyFile' is empty -- re-run scripts\configure_layer2_jellyfin_libraries.ps1, then re-run this script"
+            }
 
-            if (-not $hookExists) {
+            # Mode-aware base URL, built the same way section 8 does it.
+            $JellyfinUrlBase = if ($DomainMode -eq "duckdns") { "/jellyfin" } else { "" }
+            $JellyfinBase    = "http://127.0.0.1:$($Config.Ports.Jellyfin)$JellyfinUrlBase"
+
+            # Resolve the admin user id HERE, at configure time, so a hook that
+            # cannot authenticate fails loudly during install instead of silently
+            # no-op'ing on every future download.
+            $JellyfinUserId = $null
+            try {
+                # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the
+                # response array into a single element, so the loop below would receive the
+                # array rather than a user and [string]$u.Id would become "id1 id2 id3".
+                $jfUsers = Invoke-RestMethod -Uri "$JellyfinBase/Users" `
+                    -Headers @{"X-Emby-Authorization" = "MediaBrowser Token=`"$JellyfinApiKey`""} `
+                    -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                foreach ($u in $jfUsers) {
+                    if ($u.Policy -and $u.Policy.IsAdministrator -eq $true) { $JellyfinUserId = [string]$u.Id; break }
+                }
+                Write-DebugLog "VAR Jellyfin users=$(@($jfUsers).Count) adminUserId=$JellyfinUserId"
+            } catch {
+                Write-DebugLog "WARN" "Could not list Jellyfin users at $JellyfinBase : $_"
+            }
+            if (-not $JellyfinUserId) {
+                throw "no Jellyfin administrator account resolved at '$JellyfinBase' -- check that Jellyfin is running and has an admin user, then re-run this script"
+            }
+
+            # -- 9b. Write the hook's own settings into the ACL-protected dir ----
+            $HookConfigPath = Join-Path $InstallDir "secrets\jellyfin_hook.json"
+            $hookSettings = [ordered]@{
+                base_url = $JellyfinBase
+                api_key  = $JellyfinApiKey
+                user_id  = $JellyfinUserId
+            }
+            $secretsDir = Split-Path $HookConfigPath -Parent
+            if (-not (Test-Path $secretsDir)) { New-Item -Path $secretsDir -ItemType Directory -Force | Out-Null }
+            # BOM-free, and only those three fields -- secrets\ keeps its existing
+            # ACL (Administrators/SYSTEM full, seedbox-svc read); nothing here
+            # loosens it, and the admin password is never copied out of config.json.
+            [System.IO.File]::WriteAllText($HookConfigPath, ($hookSettings | ConvertTo-Json -Compress),
+                (New-Object System.Text.UTF8Encoding($false)))
+            Write-DebugLog "INFO" "Jellyfin hook settings written: $HookConfigPath (base_url=$JellyfinBase userId=$JellyfinUserId ******"
+
+            # -- 9c. Deploy the hook into InstallDir (seedbox-svc's own dir) -----
+            # %~dp0 keeps the wrapper location-independent, so the .py finds its
+            # sidecar as <script dir>\secrets\jellyfin_hook.json wherever it lands.
+            $RefreshPy  = Join-Path $InstallDir "sonarr_jellyfin_refresh.py"
+            $RefreshCmd = Join-Path $InstallDir "sonarr_jellyfin_refresh.cmd"
+            Copy-Item -LiteralPath $RefreshScriptSrc -Destination $RefreshPy -Force
+            $cmdContent = "@echo off`r`n`"$PythonExe`" `"%~dp0sonarr_jellyfin_refresh.py`"`r`n"
+            [System.IO.File]::WriteAllText($RefreshCmd, $cmdContent, [System.Text.Encoding]::ASCII)
+            $RefreshScript = $RefreshCmd
+            Write-DebugLog "INFO" "Refresh hook deployed: $RefreshScript (settings=$HookConfigPath)"
+
+            # -- 9d. Register the Custom Script connection in Sonarr -------------
+            # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the
+            # response array into a single element, which would make the detection loop
+            # below select the array itself and read .id as "11 12 13".
+            $existingScripts = Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
+                -Headers @{"X-Api-Key"=$ApiKey} -UseBasicParsing -ErrorAction Stop
+            $hookExists = $null
+            foreach ($n in $existingScripts) {
+                if ($n.implementation -eq "CustomScript" -and
+                    ($n.fields | Where-Object { $_.name -eq "path" -and $_.value -like "*sonarr_jellyfin_refresh*" })) {
+                    $hookExists = $n; break
+                }
+            }
+            $hookPath = if ($hookExists) {
+                ($hookExists.fields | Where-Object { $_.name -eq "path" } | Select-Object -First 1).value
+            } else { $null }
+            Write-DebugLog "VAR JellyfinRefreshHook exists=$($null -ne $hookExists) path=$hookPath"
+
+            if ($hookExists -and $hookPath -ne $RefreshScript) {
+                # An earlier install registered the hook against a different path
+                # (for example a copy made under the project tree). Re-point it
+                # instead of leaving a hook that silently does nothing.
+                foreach ($field in $hookExists.fields) {
+                    if (-not ($field.PSObject.Properties.Name -contains 'value')) {
+                        $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $null -Force
+                    }
+                    if ($field.name -eq "path") { $field.value = $RefreshScript }
+                }
+                $hookExists.enable     = $true
+                $hookExists.onDownload = $true
+                $hookExists.onUpgrade  = $true
+                Invoke-RestMethod `
+                    -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification/$($hookExists.id)" `
+                    -Method Put `
+                    -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+                    -Body ($hookExists | ConvertTo-Json -Depth 10 -Compress) `
+                    -UseBasicParsing -ErrorAction Stop | Out-Null
+                Write-Host "     [OK] Jellyfin series refresh hook re-pointed to the project script." -ForegroundColor Green
+                Write-DebugLog "INFO" "Jellyfin refresh hook re-pointed: '$hookPath' -> '$RefreshScript'"
+            } elseif (-not $hookExists) {
                 $hookSchema = $null
                 $schemas2 = Invoke-RestMethod `
                     -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification/schema" `
@@ -570,9 +680,12 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
                 Write-DebugLog "INFO" "Jellyfin refresh hook already exists"
             }
         } catch {
-            Write-Warning "     Could not register Jellyfin refresh hook: $_"
-            Write-DebugLog "WARN" "Jellyfin refresh hook registration failed: $_"
+            Write-Warning "     Jellyfin series refresh hook NOT registered: $_"
+            Write-DebugLog "WARN" "Jellyfin refresh hook not registered: $_"
         }
+    } else {
+        Write-Warning "     Python not found  --  Jellyfin series refresh hook NOT registered."
+        Write-DebugLog "WARN" "No Python interpreter found; refresh hook skipped"
     }
 }
 

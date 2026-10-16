@@ -146,12 +146,24 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
                     $node = $xml.CreateElement("UrlBase"); $node.InnerText = "/$AppLower"
                     $xml.Config.AppendChild($node) | Out-Null
                 } else { $xml.Config.UrlBase = "/$AppLower" }
-            } elseif ($null -ne $xml.Config.UrlBase) {
-                $xml.Config.RemoveChild($xml.Config.UrlBase) | Out-Null
+            } else {
+                # PowerShell's XML adapter hands back an element's text (a String),
+                # not a node, so RemoveChild($xml.Config.UrlBase) throws
+                # ("cannot convert ... to type System.Xml.XmlNode"). That exception
+                # used to abort the whole re-align before $xml.Save(), leaving a
+                # stale UrlBase (and port) behind after a DuckDNS -> Cloudflare
+                # reinstall. Remove the node itself instead.
+                $urlBaseNode = $xml.Config.SelectSingleNode("UrlBase")
+                if ($urlBaseNode) { $xml.Config.RemoveChild($urlBaseNode) | Out-Null }
             }
             $xml.Save($ConfigXml)
             Write-DebugLog "INFO" "Restored config.xml re-aligned: port=$AppPort"
         } catch {
+            # Write-DebugLog is a no-op unless General.DebugLogging is on, so warn
+            # on the console too: an unaligned config.xml (wrong port / stale
+            # UrlBase) leaves Sonarr unreachable through Caddy and no other step
+            # re-checks it.
+            Write-Warning "  -> Could not re-align the restored config.xml: $_"
             Write-DebugLog "WARN" "config.xml re-align failed: $_"
         }
     }
@@ -210,7 +222,16 @@ Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s
 if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
     Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
     Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
+    # Stop-Service can return before the NSSM-managed process has actually exited,
+    # and a process that is still shutting down rewrites config.xml on its way out,
+    # discarding the edit made below. Wait for the service to report Stopped, the
+    # same way configure_layer1_sonarr.ps1 waits before restoring its config backup.
+    $stopDeadline = (Get-Date).AddSeconds(15)
+    do {
+        Start-Sleep -Seconds 1
+        $svcStopping = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+    } while ($svcStopping -and $svcStopping.Status -ne "Stopped" -and (Get-Date) -lt $stopDeadline)
+    Write-DebugLog "VAR $AppName status after stop wait=$(if ($svcStopping) { $svcStopping.Status } else { 'N/A' })"
     try {
         [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
         $beforeUrlBase = $xml.Config.UrlBase
@@ -231,6 +252,23 @@ if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
     }
     Start-Service -Name $AppName -ErrorAction SilentlyContinue
     Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
+
+    # Verify the edit survived the restart. Without UrlBase Sonarr answers only on
+    # "/" while Caddy sends every request to "/sonarr", so a lost edit makes the app
+    # unreachable through the proxy -- worth a warning rather than a silent success.
+    Start-Sleep -Seconds 3
+    try {
+        [xml]$verifyXml = Get-Content -Path $ConfigXml -Encoding UTF8
+        $verifyUrlBase  = [string]$verifyXml.Config.UrlBase
+        if ($verifyUrlBase -ne "/$AppLower") {
+            Write-Warning "  -> config.xml UrlBase is '$verifyUrlBase' (expected '/$AppLower'). Sonarr will not answer on the /$AppLower path route."
+            Write-DebugLog "WARN" "UrlBase verification failed: got '$verifyUrlBase'"
+        } else {
+            Write-DebugLog "INFO" "UrlBase verification OK: '/$AppLower'"
+        }
+    } catch {
+        Write-DebugLog "WARN" "UrlBase verification could not read config.xml: $_"
+    }
 } elseif (-not (Test-Path $ConfigXml)) {
     Write-Warning "  -> config.xml not found after 90s. UrlBase not set."
     Write-DebugLog "WARN" "config.xml not generated within 90s. UrlBase not set."
