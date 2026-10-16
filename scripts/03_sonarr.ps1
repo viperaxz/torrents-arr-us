@@ -284,8 +284,16 @@ if ($svc -and $svc.Status -eq "Running") {
     Write-Host "  -> $AppName running on port $AppPort." -ForegroundColor Green
     Write-DebugLog "INFO" "$AppName is Running on port $AppPort"
 } else {
-    Write-Warning "  -> $AppName may not have started. Check $DataDir\$AppLower.log"
-    Write-DebugLog "WARN" "$AppName may not be running. Check $DataDir\$AppLower.log"
+    # Do NOT record success for a service that never started. Writing the lock file
+    # and the ledger entry here made a broken app permanent: the next
+    # master_install.ps1 run saw "Already installed. Skipping." and never repaired it.
+    # Leaving both unwritten means a re-run genuinely retries, and exit 1 makes
+    # master_install.ps1 report this app FAILED -- it continues with the other apps
+    # and skips only this app's configure step.
+    Write-Host "  -> $AppName did NOT reach Running. Not recording it as installed." -ForegroundColor Red
+    Write-Warning "  -> $AppName failed to start. Check $DataDir\$AppLower.log"
+    Write-DebugLog "ERROR" "$AppName did not reach Running (status=$(if ($svc) { $svc.Status } else { 'NOT FOUND' })); lock file and ledger NOT written so a re-run retries"
+    exit 1
 }
 
 # 10. Lock file (stores installed version for update comparison)

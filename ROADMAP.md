@@ -26,7 +26,6 @@ Two things show up in the *arr UIs right after an install and are worth recognis
 
 **Silent-success / health-check gaps (still open)**
 
-- **Three installers still write lock + ledger when the service never started** — Sonarr, Radarr and Prowlarr. ffmpeg, Jellyfin, Deluge, FlareSolverr, Zurg, rclone and — since the first full install — **Bazarr** are hardened; the rest leave a permanently "Already installed. Skipping." state that no re-run repairs. This is not theoretical: it is exactly what made Bazarr unrecoverable. It warned that the service was `Stopped`, then wrote the lock anyway, so every re-run reported "Already installed. Skipping." and never repaired it. `09_bazarr.ps1` is now the template for the remaining three: write neither the lock nor the ledger, and `exit 1`, when the service does not reach `Running`.
 - **The service-state check cannot prove the *new* image is loaded.** `Restart-Service -Force` can silently no-op on a failed stop, which `update_crowdsec.ps1` / `update_crowdsecbouncer.ps1` now verify around — so they confirm the service is `Running`, not which binary it is running.
 
 **Feature / UX gaps (still open)**

@@ -1157,6 +1157,24 @@ if ($DomainMode -eq "cloudflare") {
     }
 }
 
+# -- Refuse to record a Grafana that never came up -----------------------------
+# Re-queried rather than reusing $svcGrafana: that object is a snapshot taken before
+# the Caddyfile patch and the DNS update, so it says nothing about the service now.
+$svcLock = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+Write-DebugLog "VAR $AppName final status=$(if ($svcLock) { $svcLock.Status } else { 'NOT FOUND' })"
+if (-not ($svcLock -and $svcLock.Status -eq "Running")) {
+    # Do NOT record success for a service that never started. Writing the lock file
+    # and the ledger entries here made a broken app permanent: the next
+    # master_install.ps1 run saw "Already installed. Skipping." and never repaired it.
+    # Leaving them unwritten means a re-run genuinely retries, and exit 1 makes
+    # master_install.ps1 report this app FAILED -- it continues with the other apps
+    # and skips only this app's configure step.
+    Write-Host "  -> $AppName did NOT reach Running. Not recording it as installed." -ForegroundColor Red
+    Write-Warning "  -> $AppName failed to start. Check $GrafanaData\logs\grafana.log"
+    Write-DebugLog "ERROR" "$AppName did not reach Running (status=$(if ($svcLock) { $svcLock.Status } else { 'NOT FOUND' }), apiReady=$grafanaReady); lock file and ledger NOT written so a re-run retries"
+    exit 1
+}
+
 # -- Write lock file -----------------------------------------------------------
 [System.IO.File]::WriteAllText($LockFile, "installed", $utf8NoBom)
 Write-DebugLog "INFO" "14_grafana.ps1 complete. Lock: $LockFile"
