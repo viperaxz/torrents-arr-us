@@ -144,10 +144,19 @@ function barClass(pct) {
   return 'bar-ok';
 }
 
-function svcDot(status) {
-  if (status === 'Running') return 'dot-green';
-  if (status === 'Stopped') return 'dot-red';
+function svcDot(s) {
+  if (s.state === 'Running') return s.api_ok === false ? 'dot-yellow' : 'dot-green';
+  if (s.state === 'Stopped') return 'dot-red';
   return 'dot-yellow';
+}
+
+function svcTitle(s) {
+  var parts = [s.name];
+  if (s.state && s.state !== 'Running') parts.push('service ' + s.state.toLowerCase());
+  if (s.api_ok === false) parts.push('API unreachable');
+  else if (s.api_ok === true) parts.push('API OK' + (s.api_latency_ms ? ' (' + s.api_latency_ms + ' ms)' : '') + (s.consecutive_ok ? ', ' + s.consecutive_ok + ' consecutive checks' : ''));
+  else parts.push('API status unknown');
+  return parts.join(': ');
 }
 
 function renderStats(d) {
@@ -157,7 +166,7 @@ function renderStats(d) {
   html += '<div class="stat-card"><div class="stat-card-title">Services</div><div class="svc-list">';
   if (d.services && d.services.length) {
     d.services.forEach(function(s) {
-      html += '<span class="svc"><span class="dot ' + svcDot(s.state) + '"></span>' + s.name + '</span>';
+      html += '<span class="svc" title="' + svcTitle(s) + '"><span class="dot ' + svcDot(s) + '"></span>' + s.name + '</span>';
     });
   } else {
     html += '<span class="stats-msg">No service data</span>';
