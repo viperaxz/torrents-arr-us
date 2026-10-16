@@ -149,9 +149,12 @@ try {
     Write-DebugLog "WARN" "Public IP detection failed: $_"
 }
 
-$crowdsecOk   = $false
-$bouncerOk    = $false
-$blocklistOk  = $false
+$crowdsecOk      = $false
+$bouncerOk       = $false
+$blocklistOk     = $false
+# A partial blocklist update applies what it could fetch, so it is neither a
+# clean success nor a failure -- the summary has to say which it was.
+$blocklistPartial = $false
 
 # == Phase 1: CrowdSec Security Engine =========================================
 Write-Host "  [CrowdSec] Installing Security Engine..." -ForegroundColor Gray
@@ -668,11 +671,16 @@ if ($DoBlocklists) {
     try {
         & $blocklistScript
         # update_blocklists.ps1 exits 1 when no rules could be applied or a rule
-        # failed to build. Without this check the summary below reported a hard
-        # failure (or an empty fetch) as "OK".
+        # failed to build, and 2 when it applied what it could but one or more
+        # sources were unavailable. Without this check the summary below reported
+        # a hard failure (or an empty fetch) as "OK".
         if ($LASTEXITCODE -eq 0) {
             $blocklistOk = $true
             Write-DebugLog "INFO" "Initial blocklist update complete"
+        } elseif ($LASTEXITCODE -eq 2) {
+            $blocklistPartial = $true
+            Write-DebugLog "WARN" "Initial blocklist update partial: one or more sources unavailable"
+            Write-Host "  -> Blocklist update PARTIAL: some sources were unavailable; the rest were applied." -ForegroundColor Yellow
         } else {
             Write-DebugLog "WARN" "Initial blocklist update exited $LASTEXITCODE -- rules left unchanged"
             Write-Host "  -> Blocklist update failed (exit $LASTEXITCODE) -- existing rules kept." -ForegroundColor Yellow
@@ -712,7 +720,7 @@ Write-Host "    Detection (CrowdSec engine) : $(if ($crowdsecOk) { 'OK' } else {
     -ForegroundColor $(if ($crowdsecOk) { 'Green' } else { 'Yellow' })
 Write-Host "    Enforcement (FW bouncer)    : $(if ($bouncerOk)  { 'OK' } else { 'FAILED' })" `
     -ForegroundColor $(if ($bouncerOk)  { 'Green' } else { 'Yellow' })
-Write-Host "    Abuse blocklists            : $(if (-not $DoBlocklists) { 'disabled' } elseif ($blocklistOk) { 'OK' } else { 'FAILED' })" `
+Write-Host "    Abuse blocklists            : $(if (-not $DoBlocklists) { 'disabled' } elseif ($blocklistOk) { 'OK' } elseif ($blocklistPartial) { 'PARTIAL (source(s) unavailable)' } else { 'FAILED' })" `
     -ForegroundColor $(if (-not $DoBlocklists) { 'DarkGray' } elseif ($blocklistOk) { 'Green' } else { 'Yellow' })
 if ($crowdsecOk) {
     Write-Host ""

@@ -200,8 +200,19 @@ try {
 }
 
 $srcNote = if ($failedSources -gt 0) { " ($failedSources source(s) unavailable)" } else { "" }
-Write-Host "  [Blocklist] $applied abuse CIDRs blocked across $($live.Count) rule(s) (Spamhaus DROP + Firehol level-1)$srcNote." -ForegroundColor Green
+Write-Host "  [Blocklist] $applied abuse CIDRs blocked across $($live.Count) rule(s) (Spamhaus DROP + Firehol level-1)$srcNote." -ForegroundColor $(if ($failedSources -gt 0) { 'Yellow' } else { 'Green' })
 if ($ruleErrors -gt 0) { exit 1 }
+# Exit codes, so callers can tell a partial result from a clean one:
+#   0 = every source fetched and all rules applied
+#   2 = partial: one or more sources were unavailable or parsed to nothing, but
+#       the lists that did load were applied and are protecting the box.
+#       Deliberately non-zero so a caller cannot report it as plain OK: a source
+#       being unreachable or silently retired is worth noticing.
+#   1 = nothing applied, or a rule failed to build (handled above)
+if ($failedSources -gt 0) {
+    Write-Host "  [Blocklist] Partial update: $failedSources source(s) unavailable -- exiting 2 so callers can tell this apart from a clean run." -ForegroundColor Yellow
+    exit 2
+}
 # Exit explicitly: a script that just runs off the end leaves $LASTEXITCODE set
 # to whatever the last native command left behind, so callers (12_security.ps1,
 # the scheduled task) could not tell a success from a failure.
