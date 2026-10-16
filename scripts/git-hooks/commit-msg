@@ -1,0 +1,40 @@
+#!/bin/sh
+# commit-msg hook -- repository rule: commits are authored by the human only.
+#
+# See .github/copilot-instructions.md. AI agents habitually append
+#   Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+# to every commit they make. This repository does not want that, so the line is
+# removed here instead of merely being discouraged in a document: an agent (or a
+# template, or a GUI) that never reads the instructions still cannot persist the
+# trailer.
+#
+# The commit is not rejected -- rejecting would interrupt legitimate work over a
+# cosmetic line -- but a warning is printed on every occurrence so the behaviour
+# gets corrected rather than quietly tolerated.
+#
+# Enable once per clone:
+#   git config core.hooksPath scripts/git-hooks
+
+msg_file="$1"
+[ -n "$msg_file" ] || exit 0
+[ -f "$msg_file" ] || exit 0
+
+# Only AI attribution is matched. A genuine human co-author is left untouched.
+pattern='^[[:space:]]*(co-authored-by|co-authored|generated-by|assisted-by)[[:space:]]*:[[:space:]]*(copilot|github[ -]copilot|claude|chatgpt|openai|gpt|gemini|cursor|codex|ai|assistant)([[:space:]>]|$)'
+
+if grep -qiE "$pattern" "$msg_file"; then
+    tmp="$(mktemp)"
+    grep -viE "$pattern" "$msg_file" > "$tmp"
+    # Strip the blank line left behind where the trailer sat, and normalise the
+    # trailing newline. `git stripspace` is exactly the right tool for this.
+    git stripspace < "$tmp" > "$msg_file"
+    rm -f "$tmp"
+
+    echo ""
+    echo "  *** WARNING: removed an AI co-author trailer from this commit message."
+    echo "  *** Commits in this repository are authored by the human only."
+    echo "  *** See .github/copilot-instructions.md -- do not add it again."
+    echo ""
+fi
+
+exit 0

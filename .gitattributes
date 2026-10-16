@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings even though core.autocrlf is true in this
+# repository: a CRLF shebang script does not run under sh, which would silently
+# disable the git hooks below.
+*.sh            text eol=lf
+scripts/git-hooks/*   text eol=lf
