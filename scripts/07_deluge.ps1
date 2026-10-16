@@ -58,10 +58,414 @@ if (Test-Path $LockFile) {
 Write-Host "[$AppName] Installing..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== Installing $AppName ==="
 
-# -- 1. Install Deluge via Chocolatey (version-pinned when versions.json present) -
-$PinnedVersion = if ($Config._Versions -and $Config._Versions.Apps.Deluge) { $Config._Versions.Apps.Deluge.version } else { $null }
-# "latest"/"unknown" are manifest sentinels, not package versions: choco rejects
-# them, so install the current release instead of failing the step.
+# -- 1. Deluge from the upstream mirror ----------------------------------------
+# Chocolatey still ships Deluge 2.1.1, whose Web UI cannot work behind a reverse
+# proxy: 2.1.1 registers its Twisted base child with a str key while Twisted
+# traverses with bytes, so every /deluge/... request 404s and Caddy's
+# "handle /deluge*" block can never serve it.  Upstream fixed that after the
+# 2.1.1 release (Deluge PRs #390/#391) and publishes the fixed build as an NSIS
+# installer, so Deluge is installed from the upstream mirror instead; Chocolatey
+# is kept only as a guarded fallback (see 1b below).
+#
+# NOTE: this acquisition block is duplicated verbatim in scripts\07_deluge.ps1
+# and scripts\update_deluge.ps1 -- the installer and the updater must use exactly
+# the same discovery and verification path, so keep both copies in sync.
+$DelugeMirrorIndexUrl   = "https://ftp.osuosl.org/pub/deluge/windows/"
+$DelugeMirrorVersionUrl = "https://ftp.osuosl.org/pub/deluge/version"
+# First release carrying the Twisted base-path fix.  Older builds reintroduce the
+# /deluge 404, so they are refused rather than installed.
+$DelugeMinFixedVersion  = "2.2.0"
+$DelugeReleaseRegex     = '^\d+(\.\d+)+$'
+# The upstream NSIS script sets InstallDir "$PROGRAMFILES64\Deluge", which is
+# therefore where the service binaries are expected to land.
+$DelugeTargetDir        = Join-Path $env:ProgramFiles "Deluge"
+
+$DelugeManifest = if ($Config -and $Config.PSObject.Properties["_Versions"] -and
+                      $Config._Versions.PSObject.Properties["Apps"] -and
+                      $Config._Versions.Apps.PSObject.Properties["Deluge"]) {
+                      $Config._Versions.Apps.Deluge
+                  } else { $null }
+# Optional manifest overrides so another mirror can be used without editing this
+# script (keys: url = windows/ directory listing, versionUrl = release marker).
+if ($DelugeManifest -and $DelugeManifest.PSObject.Properties["url"] -and $DelugeManifest.url) {
+    $DelugeMirrorIndexUrl = $DelugeManifest.url
+}
+if ($DelugeManifest -and $DelugeManifest.PSObject.Properties["versionUrl"] -and $DelugeManifest.versionUrl) {
+    $DelugeMirrorVersionUrl = $DelugeManifest.versionUrl
+}
+
+# The mirror is HTTPS and a fresh PowerShell 5.1 session still negotiates TLS 1.0
+# by default (00_prerequisites.ps1 only raises it for the Chocolatey bootstrap).
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+} catch {
+    Write-DebugLog "WARN" "Could not enable TLS 1.2: $_"
+}
+
+function ConvertTo-DelugeVersionParts {
+    # "2.10.0" -> 2,10,0.  Callers validate the shape first.
+    param([Parameter(Mandatory=$true)][string]$Version)
+    $clean = ($Version -replace '^[vV]', '').Trim()
+    return @($clean.Split('.') | ForEach-Object { [int]$_ })
+}
+
+function Compare-DelugeVersionString {
+    # Numeric, segment-wise comparison, so 2.10.0 ranks above 2.9.0 (a plain
+    # string sort would pick the older build).  Returns -1, 0 or 1.
+    param([Parameter(Mandatory=$true)][string]$A, [Parameter(Mandatory=$true)][string]$B)
+    $partsA = ConvertTo-DelugeVersionParts -Version $A
+    $partsB = ConvertTo-DelugeVersionParts -Version $B
+    $max = [Math]::Max($partsA.Count, $partsB.Count)
+    for ($i = 0; $i -lt $max; $i++) {
+        $segA = if ($i -lt $partsA.Count) { $partsA[$i] } else { 0 }
+        $segB = if ($i -lt $partsB.Count) { $partsB[$i] } else { 0 }
+        if ($segA -lt $segB) { return -1 }
+        if ($segA -gt $segB) { return 1 }
+    }
+    return 0
+}
+
+function ConvertTo-DelugeText {
+    # Invoke-WebRequest hands back .Content as a byte[] for responses the server
+    # does not label as text (the OSUOSL mirror serves "version" and ".sha256"
+    # as application/octet-stream).  A [string] cast would render that as
+    # "50 46 50 46 48 10", so decode explicitly.
+    param([object]$Content)
+    if ($null -eq $Content) { return "" }
+    if ($Content -is [byte[]]) { return [System.Text.Encoding]::UTF8.GetString($Content) }
+    return [string]$Content
+}
+
+function Get-DelugeMirrorListing {
+    # File names published in the mirror's windows/ directory.  The page is an
+    # Apache autoindex: one <a href="name">name</a> per entry, mixed with sort
+    # links, a parent link and the site's own "https://..." chrome.
+    param([Parameter(Mandatory=$true)][string]$IndexUrl)
+    $response = Invoke-WebRequest -Uri $IndexUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $html     = ConvertTo-DelugeText -Content $response.Content
+    $names    = New-Object System.Collections.Generic.List[string]
+    foreach ($match in [regex]::Matches($html, 'href="([^"]+)"')) {
+        $name = [System.Uri]::UnescapeDataString($match.Groups[1].Value)
+        # Keep plain entry names only: this drops the "?C=N;O=D" sort links, the
+        # "/pub/deluge/" parent link and the "https://..." site chrome.
+        if (-not $name -or $name.Contains("/") -or $name.Contains("?") -or $name.Contains(":")) { continue }
+        if (-not $names.Contains($name)) { $names.Add($name) }
+    }
+    Write-DebugLog "INFO" "Deluge mirror listing $IndexUrl returned $($names.Count) entries"
+    return $names.ToArray()
+}
+
+function Get-DelugeMirrorReleaseMarker {
+    # The mirror publishes the current release as plain text next to the windows/
+    # directory (observed: "2.2.0\n").  Anything that is not a plain release
+    # number (empty, an HTML error page, "2.3.0-rc1") is ignored.
+    param([string]$VersionUrl)
+    if (-not $VersionUrl) { return $null }
+    try {
+        $response = Invoke-WebRequest -Uri $VersionUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+        $content  = ConvertTo-DelugeText -Content $response.Content
+    } catch {
+        Write-DebugLog "WARN" "Deluge release marker unreachable ($VersionUrl): $_"
+        return $null
+    }
+    $marker = $content.TrimStart([char]0xFEFF).Trim()
+    if ($marker -match $DelugeReleaseRegex) { return $marker }
+    Write-DebugLog "WARN" "Deluge release marker is not a plain release version: '$marker'"
+    return $null
+}
+
+function Select-DelugeMirrorRelease {
+    # Highest published "deluge-<version>-win64-setup.exe" that also has its
+    # sibling ".sha256".  Only a bare "<digits>[.<digits>...]" version is
+    # accepted between the prefix and "-win64-setup.exe", so pre-releases
+    # ("-rc1", "-beta"), 32-bit and libtorrent-variant ("-lt2.0") builds can
+    # never win.  Returns $null when nothing qualifies.
+    param([Parameter(Mandatory=$true)][string[]]$Names)
+    $bestVersion = $null
+    $bestFile    = $null
+    foreach ($name in $Names) {
+        if ($name -notmatch '^deluge-.*setup\.exe$') { continue }
+        $match = [regex]::Match($name, '^deluge-(?<ver>\d+(?:\.\d+)+)-win64-setup\.exe$')
+        if (-not $match.Success) {
+            Write-DebugLog "VAR" "Skipping mirror build (not a plain win64 release): $name"
+            continue
+        }
+        $version = $match.Groups['ver'].Value
+        if ($Names -notcontains "$name.sha256") {
+            Write-DebugLog "VAR" "Skipping mirror build (no .sha256 sibling published): $name"
+            continue
+        }
+        if ((Compare-DelugeVersionString -A $version -B $DelugeMinFixedVersion) -lt 0) {
+            Write-DebugLog "VAR" "Skipping mirror build (older than $DelugeMinFixedVersion): $name"
+            continue
+        }
+        if (-not $bestVersion -or (Compare-DelugeVersionString -A $version -B $bestVersion) -gt 0) {
+            $bestVersion = $version
+            $bestFile    = $name
+        }
+    }
+    if (-not $bestFile) { return $null }
+    return [PSCustomObject]@{ Version = $bestVersion; FileName = $bestFile }
+}
+
+function Resolve-DelugeRelease {
+    # Decides which build to install, and never guesses:
+    #   pin    - versions.json names an exact version (must exist on the mirror)
+    #   marker - the mirror's release marker, once its Windows build is published
+    #   index  - highest matching version in the windows/ listing
+    # A parse or lookup failure throws instead of silently falling back to an
+    # older/different build.
+    param(
+        [string]$PinnedVersion,
+        [string]$IndexUrl   = $DelugeMirrorIndexUrl,
+        [string]$VersionUrl = $DelugeMirrorVersionUrl
+    )
+    if ($PinnedVersion) {
+        $pin = $PinnedVersion.Trim()
+        if ($pin.StartsWith("v") -or $pin.StartsWith("V")) { $pin = $pin.Substring(1) }
+        if ($pin -notmatch $DelugeReleaseRegex) {
+            throw "versions.json pins Deluge to '$PinnedVersion', which is not a plain version number"
+        }
+        if ((Compare-DelugeVersionString -A $pin -B $DelugeMinFixedVersion) -lt 0) {
+            throw ("versions.json pins Deluge $pin, which predates $DelugeMinFixedVersion and has the broken " +
+                   "/deluge base path - set Apps.Deluge.version to $DelugeMinFixedVersion or to 'latest'")
+        }
+        return [PSCustomObject]@{ Version = $pin; FileName = "deluge-$pin-win64-setup.exe"; Source = "pin" }
+    }
+
+    $names  = Get-DelugeMirrorListing -IndexUrl $IndexUrl
+    $marker = Get-DelugeMirrorReleaseMarker -VersionUrl $VersionUrl
+    if ($marker) {
+        $markerFile = "deluge-$marker-win64-setup.exe"
+        if (($names -contains $markerFile) -and ($names -contains "$markerFile.sha256") -and
+            ((Compare-DelugeVersionString -A $marker -B $DelugeMinFixedVersion) -ge 0)) {
+            return [PSCustomObject]@{ Version = $marker; FileName = $markerFile; Source = "marker" }
+        }
+        Write-DebugLog "WARN" "Release marker '$marker' has no installable Windows build in $IndexUrl; using the newest published build instead"
+    }
+    $pick = Select-DelugeMirrorRelease -Names $names
+    if (-not $pick) {
+        throw "no deluge-<version>-win64-setup.exe with a .sha256 sibling and version >= $DelugeMinFixedVersion is published in $IndexUrl"
+    }
+    return [PSCustomObject]@{ Version = $pick.Version; FileName = $pick.FileName; Source = "index" }
+}
+
+function Save-DelugeInstaller {
+    # Downloads "<file>" plus its sibling "<file>.sha256" and verifies the hash
+    # before the file is ever executed.  The installer is cached in $Destination,
+    # but its hash is re-checked on every run against a freshly fetched .sha256,
+    # so a truncated or tampered cache entry can never be installed.
+    # Returns the path of the verified installer; throws on any mismatch.
+    param(
+        [Parameter(Mandatory=$true)][string]$FileName,
+        [Parameter(Mandatory=$true)][string]$IndexUrl,
+        [Parameter(Mandatory=$true)][string]$Destination
+    )
+    if (-not (Test-Path $Destination)) { New-Item -Path $Destination -ItemType Directory -Force | Out-Null }
+    $installerPath = Join-Path $Destination $FileName
+
+    $shaUrl = "$IndexUrl$FileName.sha256"
+    $shaResponse = Invoke-WebRequest -Uri $shaUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+    $shaRaw = ConvertTo-DelugeText -Content $shaResponse.Content
+    # Observed format is sha256sum text mode: "<64 lowercase hex>  <filename>\n"
+    # (two spaces, LF terminated).  Any separator is accepted, but the digest
+    # must be the first token and a named artifact must be the one we asked for.
+    $shaMatch = [regex]::Match($shaRaw.Trim(), '^(?<hash>[0-9a-fA-F]{64})(?:\s+\*?(?<name>\S+))?$')
+    if (-not $shaMatch.Success) {
+        throw "cannot parse $shaUrl (expected a 64 hex digit SHA256 digest)"
+    }
+    $expectedHash = $shaMatch.Groups['hash'].Value
+    if ($shaMatch.Groups['name'].Success -and $shaMatch.Groups['name'].Value -ine $FileName) {
+        throw "checksum file $shaUrl names '$($shaMatch.Groups['name'].Value)', not '$FileName'"
+    }
+
+    if (Test-Path $installerPath) {
+        $cachedHash = (Get-FileHash -Path $installerPath -Algorithm SHA256).Hash
+        if ($cachedHash -ieq $expectedHash) {
+            Write-DebugLog "INFO" "Reusing verified installer $installerPath ($expectedHash)"
+            return $installerPath
+        }
+        Write-DebugLog "WARN" "Cached installer hash mismatch ($cachedHash); re-downloading $FileName"
+        Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # Download to a side name: a half-written file must never look like a usable
+    # installer to a later run.
+    $partialPath = "$installerPath.download"
+    Remove-Item -Path $partialPath -Force -ErrorAction SilentlyContinue
+    try {
+        Invoke-WebRequest -Uri "$IndexUrl$FileName" -OutFile $partialPath -UseBasicParsing -TimeoutSec 900 -ErrorAction Stop
+    } catch {
+        Remove-Item -Path $partialPath -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    $actualHash = (Get-FileHash -Path $partialPath -Algorithm SHA256).Hash
+    if ($actualHash -ine $expectedHash) {
+        Remove-Item -Path $partialPath -Force -ErrorAction SilentlyContinue
+        throw "SHA256 mismatch for $FileName (expected $expectedHash, got $actualHash) - refusing to install"
+    }
+    Move-Item -Path $partialPath -Destination $installerPath -Force
+    Write-DebugLog "INFO" "Verified $FileName (SHA256 $actualHash) -> $installerPath"
+    return $installerPath
+}
+
+function Stop-DelugeForInstall {
+    # The upstream installer aborts when a Deluge process is alive (its .onInit
+    # checks the "deluge" mutex) and it cannot replace deluged.exe while the
+    # daemon holds the image open - either way a silent install would be a no-op.
+    param(
+        [string[]]$ServiceNames = @("DelugeDaemon", "DelugeWeb"),
+        [string[]]$ProcessNames = @("deluged", "deluge-web")
+    )
+    foreach ($svcName in $ServiceNames) {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -ne "Stopped") {
+            Write-DebugLog "INFO" "Stopping service $svcName (was $($svc.Status))"
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Name $ProcessNames -ErrorAction SilentlyContinue)) { return }
+        Start-Sleep -Seconds 1
+    }
+    foreach ($proc in @(Get-Process -Name $ProcessNames -ErrorAction SilentlyContinue)) {
+        Write-DebugLog "WARN" "Force-stopping lingering $($proc.ProcessName) (pid $($proc.Id))"
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 2
+}
+
+function Install-DelugeFromMirror {
+    # Runs the NSIS installer unattended into $TargetDir.
+    # "/S" is NSIS's silent switch and "/D=<dir>" overrides $INSTDIR; /D has to be
+    # the last argument and must NOT be quoted, so the argument string is handed
+    # to CreateProcess verbatim (Start-Process or the call operator would wrap the
+    # "Program Files" path in quotes and break NSIS's own parsing).
+    param(
+        [Parameter(Mandatory=$true)][string]$InstallerPath,
+        [Parameter(Mandatory=$true)][string]$TargetDir
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName         = $InstallerPath
+    $startInfo.Arguments        = "/S /D=$TargetDir"
+    $startInfo.UseShellExecute  = $false
+    $startInfo.WorkingDirectory = Split-Path $InstallerPath
+    Write-DebugLog "INFO" "Running `"$InstallerPath`" /S /D=$TargetDir"
+    $proc = [System.Diagnostics.Process]::Start($startInfo)
+    if (-not $proc.WaitForExit(900000)) {
+        $proc.Kill()
+        throw "the Deluge installer did not finish within 15 minutes"
+    }
+    Write-DebugLog "INFO" "Deluge installer exit code=$($proc.ExitCode)"
+    return $proc.ExitCode
+}
+
+function Wait-DelugeInstalled {
+    # NSIS can return before every payload file is flushed, so the exit code is
+    # not trusted: poll for the binaries the NSSM services need.
+    param(
+        [Parameter(Mandatory=$true)][string]$TargetDir,
+        [int]$TimeoutSeconds = 180
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Test-Path (Join-Path $TargetDir "deluged.exe")) -and (Test-Path (Join-Path $TargetDir "deluge-web.exe"))) {
+            Write-DebugLog "INFO" "Deluge payload present in $TargetDir"
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Get-DelugeInstalledVersion {
+    # Reads the version of the build on disk.  The upstream PyInstaller layout
+    # ships "_internal\deluge-<version>.dist-info\METADATA", which is the only
+    # trustworthy record of what is installed (Chocolatey's bookkeeping knows
+    # nothing about an installer that was run directly).
+    param([Parameter(Mandatory=$true)][string]$TargetDir)
+    foreach ($root in @((Join-Path $TargetDir "_internal"), $TargetDir)) {
+        if (-not (Test-Path $root)) { continue }
+        $distInfo = Get-ChildItem -Path $root -Directory -Filter "deluge-*.dist-info" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $distInfo) { continue }
+        $metadataPath = Join-Path $distInfo.FullName "METADATA"
+        if (Test-Path $metadataPath) {
+            $versionLines = @(Get-Content -Path $metadataPath -ErrorAction SilentlyContinue | Where-Object { $_ -match '^Version:\s*\S' })
+            if ($versionLines.Count -gt 0) {
+                $detected = ($versionLines[0] -replace '^Version:\s*', '').Trim()
+                if ($detected -match $DelugeReleaseRegex) { return $detected }
+            }
+        }
+        if ($distInfo.Name -match '^deluge-(?<ver>\d+(?:\.\d+)+)\.dist-info$') {
+            return $Matches['ver']
+        }
+    }
+    return $null
+}
+
+function Install-DelugeRelease {
+    # Runs a verified installer and returns the version that ends up on disk.  An
+    # installer that silently aborts (a lingering Deluge process) must not be
+    # mistaken for a success, so the result is read off the payload instead of
+    # from the exit code: the version has to match the installer that ran and,
+    # when the layout carries no readable version, the executable still has to
+    # have been replaced.
+    param(
+        [Parameter(Mandatory=$true)][string]$InstallerPath,
+        [Parameter(Mandatory=$true)][string]$TargetDir,
+        [Parameter(Mandatory=$true)][string]$ExpectedVersion
+    )
+    $exePath    = Join-Path $TargetDir "deluged.exe"
+    $beforeTime = if (Test-Path $exePath) { (Get-Item $exePath).LastWriteTimeUtc } else { $null }
+
+    Install-DelugeFromMirror -InstallerPath $InstallerPath -TargetDir $TargetDir | Out-Null
+    if (-not (Wait-DelugeInstalled -TargetDir $TargetDir)) {
+        throw "the installer finished but $exePath never appeared (is another Deluge instance running?)"
+    }
+    $afterTime   = (Get-Item $exePath).LastWriteTimeUtc
+    $wasReplaced = (-not $beforeTime) -or ($afterTime -ne $beforeTime)
+    $detected    = Get-DelugeInstalledVersion -TargetDir $TargetDir
+
+    if ($detected) {
+        if ((Compare-DelugeVersionString -A $detected -B $ExpectedVersion) -ne 0) {
+            if (-not $wasReplaced) {
+                throw "the installer did not replace $exePath - it aborts while a Deluge process is running (build on disk is $detected, expected $ExpectedVersion)"
+            }
+            throw "the build on disk is Deluge $detected, not the verified $ExpectedVersion"
+        }
+        return $detected
+    }
+    # No readable version in the payload (a non-PyInstaller layout): the only
+    # evidence available is that the executable was actually swapped.
+    if (-not $wasReplaced) {
+        throw "the installer did not replace $exePath - it aborts while a Deluge process is running"
+    }
+    Write-DebugLog "WARN" "No on-disk Deluge version found in $TargetDir; trusting the verified installer version $ExpectedVersion"
+    return $ExpectedVersion
+}
+
+function Get-ChocoAvailableVersion {
+    # Version Chocolatey would install for a package (repository metadata).
+    param([Parameter(Mandatory=$true)][string]$Package)
+    $savedEap = $ErrorActionPreference
+    $output   = $null
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = choco search $Package --exact -r 2>$null
+    } finally {
+        $ErrorActionPreference = $savedEap
+    }
+    Write-DebugLog "VAR choco search $Package --exact -r => $output"
+    if ([string]::IsNullOrWhiteSpace($output)) { return $null }
+    $parts = ([string]($output | Select-Object -First 1)) -split '\|'
+    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
+    return $null
+}
+
+$PinnedVersion = if ($DelugeManifest) { $DelugeManifest.version } else { $null }
+# "latest"/"unknown" are manifest sentinels, not versions: discover the newest
+# published build instead of failing the step.
 if ($PinnedVersion -and ($PinnedVersion -ieq "latest" -or $PinnedVersion -ieq "unknown")) {
     Write-DebugLog "WARN" "Ignoring non-version manifest pin for Deluge: '$PinnedVersion'"
     $PinnedVersion = $null
@@ -85,28 +489,72 @@ function Get-InstalledChocoVersion {
     return "unknown"
 }
 
-Write-DebugLog "VAR PinnedVersion=$PinnedVersion"
+$DelugeDownloadDir = Join-Path $PSScriptRoot "..\bin"
+Write-DebugLog "VAR PinnedVersion=$PinnedVersion DelugeTargetDir=$DelugeTargetDir DelugeDownloadDir=$DelugeDownloadDir"
 
-if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-    Write-Warning "[$AppName] Chocolatey is not available (00_prerequisites.ps1 installs it). Cannot install Deluge."
-    Write-DebugLog "ERROR" "choco not found in PATH; aborting Deluge install"
-    exit 1
+# A box that was installed through Chocolatey still has the broken 2.1.1
+# registered there; log it, because the mirror build now owns those binaries.
+if (Get-Command choco -ErrorAction SilentlyContinue) {
+    Write-DebugLog "VAR choco reports deluge $(Get-InstalledChocoVersion -Package 'deluge')"
+} else {
+    Write-DebugLog "WARN" "choco not found in PATH - the Chocolatey fallback is unavailable (the mirror path does not need it)"
 }
 
-$installedVersion = Get-InstalledChocoVersion -Package "deluge"
-if (-not $installedVersion) {
-    $displayVer = if ($PinnedVersion) { " $PinnedVersion" } else { "" }
-    Write-Host "  -> Installing Deluge$displayVer via Chocolatey..." -ForegroundColor Gray
-    Write-DebugLog "INFO" "Installing Deluge via choco..."
-    $savedEAP = $ErrorActionPreference
+$installedVersion = Get-DelugeInstalledVersion -TargetDir $DelugeTargetDir
+if ($installedVersion) {
+    Write-DebugLog "INFO" "Deluge build already on disk: $installedVersion"
+}
+
+# 1a. Preferred path: the checksum-verified upstream installer.
+$acquirePath   = $null
+$delugeRelease = $null
+try {
+    $delugeRelease = Resolve-DelugeRelease -PinnedVersion $PinnedVersion
+    Write-Host "  -> Installing Deluge $($delugeRelease.Version) from the upstream mirror (resolved via $($delugeRelease.Source))..." -ForegroundColor Gray
+    Write-DebugLog "INFO" "Resolved Deluge $($delugeRelease.Version) ($($delugeRelease.FileName)) via $($delugeRelease.Source)"
+
+    $delugeInstaller = Save-DelugeInstaller -FileName $delugeRelease.FileName -IndexUrl $DelugeMirrorIndexUrl -Destination $DelugeDownloadDir
+    Stop-DelugeForInstall
+    $installedVersion = Install-DelugeRelease -InstallerPath $delugeInstaller -TargetDir $DelugeTargetDir -ExpectedVersion $delugeRelease.Version
+    $acquirePath = "ftp"
+} catch {
+    Write-Warning "[$AppName] Upstream mirror install failed: $($_.Exception.Message)"
+    Write-DebugLog "WARN" "Upstream mirror install failed: $_"
+
+    # 1b. Last resort: Chocolatey, and only when its repository offers a build
+    # that already contains the Twisted base-path fix (under a pin: exactly the
+    # pinned version).  Chocolatey still serves 2.1.1, and silently installing
+    # that would rebuild the /deluge 404 this path exists to fix, so an older
+    # candidate is refused -- failing is better than a broken Web UI.
+    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        Write-Warning "[$AppName] Chocolatey is not available (00_prerequisites.ps1 installs it) and the mirror path failed. Cannot install Deluge."
+        Write-DebugLog "ERROR" "choco not found in PATH and mirror path failed; aborting Deluge install"
+        exit 1
+    }
+    $chocoCandidate = Get-ChocoAvailableVersion -Package "deluge"
+    $fallbackReason = $null
+    if (-not $chocoCandidate) {
+        $fallbackReason = "Chocolatey has no 'deluge' package to offer"
+    } elseif ($chocoCandidate -notmatch $DelugeReleaseRegex) {
+        $fallbackReason = "Chocolatey offers Deluge '$chocoCandidate', which is not a plain version number"
+    } elseif ((Compare-DelugeVersionString -A $chocoCandidate -B $DelugeMinFixedVersion) -lt 0) {
+        $fallbackReason = "Chocolatey only offers Deluge $chocoCandidate, which predates $DelugeMinFixedVersion and has the broken /deluge base path"
+    } elseif ($PinnedVersion -and ($chocoCandidate -ine $PinnedVersion)) {
+        $fallbackReason = "Chocolatey offers Deluge $chocoCandidate, not the pinned $PinnedVersion"
+    }
+    if ($fallbackReason) {
+        Write-Warning "[$AppName] Refusing the Chocolatey fallback: $fallbackReason."
+        Write-DebugLog "ERROR" "Chocolatey fallback refused: $fallbackReason"
+        exit 1
+    }
+
+    Write-Host "  -> Falling back to Chocolatey (deluge $chocoCandidate)..." -ForegroundColor Yellow
+    Write-DebugLog "WARN" "Falling back to Chocolatey for deluge $chocoCandidate"
     $global:LASTEXITCODE = 0
+    $savedEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        if ($PinnedVersion) {
-            choco install deluge --version $PinnedVersion -y --no-progress | Out-Null
-        } else {
-            choco install deluge -y --no-progress | Out-Null
-        }
+        choco install deluge --version $chocoCandidate -y --no-progress | Out-Null
     } catch {
         Write-DebugLog "WARN" "choco install deluge could not run: $_"
     } finally {
@@ -119,51 +567,57 @@ if (-not $installedVersion) {
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     Write-DebugLog "INFO" "PATH refreshed after deluge install"
+    $acquirePath = "choco"
     # The exit code alone is not authoritative (choco returns non-zero for warnings
-    # such as a pending reboot): ask Chocolatey what is installed now.
-    $installedVersion = Get-InstalledChocoVersion -Package "deluge"
-} else {
-    Write-Host "  -> Deluge already installed via Chocolatey (version $installedVersion)." -ForegroundColor Green
-    Write-DebugLog "INFO" "Deluge already installed: $installedVersion"
+    # such as a pending reboot): read the version off the installed payload.
+    $installedVersion = Get-DelugeInstalledVersion -TargetDir $DelugeTargetDir
+    if (-not $installedVersion) { $installedVersion = $chocoCandidate }
 }
 
 if (-not $installedVersion) {
     # Writing the lock file and the ledger entry after a failed install would make every
     # later run report "Already installed. Skipping." (a stale deluge.exe on the box makes
-    # this reachable even when the package is gone) and would tell the updater that the
-    # manifest pin is installed, so a transient choco/network failure could never be
+    # this reachable even when the payload is gone) and would tell the updater that the
+    # manifest pin is installed, so a transient mirror/network failure could never be
     # retried. Leave both untouched and fail the step so master_install.ps1 logs Deluge as
     # failed and a re-run installs it.
-    Write-Warning "[$AppName] No Deluge Chocolatey package is present after the install attempt. Not writing the lock file so a re-run retries."
-    Write-DebugLog "ERROR" "deluge package absent after install attempt; lock file not written"
+    Write-Warning "[$AppName] No Deluge build is present after the install attempt. Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "Deluge absent after install attempt (path=$acquirePath); lock file not written"
     exit 1
 }
+Write-DebugLog "INFO" "Deluge acquired via '$acquirePath'; on-disk version=$installedVersion"
+Write-Host "  -> Deluge $installedVersion installed (source: $acquirePath)." -ForegroundColor Green
 
-# Find deluged.exe and deluge-web.exe
-$delugedExe = Get-Command deluged.exe -ErrorAction SilentlyContinue
-if (-not $delugedExe) {
-    $chocoBin    = "C:\ProgramData\chocolatey\bin"
-    $delugedExe  = Get-ChildItem $chocoBin -Filter "deluged.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $delugedExe) {
-        $delugeDir = Get-ChildItem "C:\Program Files" -Directory -Filter "Deluge*" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($delugeDir) {
-            $delugedExe = Get-ChildItem $delugeDir.FullName -Filter "deluged.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-        }
-    }
+# Find deluged.exe and deluge-web.exe.  The mirror install directory is probed
+# first on purpose: a leftover Chocolatey shim in C:\ProgramData\chocolatey\bin
+# could otherwise win and point at the broken 2.1.1 build.
+$delugeCandidates = New-Object System.Collections.Generic.List[string]
+$delugeCandidates.Add((Join-Path $DelugeTargetDir "deluged.exe"))
+$delugedOnPath = Get-Command deluged.exe -ErrorAction SilentlyContinue
+if ($delugedOnPath) { $delugeCandidates.Add($delugedOnPath.Source) }
+$delugeCandidates.Add("C:\ProgramData\chocolatey\bin\deluged.exe")
+foreach ($delugeRoot in (Get-ChildItem "C:\Program Files" -Directory -Filter "Deluge*" -ErrorAction SilentlyContinue)) {
+    $delugeCandidate = Get-ChildItem $delugeRoot.FullName -Filter "deluged.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($delugeCandidate) { $delugeCandidates.Add($delugeCandidate.FullName) }
 }
-$delugedPath = if ($delugedExe -is [System.Management.Automation.CommandInfo]) { $delugedExe.Source } else { $delugedExe.FullName }
+$delugedPath = $null
+foreach ($candidate in $delugeCandidates) {
+    if ($candidate -and (Test-Path $candidate)) { $delugedPath = $candidate; break }
+}
 Write-DebugLog "VAR delugedPath=$delugedPath"
+Write-DebugLog "VAR deluged candidates: $($delugeCandidates -join ' | ')"
 if (-not $delugedPath) {
-    Write-Error "[$AppName] deluged.exe not found. Chocolatey install may have failed."
-    Write-DebugLog "ERROR" "deluged.exe not found in PATH or chocolatey bin"
+    Write-Error "[$AppName] deluged.exe not found. The Deluge install may have failed."
+    Write-DebugLog "ERROR" "deluged.exe not found in $DelugeTargetDir, PATH, chocolatey bin or C:\Program Files\Deluge*"
     exit 1
 }
 
-$delugeWebExe = Get-Command deluge-web.exe -ErrorAction SilentlyContinue
-if (-not $delugeWebExe) {
-    $delugeWebExe = Get-ChildItem (Split-Path $delugedPath) -Filter "deluge-web.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+# Same directory as the daemon, so daemon and Web UI always come from one build.
+$delugeWebPath = Join-Path (Split-Path $delugedPath) "deluge-web.exe"
+if (-not (Test-Path $delugeWebPath)) {
+    $delugeWebOnPath = Get-Command deluge-web.exe -ErrorAction SilentlyContinue
+    $delugeWebPath = if ($delugeWebOnPath) { $delugeWebOnPath.Source } else { $null }
 }
-$delugeWebPath = if ($delugeWebExe -is [System.Management.Automation.CommandInfo]) { $delugeWebExe.Source } else { $delugeWebExe.FullName }
 Write-DebugLog "VAR delugeWebPath=$delugeWebPath"
 if (-not $delugeWebPath) {
     Write-Warning "[$AppName] deluge-web.exe not found. Web UI will not be available."
@@ -341,6 +795,24 @@ if (-not (Test-Path $WebConf)) {
 }
 
 # -- 5. NSSM services ----------------------------------------------------------
+# These services are created and owned by this script; NSSM re-applies their
+# parameters idempotently.  When a service already exists it is recycled rather
+# than skipped: a machine that was installed by Chocolatey, or one that switched
+# DomainMode, would otherwise keep a daemon pointing at the wrong config
+# directory or a Web UI without the DuckDNS "--base /deluge" argument, which is
+# exactly the setting that makes /deluge work behind Caddy.
+function Test-DelugeNssmService {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    try {
+        $serviceInfo = Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'" -ErrorAction Stop
+    } catch {
+        Write-DebugLog "WARN" "Could not query service '$Name': $_"
+        return $false
+    }
+    if (-not $serviceInfo -or -not $serviceInfo.PathName) { return $false }
+    return ($serviceInfo.PathName -match 'nssm')
+}
+
 # Daemon service
 Write-Host "  -> Creating Windows services..." -ForegroundColor Gray
 $existingDaemon = Get-Service -Name "DelugeDaemon" -ErrorAction SilentlyContinue
@@ -362,16 +834,25 @@ if (-not $existingDaemon) {
 } else {
     Write-Host "  -> Service 'DelugeDaemon' already exists." -ForegroundColor Green
     Write-DebugLog "INFO" "NSSM service 'DelugeDaemon' already exists"
+    if (Test-DelugeNssmService -Name "DelugeDaemon") {
+        nssm set DelugeDaemon Application "`"$delugedPath`"" | Out-Null
+        nssm set DelugeDaemon AppParameters "--config `"$DataDir`" --loglevel info --logfile `"$DaemonLog`"" | Out-Null
+        nssm set DelugeDaemon AppDirectory (Split-Path $delugedPath) | Out-Null
+        Write-DebugLog "INFO" "Re-applied DelugeDaemon NSSM parameters (exe=$delugedPath config=$DataDir)"
+    } else {
+        Write-DebugLog "WARN" "Service 'DelugeDaemon' is not NSSM-managed -- leaving its parameters untouched"
+    }
 }
 
 # Web UI service
 $existingWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
 Write-DebugLog "VAR DelugeWeb service exists=$($null -ne $existingWeb)"
-$DomainMode = $Config.General.DomainMode
+$DomainMode  = $Config.General.DomainMode
+$webBaseArg  = if ($DomainMode -eq 'duckdns') { '--base /deluge' } else { '' }
+Write-DebugLog "VAR DelugeWeb DomainMode=$DomainMode baseArg='$webBaseArg'"
 if (-not $existingWeb -and $delugeWebPath) {
     Write-DebugLog "INFO" "Creating NSSM service 'DelugeWeb' exe=$delugeWebPath"
     nssm install DelugeWeb "`"$delugeWebPath`"" | Out-Null
-    $webBaseArg = if ($DomainMode -eq 'duckdns') { '--base /deluge' } else { '' }
     nssm set DelugeWeb AppParameters "--config `"$DataDir`" $webBaseArg --loglevel info --logfile `"$WebLog`"" | Out-Null
     nssm set DelugeWeb Description "Deluge Web UI" | Out-Null
     nssm set DelugeWeb AppDirectory (Split-Path $delugeWebPath) | Out-Null
@@ -382,13 +863,28 @@ if (-not $existingWeb -and $delugeWebPath) {
     nssm set DelugeWeb AppExit Default Restart | Out-Null
     nssm set DelugeWeb AppRestartDelay 5000 | Out-Null
     Write-Host "  -> Service 'DelugeWeb' created under '$SvcUser'." -ForegroundColor Green
-    Write-DebugLog "INFO" "NSSM service 'DelugeWeb' created. config=$DataDir log=$WebLog"
+    Write-DebugLog "INFO" "NSSM service 'DelugeWeb' created. config=$DataDir log=$WebLog base='$webBaseArg'"
 } elseif (-not $delugeWebPath) {
     Write-Host "  -> Skipping DelugeWeb service (deluge-web.exe not found)." -ForegroundColor Yellow
     Write-DebugLog "WARN" "DelugeWeb service skipped: deluge-web.exe not found"
 } else {
     Write-Host "  -> Service 'DelugeWeb' already exists." -ForegroundColor Green
     Write-DebugLog "INFO" "NSSM service 'DelugeWeb' already exists"
+    if (Test-DelugeNssmService -Name "DelugeWeb") {
+        nssm set DelugeWeb Application "`"$delugeWebPath`"" | Out-Null
+        nssm set DelugeWeb AppParameters "--config `"$DataDir`" $webBaseArg --loglevel info --logfile `"$WebLog`"" | Out-Null
+        nssm set DelugeWeb AppDirectory (Split-Path $delugeWebPath) | Out-Null
+        Write-DebugLog "INFO" "Re-applied DelugeWeb NSSM parameters (exe=$delugeWebPath config=$DataDir base='$webBaseArg')"
+        # The base path is only read when the Web UI process starts.
+        $runningWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
+        if ($runningWeb -and $runningWeb.Status -eq "Running") {
+            Write-Host "  -> Restarting DelugeWeb so the base path takes effect..." -ForegroundColor Gray
+            Restart-Service -Name "DelugeWeb" -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        }
+    } else {
+        Write-DebugLog "WARN" "Service 'DelugeWeb' is not NSSM-managed -- leaving its parameters untouched"
+    }
 }
 
 # -- 6. Firewall ---------------------------------------------------------------
@@ -397,13 +893,27 @@ New-NetFirewallRule -DisplayName "Deluge BT UDP" -Direction Inbound -LocalPort $
 Write-DebugLog "INFO" "Firewall rules added for BitTorrent port $BTPort (TCP+UDP). Daemon port $DaemonPort is NOT opened (localhost-only)"
 Write-Host "   -> IMPORTANT: Forward TCP+UDP port $BTPort on your router for optimal speeds." -ForegroundColor Yellow
 
-# -- Fix Web UI: Chocolatey Deluge package only ships deluge-all-debug.js,
-#    causing the Web UI to start in debug mode and fail to display torrents.
+# -- Fix Web UI: the upstream build only ships deluge-all-debug.js (verified for
+#    2.2.0: the payload contains _internal\deluge\ui\web\js\deluge-all-debug.js
+#    but no deluge-all.js), causing the Web UI to start in debug mode and fail to
+#    display torrents.  The copy is guarded, so a build that does ship
+#    deluge-all.js is left untouched.
 if ($delugeWebPath) {
-    $webJsDir = Join-Path (Split-Path $delugeWebPath) "deluge\ui\web\js"
-    # A Chocolatey shim is resolved from chocolatey\bin, where no js tree exists --
-    # fall back to the real Deluge install directory in that case.
-    if (-not (Test-Path (Join-Path $webJsDir "deluge-all-debug.js"))) {
+    # Layout candidates, in order: the upstream PyInstaller onedir tree
+    # (<exe dir>\_internal\deluge\ui\web\js), the older tree, then the same two
+    # under the mirror install directory.  A Chocolatey shim resolves to
+    # chocolatey\bin, where no js tree exists, so a recursive search of
+    # C:\Program Files\Deluge* remains as the last resort.
+    $webJsDir = $null
+    $webExeDir = Split-Path $delugeWebPath
+    foreach ($jsCandidate in @(
+            (Join-Path $webExeDir "_internal\deluge\ui\web\js"),
+            (Join-Path $webExeDir "deluge\ui\web\js"),
+            (Join-Path $DelugeTargetDir "_internal\deluge\ui\web\js"),
+            (Join-Path $DelugeTargetDir "deluge\ui\web\js"))) {
+        if (Test-Path (Join-Path $jsCandidate "deluge-all-debug.js")) { $webJsDir = $jsCandidate; break }
+    }
+    if (-not $webJsDir) {
         $delugeInstallRoot = Get-ChildItem "C:\Program Files" -Directory -Filter "Deluge*" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($delugeInstallRoot) {
             $foundJs = Get-ChildItem $delugeInstallRoot.FullName -Filter "deluge-all-debug.js" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -413,13 +923,16 @@ if ($delugeWebPath) {
             }
         }
     }
-    $debugJs  = Join-Path $webJsDir "deluge-all-debug.js"
-    $normalJs = Join-Path $webJsDir "deluge-all.js"
-    if ((Test-Path $debugJs) -and -not (Test-Path $normalJs)) {
+    $debugJs  = if ($webJsDir) { Join-Path $webJsDir "deluge-all-debug.js" } else { $null }
+    $normalJs = if ($webJsDir) { Join-Path $webJsDir "deluge-all.js" } else { $null }
+    if ($debugJs -and (Test-Path $debugJs) -and -not (Test-Path $normalJs)) {
         Copy-Item $debugJs $normalJs -Force
+        Write-Host "  -> Web UI fix applied: $normalJs" -ForegroundColor Gray
         Write-DebugLog "INFO" "Deluge Web UI: copied deluge-all-debug.js -> deluge-all.js to fix debug mode"
-    } elseif (-not (Test-Path $debugJs)) {
+    } elseif (-not $debugJs -or -not (Test-Path $debugJs)) {
         Write-DebugLog "WARN" "Deluge Web UI js directory not found (looked in $webJsDir) -- debug-mode fix not applied"
+    } else {
+        Write-DebugLog "INFO" "Deluge Web UI already ships deluge-all.js -- debug-mode fix not needed"
     }
 } else {
     Write-DebugLog "WARN" "deluge-web.exe path unknown -- skipping Web UI debug-mode fix"
@@ -457,12 +970,14 @@ if ($delugeWebPath) {
     }
 }
 
-# Record what Chocolatey reports as installed, not the manifest pin: a machine that
-# already carried a different Deluge build must show up as "update available" in the
-# updater instead of being compared pin-vs-pin and reported as current.
+# Record the version of the build that is on disk (read from the installed
+# payload), not the manifest pin: a machine that already carried a different
+# Deluge build must show up as "update available" in the updater instead of
+# being compared pin-vs-pin and reported as current.  $installedVersion was set
+# only after a verified install, so the lock file is never written for a failure.
 $LockVersion = $installedVersion
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
-Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
+Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion source=$acquirePath)"
 
 # Ledger entry for the updater (single source of truth for installed versions)
 if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {

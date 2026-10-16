@@ -75,6 +75,69 @@ function Get-LatestGrafanaStable {
     return $info.version
 }
 
+function Get-LatestFtpVersion {
+    # Apps published as a plain installer on an Apache autoindex mirror (the
+    # upstream Deluge Windows builds on ftp.osuosl.org).  The mirror publishes a
+    # machine-readable release marker at <mirror>/version (bytes "2.2.0\n"), so
+    # prefer that over parsing HTML; fall back to scanning the directory index.
+    #
+    # Directory mtimes are deliberately NOT used: mirroring rewrites them, so the
+    # FILENAME is the release identity.  Only <name>-<version>-<arch>-setup.exe
+    # entries that publish a matching .sha256 are considered -- a version with no
+    # checksum cannot be verified by the installer, which refuses it.
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [string]$VersionUrl = "",
+        [string]$NamePattern = "deluge",
+        [string]$ArchPattern = "win64"
+    )
+    if ($VersionUrl) {
+        try {
+            $resp = Invoke-WebRequest -Uri $VersionUrl -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            # The mirror serves the marker without a text/* content type, so
+            # Invoke-WebRequest hands back a byte[] -- casting that to [string]
+            # yields space-separated decimals ("50 46 50 46 48 10"), not "2.2.0".
+            # Decode explicitly. Same idiom as the DuckDNS updater.
+            $rawContent = $resp.Content
+            $raw = if ($rawContent -is [byte[]]) {
+                [Text.Encoding]::UTF8.GetString($rawContent).Trim()
+            } else {
+                ([string]$rawContent).Trim()
+            }
+            if ($raw -match '^\d+(\.\d+)+$') { return $raw }
+            $shown = if ($raw.Length -gt 40) { $raw.Substring(0, 40) + '...' } else { $raw }
+            Write-Host ("  release marker is not a bare version ('{0}') -- falling back to the index" -f $shown) -ForegroundColor DarkGray
+        } catch {
+            Write-Host ("  release marker unavailable ({0}) -- falling back to the index" -f $_.Exception.Message) -ForegroundColor DarkGray
+        }
+    }
+
+    $html = [string](Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop).Content
+    $pattern = [regex]::Escape($NamePattern) + '-(\d+(?:\.\d+)+)-' + [regex]::Escape($ArchPattern) + '-setup\.exe\.sha256'
+    $versions = [System.Collections.Generic.List[string]]::new()
+    foreach ($m in [regex]::Matches($html, $pattern)) {
+        $v = $m.Groups[1].Value
+        if (-not $versions.Contains($v)) { $versions.Add($v) }
+    }
+    if ($versions.Count -eq 0) {
+        throw "no $NamePattern-<version>-$ArchPattern-setup.exe.sha256 entries found in $Url"
+    }
+
+    # Numeric segment comparison: a string sort would rank 2.9.0 above 2.10.0.
+    $best = $versions[0]
+    foreach ($v in $versions) {
+        $a = @($v.Split('.') | ForEach-Object { [int]$_ })
+        $b = @($best.Split('.') | ForEach-Object { [int]$_ })
+        for ($i = 0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
+            $x = if ($i -lt $a.Count) { $a[$i] } else { 0 }
+            $y = if ($i -lt $b.Count) { $b[$i] } else { 0 }
+            if ($x -gt $y) { $best = $v; break }
+            if ($x -lt $y) { break }
+        }
+    }
+    return $best
+}
+
 Write-Host "Bump check for versions.json (schema $($Manifest.schema))..." -ForegroundColor Cyan
 
 $changes = [System.Collections.Generic.List[object]]::new()
@@ -95,6 +158,11 @@ foreach ($prop in $Manifest.apps.PSObject.Properties) {
             "github_source"  { $latest = Get-LatestGithubTag $entry.repo }
             "chocolatey"     { $latest = Get-LatestChocoVersion $entry.package }
             "dl.grafana.com" { $latest = Get-LatestGrafanaStable }
+            "ftp" {
+                if (-not $entry.url) { throw "source 'ftp' requires a 'url' in versions.json" }
+                $latest = Get-LatestFtpVersion -Url $entry.url `
+                            -VersionUrl $(if ($entry.PSObject.Properties["versionUrl"]) { $entry.versionUrl } else { "" })
+            }
             default          { Write-Host ("  {0,-18} unknown source '{1}'" -f $app, $entry.source) -ForegroundColor DarkGray }
         }
     } catch {
