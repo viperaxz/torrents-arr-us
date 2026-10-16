@@ -44,6 +44,7 @@ $lines = [System.Collections.Generic.List[string]]::new(
 if ($lines.Count -eq 0) { exit 0 }   # unreadable/corrupt file -- never clobber it
 
 $changed = $false
+$found   = $false
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i] -match "^\s*-\s*'([\d\.]+)'\s*#\s*$Marker") {
         if ($Matches[1] -ne $Ip) {
@@ -70,11 +71,35 @@ if (-not $found) {
 if ($changed) {
     # BOM-free UTF-8, matching Write-YamlFile / 12_security.ps1.
     [System.IO.File]::WriteAllLines($WlFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    try {
-        Restart-Service -Name 'crowdsec' -Force -ErrorAction Stop
-    } catch {
-        # The file is correct; the engine picks it up on its next start.
-        exit 1
+
+    # Parsers are only read at service start -- there is no hot reload for custom
+    # parser files on Windows.  Resolve the service the same way 12_security.ps1
+    # does (a hardcoded name would make every refresh a silent no-op on a release
+    # that renames it) and retry a transient failure, because the next run would
+    # otherwise find the file already correct, skip the restart, and leave the
+    # engine running with the previous WAN IP whitelisted.
+    $svcName = $null
+    foreach ($candidate in @('crowdsec', 'CrowdSec')) {
+        $s = Get-Service -Name $candidate -ErrorAction SilentlyContinue
+        if ($s) { $svcName = $s.Name; break }
     }
+    if (-not $svcName) {
+        $s = Get-Service -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*crowdsec*' -and $_.Name -notlike '*bouncer*' } |
+            Select-Object -First 1
+        if ($s) { $svcName = $s.Name }
+    }
+    if (-not $svcName) { exit 0 }   # engine not installed -- nothing to reload
+
+    $restarted = $false
+    for ($attempt = 1; $attempt -le 3 -and -not $restarted; $attempt++) {
+        try {
+            Restart-Service -Name $svcName -Force -ErrorAction Stop
+            $restarted = $true
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+    if (-not $restarted) { exit 1 }   # file is correct; the engine picks it up on its next start
 }
 exit 0

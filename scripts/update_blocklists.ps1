@@ -202,3 +202,7 @@ try {
 $srcNote = if ($failedSources -gt 0) { " ($failedSources source(s) unavailable)" } else { "" }
 Write-Host "  [Blocklist] $applied abuse CIDRs blocked across $($live.Count) rule(s) (Spamhaus DROP + Firehol level-1)$srcNote." -ForegroundColor Green
 if ($ruleErrors -gt 0) { exit 1 }
+# Exit explicitly: a script that just runs off the end leaves $LASTEXITCODE set
+# to whatever the last native command left behind, so callers (12_security.ps1,
+# the scheduled task) could not tell a success from a failure.
+exit 0

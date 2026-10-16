@@ -130,16 +130,28 @@ function Invoke-Cscli {
 }
 
 # -- Detect public IP (whitelisted so you cannot lock yourself out) ------------
+# Validated before use: this value is interpolated straight into the whitelist
+# parser below.  A captive portal, proxy error page or any other non-IP body
+# would be written verbatim, the parser file would then fail to load, and the
+# anti-lockout guarantee would disappear silently (and with it every other
+# whitelist entry in the file).
 $publicIp = $null
 try {
-    $publicIp = (Invoke-RestMethod "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Trim()
-    Write-DebugLog "VAR publicIp=$publicIp"
+    $candidate = (Invoke-RestMethod "https://api.ipify.org" -UseBasicParsing -TimeoutSec 10).Trim()
+    $parsedIp  = [System.Net.IPAddress]::Any
+    if ($candidate -and [System.Net.IPAddress]::TryParse($candidate, [ref]$parsedIp)) {
+        $publicIp = $candidate
+        Write-DebugLog "VAR publicIp=$publicIp"
+    } else {
+        Write-DebugLog "WARN" "Public IP detection returned a non-IP value; ignoring it"
+    }
 } catch {
     Write-DebugLog "WARN" "Public IP detection failed: $_"
 }
 
-$crowdsecOk = $false
-$bouncerOk  = $false
+$crowdsecOk   = $false
+$bouncerOk    = $false
+$blocklistOk  = $false
 
 # == Phase 1: CrowdSec Security Engine =========================================
 Write-Host "  [CrowdSec] Installing Security Engine..." -ForegroundColor Gray
@@ -230,12 +242,18 @@ try {
         Write-Host "     Starting CrowdSec service to generate default config..." -ForegroundColor DarkGray
         Write-DebugLog "INFO" "Starting $CrowdSecSvc service"
         Start-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
-        # Wait up to 30s for config.yaml to appear
+    }
+    # cscli reads config.yaml, which the service only creates on its first start.
+    # Wait whenever the file is absent -- not just when *we* started the service:
+    # the MSI starts it too, and a Running-but-not-yet-initialised service would
+    # otherwise race every cscli call below into a YAML read error.
+    if (-not (Test-Path $configYaml)) {
+        Write-DebugLog "INFO" "Waiting up to 30s for config.yaml to be generated"
         $cfgDeadline = (Get-Date).AddSeconds(30)
         while (-not (Test-Path $configYaml) -and (Get-Date) -lt $cfgDeadline) {
             Start-Sleep -Seconds 2
         }
-        Write-DebugLog "VAR config.yaml exists after start: $(Test-Path $configYaml)"
+        Write-DebugLog "VAR config.yaml exists after wait: $(Test-Path $configYaml)"
         if (-not (Test-Path $configYaml)) {
             Write-Warning "     config.yaml not created after 30s. cscli commands may fail."
             Write-DebugLog "WARN" "config.yaml not generated after 30s of service runtime"
@@ -473,9 +491,21 @@ on_success: break
     }
 
     # -- 1i. Restart so acquisition + collections take effect ------------------
-    Restart-Service -Name $CrowdSecSvc -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 5
+    # Restart-Service errors out on a stopped service, so fall back to
+    # Start-Service; a first start also runs DB migrations, which can take
+    # considerably longer than the few seconds a plain restart needs.
     $svc = Get-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") {
+        Restart-Service -Name $CrowdSecSvc -Force -ErrorAction SilentlyContinue
+    } else {
+        Start-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
+    }
+    $svcDeadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $svcDeadline) {
+        $svc = Get-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq "Running") { break }
+        Start-Sleep -Seconds 2
+    }
     Write-DebugLog "VAR CrowdSec service status=$(if ($svc) { $svc.Status } else { 'not found' })"
     if ($svc -and $svc.Status -eq "Running") {
         Write-Host "  -> CrowdSec Security Engine running." -ForegroundColor Green
@@ -581,6 +611,15 @@ fw_profiles:
         Write-DebugLog "VAR BouncerSvc=$BouncerSvc"
         if (-not $BouncerSvc) { throw "Firewall bouncer service not found after install" }
 
+        # The yaml just written carries a *fresh* API key: the previous
+        # registration was deleted above.  A service that is already Running
+        # keeps the old key in memory and would poll LAPI with a key that no
+        # longer exists -- it looks perfectly healthy in the service list while
+        # nothing is being enforced.  So restart unconditionally, not only when
+        # the service happens to be stopped.
+        Write-DebugLog "INFO" "Restarting $BouncerSvc to load the new API key"
+        Restart-Service -Name $BouncerSvc -Force -ErrorAction SilentlyContinue
+
         # Bouncer may need multiple start attempts and more time to come up.
         $bouncerRetries = 0
         $bouncerMaxRetries = 5
@@ -628,7 +667,16 @@ if ($DoBlocklists) {
     $blocklistScript = Join-Path $ScriptsDir "update_blocklists.ps1"
     try {
         & $blocklistScript
-        Write-DebugLog "INFO" "Initial blocklist update complete"
+        # update_blocklists.ps1 exits 1 when no rules could be applied or a rule
+        # failed to build. Without this check the summary below reported a hard
+        # failure (or an empty fetch) as "OK".
+        if ($LASTEXITCODE -eq 0) {
+            $blocklistOk = $true
+            Write-DebugLog "INFO" "Initial blocklist update complete"
+        } else {
+            Write-DebugLog "WARN" "Initial blocklist update exited $LASTEXITCODE -- rules left unchanged"
+            Write-Host "  -> Blocklist update failed (exit $LASTEXITCODE) -- existing rules kept." -ForegroundColor Yellow
+        }
     } catch {
         Write-DebugLog "WARN" "Blocklist initial run failed: $_"
     }
@@ -664,7 +712,8 @@ Write-Host "    Detection (CrowdSec engine) : $(if ($crowdsecOk) { 'OK' } else {
     -ForegroundColor $(if ($crowdsecOk) { 'Green' } else { 'Yellow' })
 Write-Host "    Enforcement (FW bouncer)    : $(if ($bouncerOk)  { 'OK' } else { 'FAILED' })" `
     -ForegroundColor $(if ($bouncerOk)  { 'Green' } else { 'Yellow' })
-Write-Host "    Abuse blocklists            : $(if ($DoBlocklists) { 'OK' } else { 'disabled' })" -ForegroundColor DarkGray
+Write-Host "    Abuse blocklists            : $(if (-not $DoBlocklists) { 'disabled' } elseif ($blocklistOk) { 'OK' } else { 'FAILED' })" `
+    -ForegroundColor $(if (-not $DoBlocklists) { 'DarkGray' } elseif ($blocklistOk) { 'Green' } else { 'Yellow' })
 if ($crowdsecOk) {
     Write-Host ""
     Write-Host "    Inspect with:" -ForegroundColor DarkGray

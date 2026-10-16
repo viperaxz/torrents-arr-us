@@ -24,7 +24,11 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
         $(if ($bnc -and $bnc.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) `
         "Firewall bouncer state: $(if ($bnc) { $bnc.Status } else { 'not installed' })"))
 
-    $blocklistRule = Get-NetFirewallRule -DisplayName 'Seedbox-Abuse-Blocklist' -ErrorAction SilentlyContinue
+    # Wildcard: with more than 5000 unique CIDRs the rules are split and named
+    # Seedbox-Abuse-Blocklist-0/1/..., i.e. the bare name does not exist. The
+    # current deduped list (~4.8k) fits in one rule, so an exact-name lookup
+    # silently starts failing the moment the lists grow.
+    $blocklistRule = Get-NetFirewallRule -DisplayName 'Seedbox-Abuse-Blocklist*' -ErrorAction SilentlyContinue
     $Script:Results.Add((New-TestResult $svc 1 'BlocklistRule' `
         $(if ($blocklistRule) { 'PASS' } else { 'WARN' }) 'Abuse blocklist firewall rule present'))
 }
@@ -74,12 +78,25 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     }
 
     if (Test-Path $CsCli) {
-        # Collections actually loaded by the running engine.
+        # Collections actually loaded by the running engine. The JSON shape of
+        # `cscli collections list -o json` differs between releases (array of
+        # {name=...} items, or an object keyed by item name), so accept either
+        # instead of silently reporting FAIL on the other one.
         try {
             $raw = (& $CsCli collections list -o json 2>$null | Out-String).Trim()
-            $names = if ($raw -and $raw -ne 'null') {
-                @(($raw | ConvertFrom-Json).collections | ForEach-Object { $_.name })
-            } else { @() }
+            $names = @()
+            if ($raw -and $raw -ne 'null') {
+                $parsed = $raw | ConvertFrom-Json
+                # `cscli collections list -o json` has been seen wrapped in a
+                # {collections:{...}} object and as a bare array of items.
+                $nodes = if ($parsed.PSObject.Properties['collections']) { @($parsed.collections) } else { @($parsed) }
+                foreach ($node in $nodes) {
+                    foreach ($p in @($node.PSObject.Properties)) {
+                        if ($p.Name -eq 'name' -and $p.Value) { $names += [string]$p.Value }
+                        elseif ($p.Name -match '/')          { $names += [string]$p.Name }
+                    }
+                }
+            }
             $hasCaddyCol = $names -contains 'crowdsecurity/caddy'
             $hasWinCol   = $names -contains 'crowdsecurity/windows'
             $Script:Results.Add((New-TestResult $svc 2 'CaddyCollection' `
