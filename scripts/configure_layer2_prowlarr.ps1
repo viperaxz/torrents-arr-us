@@ -27,8 +27,13 @@ $DomainMode      = $Config.General.DomainMode
 $SonarrUrlBase   = if ($DomainMode -eq "duckdns") { "/sonarr"   } else { "" }
 $RadarrUrlBase   = if ($DomainMode -eq "duckdns") { "/radarr"   } else { "" }
 $ProwlarrUrlBase = if ($DomainMode -eq "duckdns") { "/prowlarr" } else { "" }
+# URL Sonarr/Radarr use to talk back to this Prowlarr. Prowlarr derives every synced
+# indexer's baseUrl from it ("<prowlarrUrl>/<indexerId>/"), so it MUST carry the
+# UrlBase in DuckDNS mode or each *arr search returns 404.
+$ProwlarrSelfUrl = "http://127.0.0.1:$Port$ProwlarrUrlBase"
 
 Write-DebugLog "VAR AppName=$AppName Port=$Port Enabled=$Enabled DomainMode=$DomainMode"
+Write-DebugLog "VAR ProwlarrSelfUrl=$ProwlarrSelfUrl"
 Write-DebugLog "VAR ProwlarrUrlBase=$ProwlarrUrlBase SonarrUrlBase=$SonarrUrlBase RadarrUrlBase=$RadarrUrlBase"
 
 if (-not $Enabled) {
@@ -163,6 +168,7 @@ try {
                 name               = "Sonarr"
                 syncLevel          = "fullSync"
                 fields             = @(
+                    @{ name = "prowlarrUrl"; value = $ProwlarrSelfUrl }
                     @{ name = "baseUrl"; value = $sonarrUrl }
                     @{ name = "apiKey";  value = $sonarrApiKey }
                 )
@@ -207,6 +213,7 @@ try {
                 name               = "Radarr"
                 syncLevel          = "fullSync"
                 fields             = @(
+                    @{ name = "prowlarrUrl"; value = $ProwlarrSelfUrl }
                     @{ name = "baseUrl"; value = $radarrUrl }
                     @{ name = "apiKey";  value = $radarrApiKey }
                 )
@@ -254,45 +261,46 @@ if (-not ($Layer2Config -and $Layer2Config.Indexers -and $Layer2Config.Indexers.
 Write-Host "  -> Configuring indexers..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Configuring $($Layer2Config.Indexers.Count) indexers..."
 
-# --- 5a. FlareSolverr tag setup ----------------------------------------------
+# --- 5a. FlareSolverr tag ----------------------------------------------------
+# configure_layer2_flaresolverr.ps1 owns the indexer-proxy resource and resolves
+# this same tag by label, so all this script needs is the tag id: the
+# Cloudflare-protected indexers it creates below must be born with the tag, and
+# the proxy is never written from here.
+#
+# The proxy must not be written from here either way: on a fresh install it does
+# not exist yet (the FlareSolverr step runs after this one in
+# master_configure_layer2.ps1, which is also why proxying this block was a no-op),
+# and on a re-run the FlareSolverr step re-PUTs it authoritatively with
+# ?forceSave=true. Writing it here would hit Prowlarr's
+# ProviderControllerBase.UpdateProvider, where the proxy counts as enabled as soon
+# as it carries a tag (`IndexerProxyDefinition.Enable => Tags.Any()`) and no
+# forceSave is sent, so Prowlarr would run a real FlareSolverr Test() -- a full
+# browser round-trip -- mid-install and reject the save while the solver is still
+# warming up.
 $flareTagId = $null
 if ($Config.Apps.Flaresolverr -eq $true) {
-    Write-DebugLog "INFO" "Setting up FlareSolverr tag..."
+    $tagBase = "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/tag"
     try {
-        $tags = Invoke-RestMethod "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/tag" `
+        $tags = Invoke-RestMethod -Uri $tagBase `
             -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
-        $fsTag = $tags | Where-Object { $_.label -eq "flaresolverr" } | Select-Object -First 1
+        # Label comparison matches configure_layer2_flaresolverr.ps1's so the two
+        # steps can never create two different tags for the same proxy/indexers.
+        $fsTag = @($tags) | Where-Object { $_.label -ieq "flaresolverr" } | Select-Object -First 1
         Write-DebugLog "VAR flaresolverr tag exists=$($null -ne $fsTag)"
         if (-not $fsTag) {
-            $fsTag = Invoke-RestMethod "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/tag" `
+            $fsTag = Invoke-RestMethod -Uri $tagBase `
                 -Method Post `
                 -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
                 -Body (@{ label = "flaresolverr" } | ConvertTo-Json) `
                 -UseBasicParsing -ErrorAction Stop
             Write-DebugLog "INFO" "FlareSolverr tag created id=$($fsTag.id)"
         }
-        $flareTagId = $fsTag.id
+        $flareTagId = [int]$fsTag.id
         Write-DebugLog "VAR flareTagId=$flareTagId"
-
-        $proxies = Invoke-RestMethod "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexerproxy" `
-            -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
-        $fsProxy = $proxies | Where-Object { $_.implementation -eq "FlareSolverr" } | Select-Object -First 1
-        Write-DebugLog "VAR FlareSolverr proxy exists=$($null -ne $fsProxy)"
-        if ($fsProxy) {
-            $proxyPayload = @{}
-            $fsProxy.PSObject.Properties | ForEach-Object { $proxyPayload[$_.Name] = $_.Value }
-            $proxyPayload["tags"] = @($flareTagId)
-            Invoke-RestMethod "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexerproxy/$($fsProxy.id)" `
-                -Method Put `
-                -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
-                -Body ($proxyPayload | ConvertTo-Json -Depth 10 -Compress) `
-                -UseBasicParsing -ErrorAction Stop | Out-Null
-            Write-Host "     OK FlareSolverr proxy tagged (id=$flareTagId)." -ForegroundColor Green
-            Write-DebugLog "INFO" "FlareSolverr proxy updated with tag id=$flareTagId"
-        }
     } catch {
-        Write-Warning "     Could not set up FlareSolverr tag: $_"
-        Write-DebugLog "WARN" "FlareSolverr tag setup failed: $_"
+        # Not fatal: the FlareSolverr step re-tags CF indexers by definition name.
+        Write-Warning "     Could not resolve the FlareSolverr tag: $_"
+        Write-DebugLog "WARN" "FlareSolverr tag setup failed (FlareSolverr layer will apply it): $_"
     }
 }
 
@@ -484,7 +492,7 @@ if ($cfIndexerIds.Count -gt 0) {
         $gcResult = Get-Command python -ErrorAction SilentlyContinue
         if ($gcResult) { $pythonExe = $gcResult.Source }
     }
-    Write-DebugLog "VAR pythonExe=$pythonExe (exists=$(Test-Path $pythonExe))"
+    Write-DebugLog "VAR pythonExe=$pythonExe"
 
     if ($pythonExe) {
         Stop-Service -Name Prowlarr -Force -ErrorAction SilentlyContinue
@@ -539,6 +547,32 @@ print(f"Enabled {changed}/{len(ids)} CF-protected indexer(s)")
         if ($apiBack) {
             Write-Host "     OK Prowlarr restarted, API up." -ForegroundColor Green
             Write-DebugLog "INFO" "Prowlarr restarted and API is up  --  startup sync will push CF indexers to apps"
+
+            # The SQLite edit ran against a stopped Prowlarr; read the flags back
+            # instead of trusting the write, otherwise an indexer that never got
+            # enabled stays silently unusable.
+            try {
+                # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses
+                # the whole response array into ONE element, so the filter below would
+                # hand $_ the array itself and [int]$_.id would throw -- the check would
+                # never verify anything.
+                $idxAfter = @()
+                $idxAfter = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer" `
+                    -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+                $stillDisabled = @($idxAfter |
+                    Where-Object { $cfIndexerIds -contains [int]$_.id -and $_.enable -ne $true } |
+                    ForEach-Object { "$($_.name) (id=$($_.id))" })
+                if ($stillDisabled.Count -eq 0) {
+                    Write-Host "     OK Verified enabled via API ($($cfIndexerIds.Count) CF-protected indexer(s))." -ForegroundColor Green
+                    Write-DebugLog "INFO" "Verified CF indexers enabled: $($cfIndexerIds -join ',')"
+                } else {
+                    Write-Warning "     $($stillDisabled.Count) CF-protected indexer(s) still disabled: $($stillDisabled -join ', ')"
+                    Write-DebugLog "WARN" "CF indexers still disabled after SQLite enable: $($stillDisabled -join ', ')"
+                }
+            } catch {
+                Write-Warning "     Could not verify CF-protected indexer state: $_"
+                Write-DebugLog "WARN" "CF indexer enable verification failed: $_"
+            }
         } else {
             Write-Warning "     Prowlarr API did not come back within 30s."
             Write-DebugLog "WARN" "Prowlarr API did not come back after restart within 30s"
@@ -699,15 +733,17 @@ if ($seedRulesMap.Count -gt 0) {
             $appOk    = 0
 
             foreach ($syncedIdx in $idxList) {
-                if (-not $seedRulesMap.ContainsKey($syncedIdx.name)) { continue }
-                $rules    = $seedRulesMap[$syncedIdx.name]
+                # Prowlarr syncs indexers into the *arr apps as "<Name> (Prowlarr)".
+                $baseName = $syncedIdx.name -replace '\s*\(Prowlarr\)\s*$', ''
+                if (-not $seedRulesMap.ContainsKey($baseName)) { continue }
+                $rules    = $seedRulesMap[$baseName]
                 $changed  = $false
 
                 foreach ($field in $syncedIdx.fields) {
-                    if ($field.name -eq "seedRatio" -and $null -ne $rules.Ratio) {
+                    if ($field.name -eq "seedCriteria.seedRatio" -and $null -ne $rules.Ratio) {
                         if ($field.value -ne $rules.Ratio) { $field.value = $rules.Ratio; $changed = $true }
                     }
-                    if ($field.name -eq "seedTime" -and $null -ne $rules.SeedTimeMinutes) {
+                    if ($field.name -eq "seedCriteria.seedTime" -and $null -ne $rules.SeedTimeMinutes) {
                         if ($field.value -ne $rules.SeedTimeMinutes) { $field.value = $rules.SeedTimeMinutes; $changed = $true }
                     }
                 }

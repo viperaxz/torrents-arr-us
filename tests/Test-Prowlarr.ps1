@@ -46,6 +46,16 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
         $radarrReg = @($apps.data | Where-Object { $_.name -match 'Radarr' }).Count -gt 0
         $Script:Results.Add((New-TestResult $svc 2 'SonarrRegistered' $(if ($sonarrReg) { 'PASS' } else { 'FAIL' }) 'Sonarr in Prowlarr applications'))
         $Script:Results.Add((New-TestResult $svc 2 'RadarrRegistered'  $(if ($radarrReg) { 'PASS' } else { 'FAIL' }) 'Radarr in Prowlarr applications'))
+
+        # Sonarr/Radarr fetch every synced indexer from "<prowlarrUrl>/<indexerId>/".
+        # In DuckDNS mode that URL must carry the /prowlarr UrlBase or all searches 404.
+        foreach ($appName in @('Sonarr','Radarr')) {
+            $app = @($apps.data | Where-Object { $_.name -eq $appName })[0]
+            if (-not $app) { continue }
+            $prowlarrUrlField = ($app.fields | Where-Object { $_.name -eq 'prowlarrUrl' } | Select-Object -First 1).value
+            $urlOk = [bool]$prowlarrUrlField -and ($prowlarrUrlField -match "^https?://(127\.0\.0\.1|localhost):$port(?:/|$)") -and ($prowlarrUrlField.TrimEnd('/').EndsWith($base))
+            $Script:Results.Add((New-TestResult $svc 2 "${appName}ProwlarrUrl" $(if ($urlOk) { 'PASS' } else { 'FAIL' }) "prowlarrUrl='$prowlarrUrlField' expected localhost:$port$base"))
+        }
     } else {
         $Script:Results.Add((New-TestResult $svc 2 'SonarrRegistered' 'FAIL' $apps.error))
         $Script:Results.Add((New-TestResult $svc 2 'RadarrRegistered'  'FAIL' $apps.error))
@@ -81,9 +91,18 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 3) -and $apiKey) {
     if (-not $tgtIdx) {
         $Script:Results.Add((New-TestResult $svc 3 'LiveSearch' 'SKIP' 'No enabled indexer found to test with'))
     } else {
-        # Prowlarr search API: /api/v1/search?query=...&indexerIds=...&categories=2000 (movies)
-        $q    = [System.Web.HttpUtility]::UrlEncode('test')
-        $srch = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/search?query=$q&indexerIds=$($tgtIdx.id)&categories=2000&limit=5" $hdr -TimeoutSec 30
+        # Search in a category the indexer actually supports: movie categories return
+        # nothing from anime-only trackers such as Nyaa.si.
+        $catParam = '&categories=2000'
+        $caps     = $tgtIdx.capabilities
+        if ($caps -and $caps.categories) {
+            $cat = @($caps.categories | Where-Object { $_.id -ge 2000 })[0]
+            if ($cat) { $catParam = "&categories=$($cat.id)" }
+        }
+        # Prowlarr search API: /api/v1/search?query=...&indexerIds=...&categories=...
+        $q = [uri]::EscapeDataString('test')
+
+        $srch = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/search?query=$q&indexerIds=$($tgtIdx.id)$catParam&limit=5" $hdr -TimeoutSec 30
         if ($srch.ok) {
             $hits = if ($srch.data -is [array]) { $srch.data.Count } else { 0 }
             $Script:Results.Add((New-TestResult $svc 3 'LiveSearch' $(if ($hits -gt 0) { 'PASS' } else { 'WARN' }) "$hits result(s) from $($tgtIdx.name)" $srch.latency_ms))
