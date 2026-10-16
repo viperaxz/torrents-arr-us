@@ -166,8 +166,13 @@ try {
     # Inheritance flags must stay "None" for a file rule.
     $NoFlags = "None"
     $Allow   = [System.Security.AccessControl.AccessControlType]::Allow
-    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("BUILTIN\Administrators", [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
-    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("NT AUTHORITY\SYSTEM",    [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
+    # Well-known SIDs, not "BUILTIN\Administrators" / "NT AUTHORITY\SYSTEM": those
+    # names are localized, so the string form fails to resolve on Windows installed
+    # in another display language.
+    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sidAdmins, [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
+    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sidSystem, [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
     $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($SvcUser,                 [System.Security.AccessControl.FileSystemRights]"Modify",      $NoFlags, $NoFlags, $Allow))
     Set-Acl -Path $ZurgConfig -AclObject $cfgAcl
     Write-DebugLog "INFO" "config.yml ACL hardened: Admins/SYSTEM FullControl, $SvcUser Modify"
@@ -207,6 +212,7 @@ nssm set $AppName AppStdout (Join-Path $LogDir "zurg.log") | Out-Null
 nssm set $AppName AppStderr (Join-Path $LogDir "zurg-error.log") | Out-Null
 nssm set $AppName AppRotateFiles 1 | Out-Null
 nssm set $AppName AppRotateBytes 5242880 | Out-Null
+nssm set $AppName AppRotateOnline 1 | Out-Null
 nssm set $AppName Start SERVICE_AUTO_START | Out-Null
 nssm set $AppName ObjectName ".\$SvcUser" $SvcPass | Out-Null
 nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" | Out-Null

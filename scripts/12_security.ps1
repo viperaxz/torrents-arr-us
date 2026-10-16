@@ -747,7 +747,7 @@ if ($crowdsecOk) {
 
 # -- Write lock file (only when detection actually came up) --------------------
 if ($crowdsecOk) {
-    [System.IO.File]::WriteAllText($LockFile, "installed", [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($LockFile, "installed", (New-Object System.Text.UTF8Encoding($false)))
     Write-DebugLog "INFO" "12_security.ps1 complete. Lock: $LockFile"
 
     # Ledger entries for the updater (single source of truth for versions)

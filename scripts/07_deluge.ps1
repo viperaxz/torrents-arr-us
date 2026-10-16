@@ -816,6 +816,11 @@ if (-not $existingDaemon) {
     nssm set DelugeDaemon Start SERVICE_AUTO_START | Out-Null
     nssm set DelugeDaemon AppStdout $DaemonLog | Out-Null
     nssm set DelugeDaemon AppStderr $DaemonLog | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set DelugeDaemon AppRotateFiles 1 | Out-Null
+    nssm set DelugeDaemon AppRotateBytes 5242880 | Out-Null
+    nssm set DelugeDaemon AppRotateOnline 1 | Out-Null
     nssm set DelugeDaemon ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set DelugeDaemon AppExit Default Restart | Out-Null
     nssm set DelugeDaemon AppRestartDelay 5000 | Out-Null
@@ -849,6 +854,11 @@ if (-not $existingWeb -and $delugeWebPath) {
     nssm set DelugeWeb Start SERVICE_AUTO_START | Out-Null
     nssm set DelugeWeb AppStdout $WebLog | Out-Null
     nssm set DelugeWeb AppStderr $WebLog | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set DelugeWeb AppRotateFiles 1 | Out-Null
+    nssm set DelugeWeb AppRotateBytes 5242880 | Out-Null
+    nssm set DelugeWeb AppRotateOnline 1 | Out-Null
     nssm set DelugeWeb ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set DelugeWeb AppExit Default Restart | Out-Null
     nssm set DelugeWeb AppRestartDelay 5000 | Out-Null
@@ -878,6 +888,10 @@ if (-not $existingWeb -and $delugeWebPath) {
 }
 
 # -- 6. Firewall ---------------------------------------------------------------
+# Remove any previous rules first: duplicates with the same DisplayName are allowed,
+# so they would otherwise accumulate on every install run.
+Get-NetFirewallRule -DisplayName "Deluge BT"     -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+Get-NetFirewallRule -DisplayName "Deluge BT UDP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "Deluge BT"     -Direction Inbound -LocalPort $BTPort -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -DisplayName "Deluge BT UDP" -Direction Inbound -LocalPort $BTPort -Protocol UDP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 Write-DebugLog "INFO" "Firewall rules added for BitTorrent port $BTPort (TCP+UDP). Daemon port $DaemonPort is NOT opened (localhost-only)"
@@ -966,7 +980,7 @@ if ($delugeWebPath) {
 # being compared pin-vs-pin and reported as current.  $installedVersion was set
 # only after a verified install, so the lock file is never written for a failure.
 $LockVersion = $installedVersion
-[System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion source=$acquirePath)"
 
 # Ledger entry for the updater (single source of truth for installed versions)

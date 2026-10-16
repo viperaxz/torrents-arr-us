@@ -273,6 +273,9 @@ if (Test-Path $NetworkConfig) {
 # A world-open rule would expose Jellyfin's own login page on :$AppPort, bypassing
 # Caddy's basic-auth and CrowdSec detection. See 03_sonarr.ps1 for rationale.
 $JfPort = $Config.Ports.Jellyfin
+# Remove any previous rule first: duplicates with the same DisplayName are allowed,
+# so they would otherwise accumulate on every install run.
+Get-NetFirewallRule -DisplayName "Jellyfin" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "Jellyfin" -Direction Inbound -LocalPort $JfPort -Protocol TCP -Action Allow -RemoteAddress LocalSubnet -ErrorAction SilentlyContinue | Out-Null
 Write-DebugLog "INFO" "Firewall rule added for Jellyfin port=$JfPort"
 
@@ -296,7 +299,7 @@ if ($svc.Status -eq "Running") {
 # updater instead of being reported as current. The pin is only used above to decide
 # what to request from choco.
 $LockVersion = $installedVersion
-[System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 
 # Ledger entry for the updater (single source of truth for installed versions)

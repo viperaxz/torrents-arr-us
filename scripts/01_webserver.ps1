@@ -814,11 +814,20 @@ if (-not $CaddyService) {
     nssm set Caddy Start SERVICE_AUTO_START | Out-Null
     nssm set Caddy AppStdout (Join-Path $CaddyDir "caddy.log") | Out-Null
     nssm set Caddy AppStderr (Join-Path $CaddyDir "caddy.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set Caddy AppRotateFiles 1 | Out-Null
+    nssm set Caddy AppRotateBytes 5242880 | Out-Null
+    nssm set Caddy AppRotateOnline 1 | Out-Null
     nssm set Caddy ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set Caddy AppExit Default Restart | Out-Null
     nssm set Caddy AppRestartDelay 5000 | Out-Null
     Write-DebugLog "VAR Caddy service log=$(Join-Path $CaddyDir 'caddy.log')"
 
+    # Remove first: a second rule with the same DisplayName is created happily, so
+    # without this every install run would leave another allow rule behind.
+    Get-NetFirewallRule -DisplayName "Caddy HTTP"  -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    Get-NetFirewallRule -DisplayName "Caddy HTTPS" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName "Caddy HTTP"  -Direction Inbound -LocalPort 80  -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
     New-NetFirewallRule -DisplayName "Caddy HTTPS" -Direction Inbound -LocalPort 443 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
     Write-DebugLog "INFO" "Firewall rules added: ports 80 and 443"

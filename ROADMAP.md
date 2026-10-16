@@ -41,11 +41,7 @@ Two things show up in the *arr UIs right after an install and are worth recognis
 
 **Cleanup / conventions (still open)**
 
-- **`master_uninstall.ps1` leftovers:** `%APPDATA%\recyclarr\secrets.yml` (live Sonarr/Radarr API keys), the Machine `PATH` entry the installer adds, and `<repo>\bin` (cached release zips) are never removed. `cert-cache\` is kept deliberately but is not listed in the "Kept intact" footer.
-- **Duplicate firewall rules on reinstall** — `New-NetFirewallRule … -ErrorAction SilentlyContinue` is used everywhere, so rules accumulate across reinstall cycles.
-- **NSSM log rotation is only configured for Zurg and rclone**, so services that log verbosely (e.g. Seerr at `debug`, via `jellyseerr-stdout.log`) grow without bound.
-- **A few ACL helpers still use localized principal names** (`BUILTIN\Administrators`, `NT AUTHORITY\SYSTEM`) where newer code uses well-known SIDs — only breaks on non-English Windows.
-- **`.locks\*.lock` files are written with a UTF-8 BOM** — harmless (all readers are BOM-aware) but inconsistent with the repo's BOM-free convention for generated files.
+- **`<repo>\bin` and `cert-cache\` are kept across an uninstall but neither is named in the "Kept intact" footer.** Both are deliberate: `bin` caches the downloaded release zips (~1.5 GB, so a reinstall does not re-download them) and `cert-cache` preserves the ACME account and certificates. The footer lists only Chocolatey/NSSM/vcredist, the media paths and the Sonarr/Radarr backup, so a user reading it would reasonably expect both to be gone.
 - **`update_crowdsec.ps1` and `update_crowdsecbouncer.ps1` duplicate four service helpers.** They are near-identical and belong in `update_common.ps1` as `Resolve-ServiceName` / `Ensure-ServiceRunning` alongside the sibling `update_*.ps1` scripts.
 
 ---

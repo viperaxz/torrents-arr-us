@@ -870,6 +870,11 @@ if (-not $lokiExe) {
     nssm set Loki Start SERVICE_AUTO_START | Out-Null
     nssm set Loki AppStdout (Join-Path $LokiDir "loki.log") | Out-Null
     nssm set Loki AppStderr (Join-Path $LokiDir "loki.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set Loki AppRotateFiles 1 | Out-Null
+    nssm set Loki AppRotateBytes 5242880 | Out-Null
+    nssm set Loki AppRotateOnline 1 | Out-Null
     nssm set Loki ObjectName LocalSystem | Out-Null
     nssm set Loki AppExit Default Restart | Out-Null
     nssm set Loki AppRestartDelay 5000 | Out-Null
@@ -885,6 +890,11 @@ if ($alloyExe -and -not (Get-Service "Alloy" -ErrorAction SilentlyContinue)) {
     nssm set Alloy Start SERVICE_AUTO_START | Out-Null
     nssm set Alloy AppStdout (Join-Path $AlloyDir "alloy.log") | Out-Null
     nssm set Alloy AppStderr (Join-Path $AlloyDir "alloy.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set Alloy AppRotateFiles 1 | Out-Null
+    nssm set Alloy AppRotateBytes 5242880 | Out-Null
+    nssm set Alloy AppRotateOnline 1 | Out-Null
     nssm set Alloy ObjectName LocalSystem | Out-Null
     nssm set Alloy AppExit Default Restart | Out-Null
     nssm set Alloy AppRestartDelay 5000 | Out-Null
@@ -903,6 +913,11 @@ if (-not (Get-Service "Grafana" -ErrorAction SilentlyContinue)) {
     nssm set Grafana Start SERVICE_AUTO_START | Out-Null
     nssm set Grafana AppStdout (Join-Path $GrafanaData "logs\grafana.log") | Out-Null
     nssm set Grafana AppStderr (Join-Path $GrafanaData "logs\grafana.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set Grafana AppRotateFiles 1 | Out-Null
+    nssm set Grafana AppRotateBytes 5242880 | Out-Null
+    nssm set Grafana AppRotateOnline 1 | Out-Null
     nssm set Grafana ObjectName LocalSystem | Out-Null
     $grafanaEnv = @(
         "set", "Grafana", "AppEnvironmentExtra",

@@ -77,7 +77,7 @@ try {
 }
 
 if ($taskOk) {
-    [System.IO.File]::WriteAllText($LockFile, "installed", [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($LockFile, "installed", (New-Object System.Text.UTF8Encoding($false)))
     Write-DebugLog "INFO" "13_status.ps1 complete. Lock: $LockFile"
 } else {
     Write-DebugLog "WARN" "Status task not registered -- lock file left unwritten so a later run retries"

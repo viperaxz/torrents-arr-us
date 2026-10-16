@@ -174,6 +174,11 @@ if (-not $svcExists) {
     nssm set $AppName Start         SERVICE_AUTO_START | Out-Null
     nssm set $AppName AppStdout     (Join-Path $DataDir "flaresolverr-stdout.log") | Out-Null
     nssm set $AppName AppStderr     (Join-Path $DataDir "flaresolverr-stderr.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set $AppName AppRotateFiles 1 | Out-Null
+    nssm set $AppName AppRotateBytes 5242880 | Out-Null
+    nssm set $AppName AppRotateOnline 1 | Out-Null
     nssm set $AppName ObjectName    ".\$SvcUser" $SvcPass | Out-Null
     nssm set $AppName AppExit Default Restart | Out-Null
     nssm set $AppName AppRestartDelay 5000 | Out-Null
@@ -264,7 +269,7 @@ if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
 }
 
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
-[System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 
 # Ledger entry for the updater (single source of truth for installed versions)

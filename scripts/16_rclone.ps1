@@ -230,6 +230,7 @@ nssm set $MoviesSvc AppStdout (Join-Path $LogDir "rclone-rd-movies.log") | Out-N
 nssm set $MoviesSvc AppStderr (Join-Path $LogDir "rclone-rd-movies-error.log") | Out-Null
 nssm set $MoviesSvc AppRotateFiles 1 | Out-Null
 nssm set $MoviesSvc AppRotateBytes 5242880 | Out-Null
+nssm set $MoviesSvc AppRotateOnline 1 | Out-Null
 # Delayed auto-start: Zurg needs 15-30s after boot to load its torrent cache
 # and open the WebDAV port.  With SERVICE_AUTO_START rclone races Zurg every
 # boot, exits with CRITICAL "connection refused" and relies on the AppExit

@@ -179,6 +179,11 @@ if (-not $ExistingService) {
     nssm set $AppName Start SERVICE_AUTO_START | Out-Null
     nssm set $AppName AppStdout (Join-Path $DataDir "$AppLower.log") | Out-Null
     nssm set $AppName AppStderr (Join-Path $DataDir "$AppLower.log") | Out-Null
+    # Rotate the log in place. nssm only rotates at service restart without
+    # AppRotateOnline, which a long-running service never reaches.
+    nssm set $AppName AppRotateFiles 1 | Out-Null
+    nssm set $AppName AppRotateBytes 5242880 | Out-Null
+    nssm set $AppName AppRotateOnline 1 | Out-Null
     nssm set $AppName ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set $AppName AppExit Default Restart | Out-Null
     nssm set $AppName AppRestartDelay 5000 | Out-Null
@@ -189,6 +194,9 @@ if (-not $ExistingService) {
 
 # LAN-scoped: Caddy proxies over loopback, so exposing this port to the internet
 # would only bypass basic-auth and CrowdSec detection. See 03_sonarr.ps1.
+# Remove any previous rule first: duplicates with the same DisplayName are allowed,
+# so they would otherwise accumulate on every install run.
+Get-NetFirewallRule -DisplayName "$AppName" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "$AppName" -Direction Inbound -LocalPort $AppPort -Protocol TCP -Action Allow -RemoteAddress LocalSubnet -ErrorAction SilentlyContinue | Out-Null
 Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 
@@ -250,7 +258,7 @@ if ($svc -and $svc.Status -eq "Running") {
 }
 
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
-[System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 
 # Ledger entry for the updater (single source of truth for installed versions)

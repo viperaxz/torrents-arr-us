@@ -69,6 +69,34 @@ function Remove-NssmService {
     }
 }
 
+# -- Remove a single entry from the Machine PATH -------------------------------
+# Written against the registry rather than [Environment]::SetEnvironmentVariable so
+# the value's type survives. That API rewrites an ExpandString PATH as a plain
+# String, which would stop any %VAR% reference in the remaining entries (e.g.
+# %SystemRoot%\system32) from expanding.
+function Remove-MachinePathEntry {
+    param([Parameter(Mandatory = $true)][string]$Entry)
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+    try {
+        $kind = (Get-Item $key -ErrorAction Stop).GetValueKind('Path')
+        $cur  = (Get-ItemProperty -Path $key -Name Path -ErrorAction Stop).Path
+    } catch {
+        Write-DebugLog "WARN" "Could not read the Machine PATH, skipping removal of '$Entry': $_"
+        return $false
+    }
+    if (-not $cur) { return $false }
+
+    # Same normalization the installer applies when adding an entry.
+    $wanted  = $Entry.Trim().Trim('"').TrimEnd('\')
+    $entries = @($cur -split ';' | Where-Object { $_.Trim().Trim('"') -ne '' })
+    $kept    = @($entries | Where-Object { -not ($_.Trim().Trim('"').TrimEnd('\') -ieq $wanted) })
+    if ($kept.Count -eq $entries.Count) { return $false }
+
+    $type = if ($kind -eq 'ExpandString') { 'ExpandString' } else { 'String' }
+    Set-ItemProperty -Path $key -Name Path -Value ($kept -join ';') -Type $type -ErrorAction Stop
+    return $true
+}
+
 # -- 1. Stop any stray processes -----------------------------------------------
 Write-Host "[1/8] Stopping processes..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 1: Stop stray processes ==="
@@ -378,6 +406,23 @@ foreach ($dir in $dataDirs) {
     }
 }
 
+# Recyclarr keeps its configuration under %APPDATA%. The generated config only
+# references the keys symbolically ("api_key: !secret sonarr_api_key"), so
+# secrets.yml is the one file that holds them in the clear -- and it holds LIVE
+# Sonarr/Radarr keys, which must not outlive the install.
+$RecyclarrSecrets = Join-Path $env:APPDATA "recyclarr\secrets.yml"
+Write-DebugLog "VAR recyclarr secrets=$RecyclarrSecrets (exists=$(Test-Path $RecyclarrSecrets))"
+if (Test-Path $RecyclarrSecrets) {
+    Remove-Item -Path $RecyclarrSecrets -Force -ErrorAction SilentlyContinue
+    if (Test-Path $RecyclarrSecrets) {
+        Write-Warning "  -> Could not remove $RecyclarrSecrets -- it holds live Sonarr/Radarr API keys."
+        Write-DebugLog "WARN" "recyclarr secrets.yml could not be removed"
+    } else {
+        Write-Host "  -> Removed recyclarr API keys: $RecyclarrSecrets" -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Removed recyclarr secrets.yml (live Sonarr/Radarr API keys)"
+    }
+}
+
 # -- 6. Remove InstallDir contents ---------------------------------------------
 Write-Host "[6/8] Removing installation files from $InstallDir..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 6: Remove InstallDir contents from $InstallDir ==="
@@ -419,6 +464,18 @@ if (-not $remaining -or $remaining.Count -eq 0) {
 } else {
     Write-Host "  -> Skipping $InstallDir (not empty, $($remaining.Count) item(s) remain)." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "InstallDir not removed: $($remaining.Count) item(s) remain"
+}
+
+# Remove the two Machine PATH entries the installer adds: the ffmpeg directory
+# under InstallDir, and the repo root so the 'box' CLI resolves from any directory.
+# Left behind they keep PATH pointing at directories that no longer exist.
+foreach ($pathEntry in @((Join-Path $InstallDir "ffmpeg"), $PSScriptRoot)) {
+    if (Remove-MachinePathEntry -Entry $pathEntry) {
+        Write-Host "  -> Removed from Machine PATH: $pathEntry" -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Removed Machine PATH entry: $pathEntry"
+    } else {
+        Write-DebugLog "INFO" "Machine PATH entry absent, nothing to remove: $pathEntry"
+    }
 }
 
 # -- 7. Remove Chocolatey app packages ----------------------------------------

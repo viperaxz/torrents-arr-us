@@ -594,7 +594,7 @@ Write-DebugLog "INFO" "hardware tone-mapping support verified (opencl + libplace
 # build must show up as "update available" in the updater instead of being
 # reported as current.
 $LockVersion = $install.Tag
-[System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 
 # Ledger entry for the updater (single source of truth for installed versions)
