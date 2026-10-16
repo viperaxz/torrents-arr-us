@@ -28,6 +28,13 @@ if ($Config) {
     Write-Host "[DEBUG] config.json not found  --  debug logging disabled." -ForegroundColor DarkGray
 }
 
+# Shared choco plumbing. This is the file that died at step 7 of 8 with
+# "The term 'choco' is not recognized": a shell opened BEFORE Chocolatey was
+# installed never sees chocolatey\bin even though the Machine PATH names it,
+# because a process reads PATH only at startup. Resolve-ChocoExe does not trust
+# $env:Path -- it checks the known install location and re-reads the registry.
+. (Join-Path $PSScriptRoot "scripts\choco_helpers.ps1")
+
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Red
 Write-Host "  SEEDBOX UNINSTALLER" -ForegroundColor Red
@@ -418,21 +425,33 @@ if (-not $remaining -or $remaining.Count -eq 0) {
 # Does NOT remove prerequisites: nssm, php, git, vcredist140, chocolatey itself
 Write-Host "[7/8] Uninstalling Chocolatey app packages..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 7: Uninstall Chocolatey packages ==="
+# Resolve choco up front (not via $env:Path) so this phase can never abort with
+# "The term 'choco' is not recognized" just because this shell predates the
+# Chocolatey install.
+$ChocoExe = Resolve-ChocoExe
+Write-DebugLog "VAR choco.exe resolved to: $(if ($ChocoExe) { $ChocoExe } else { '(not found)' })"
+if (-not $ChocoExe) {
+    Write-Warning "  -> Chocolatey not found -- skipping app package removal (prerequisites are kept anyway)."
+    Write-DebugLog "ERROR" "choco.exe could not be located; skipping phase 7 package removal"
+}
 foreach ($pkg in @("caddy", "jellyfin", "deluge", "ffmpeg", "python312",
                    "crowdsec-windows-firewall-bouncer", "crowdsec", "winfsp")) {
-    $installed = choco list --exact $pkg -r 2>$null
+    if (-not $ChocoExe) { break }
+    $installed = Get-ChocoInstalledVersion -Package $pkg
     $isInstalled = -not [string]::IsNullOrWhiteSpace($installed)
     Write-DebugLog "VAR choco package '$pkg' installed: $isInstalled (output: $installed)"
     if ($isInstalled) {
         Write-Host "  -> Uninstalling: $pkg..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Uninstalling choco package: $pkg"
-        choco uninstall $pkg -y --no-progress 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $uninstall = Invoke-Choco -Arguments @('uninstall', $pkg, '-y', '--no-progress')
+        $uninstallTail = $uninstall.Output
+        if ($uninstallTail -and $uninstallTail.Length -gt 800) { $uninstallTail = $uninstallTail.Substring($uninstallTail.Length - 800) }
+        if ($uninstall.ExitCode -eq 0) {
             Write-Host "  -> $pkg removed." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "choco uninstall $($pkg): SUCCESS (exit 0)"
+            Write-DebugLog "INFO" "choco uninstall $($pkg): SUCCESS (exit 0, attempts $($uninstall.Attempts))"
         } else {
-            Write-Warning "  -> $pkg uninstall failed (exit $LASTEXITCODE)  --  remove manually."
-            Write-DebugLog "ERROR" "choco uninstall $($pkg): FAILED (exit $LASTEXITCODE)"
+            Write-Warning "  -> $pkg uninstall failed (exit $($uninstall.ExitCode))  --  remove manually."
+            Write-DebugLog "ERROR" "choco uninstall $($pkg): FAILED (exit $($uninstall.ExitCode), transient=$($uninstall.Transient), attempts=$($uninstall.Attempts)): $uninstallTail"
         }
     }
 }
