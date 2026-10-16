@@ -497,20 +497,39 @@ $RefreshScriptSrc = Join-Path $PSScriptRoot "sonarr_jellyfin_refresh.py"
 Write-DebugLog "VAR RefreshScriptSrc=$RefreshScriptSrc (exists=$(Test-Path $RefreshScriptSrc))"
 
 if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
+    # The chosen interpreter is baked into a .cmd that SONARR executes, and Sonarr
+    # runs as the service account -- so the interpreter must be readable by THAT
+    # account, not merely by the operator running this installer. A Python under
+    # C:\Users\<name>\ is not (another user's profile grants no access), and the
+    # Microsoft Store alias under WindowsApps is not a real interpreter at all.
+    # The PATH fallback below previously selected the operator's per-user Python,
+    # producing a wrapper that died with "is not recognized as an internal or
+    # external command" -- which made Sonarr reject the notification with HTTP
+    # 400 "Script exited with code: 1".
+    function Test-PythonForService {
+        param([string]$Path)
+        if (-not $Path -or -not (Test-Path $Path)) { return $false }
+        if ($Path -like "$env:SystemDrive\Users\*" -or $Path -like '*\WindowsApps\*') {
+            Write-DebugLog "WARN" "Python candidate rejected -- not readable by service account: $Path"
+            return $false
+        }
+        return $true
+    }
+
     $PythonExe = $null
-    if (Test-Path "C:\Python312\python.exe") {
+    if (Test-PythonForService "C:\Python312\python.exe") {
         $PythonExe = "C:\Python312\python.exe"
     } else {
         Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue |
             Sort-Object Name -Descending | ForEach-Object {
                 if ($PythonExe) { return }
                 $p = Join-Path $_.FullName "python.exe"
-                if (Test-Path $p) { $PythonExe = $p }
+                if (Test-PythonForService $p) { $PythonExe = $p }
             }
     }
     if (-not $PythonExe) {
         $gc = Get-Command python -ErrorAction SilentlyContinue
-        if ($gc) { $PythonExe = $gc.Source }
+        if ($gc -and (Test-PythonForService $gc.Source)) { $PythonExe = $gc.Source }
     }
 
     if ($PythonExe -and (Test-Path $PythonExe)) {
@@ -580,6 +599,19 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
             [System.IO.File]::WriteAllText($RefreshCmd, $cmdContent, [System.Text.Encoding]::ASCII)
             $RefreshScript = $RefreshCmd
             Write-DebugLog "INFO" "Refresh hook deployed: $RefreshScript (settings=$HookConfigPath)"
+
+            # Sonarr validates a CustomScript notification by EXECUTING it and
+            # requiring exit code 0 (the hook script itself exits 0 when
+            # sonarr_eventtype is empty). Prove the wrapper works here instead of
+            # letting the registration POST fail with a bare 400 whose only clue
+            # is "Script exited with code: 1" -- which is exactly what a wrong or
+            # unreadable interpreter produces.
+            $probeOut  = & cmd.exe /c "`"$RefreshCmd`"" 2>&1
+            $probeCode = $LASTEXITCODE
+            Write-DebugLog "VAR hook wrapper self-test exit=$probeCode output=$(($probeOut -join ' ').Trim())"
+            if ($probeCode -ne 0) {
+                throw "generated hook wrapper exits $probeCode when Sonarr tests it ($(($probeOut -join ' ').Trim()))"
+            }
 
             # -- 9d. Register the Custom Script connection in Sonarr -------------
             # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the
