@@ -426,7 +426,7 @@ if (Test-Path $RecyclarrSecrets) {
 # -- 6. Remove InstallDir contents ---------------------------------------------
 Write-Host "[6/8] Removing installation files from $InstallDir..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 6: Remove InstallDir contents from $InstallDir ==="
-foreach ($sub in @("Caddy", "caddy-data", "Sonarr", "Radarr", "Prowlarr", "Bazarr", "Deluge-data", "Flaresolverr", "Jellyseerr", "Grafana", "Grafana-data", "Loki", "Loki-data", "Alloy", "Alloy-data", "Zurg", "rclone", "dashboard", "scripts", "secrets", ".locks", "logs")) {
+foreach ($sub in @("Caddy", "caddy-data", "Sonarr", "Radarr", "Prowlarr", "Bazarr", "ffmpeg", ".ffmpeg-staging", "Deluge-data", "Flaresolverr", "Jellyseerr", "Grafana", "Grafana-data", "Loki", "Loki-data", "Alloy", "Alloy-data", "Zurg", "rclone", "dashboard", "scripts", "secrets", ".locks", "logs")) {
     $path = Join-Path $InstallDir $sub
     $exists = Test-Path $path
     Write-DebugLog "VAR subdir '$sub' exists: $exists"
@@ -462,8 +462,13 @@ if (-not $remaining -or $remaining.Count -eq 0) {
         Write-DebugLog "INFO" "Removed empty InstallDir: $InstallDir"
     }
 } else {
-    Write-Host "  -> Skipping $InstallDir (not empty, $($remaining.Count) item(s) remain)." -ForegroundColor DarkGray
-    Write-DebugLog "INFO" "InstallDir not removed: $($remaining.Count) item(s) remain"
+    # Name what survived. This warning is the only thing that reveals a path the
+    # explicit removal lists above do not know about -- a whole 'ffmpeg' directory
+    # (ffmpeg.exe + ffprobe.exe, ~176 MB) was being left behind, and because only a
+    # count was reported it blocked removal of InstallDir without ever saying why.
+    $remainingNames = @($remaining | ForEach-Object { $_.Name }) -join ', '
+    Write-Warning "  -> Skipping $InstallDir  --  $($remaining.Count) item(s) remain: $remainingNames"
+    Write-DebugLog "WARN" "InstallDir not removed; $($remaining.Count) item(s) remain: $remainingNames"
 }
 
 # Remove the two Machine PATH entries the installer adds: the ffmpeg directory
