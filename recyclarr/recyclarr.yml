@@ -3,6 +3,13 @@
 #
 # Run:     recyclarr.exe sync -c recyclarr.yml
 # Preview: recyclarr.exe sync -c recyclarr.yml --preview
+#          Both require secrets for BOTH instances below: Recyclarr resolves
+#          every !secret while parsing and aborts when one is missing.
+#
+# The installer does not run this file directly. configure_layer2_recyclarr.ps1
+# writes a per-run copy (%APPDATA%\recyclarr\win-seedbox.yml) that keeps only the
+# instances it has credentials for, so a Sonarr-only or Radarr-only install syncs
+# cleanly. Keep this file the single source of truth for both instances.
 #
 # Secrets are written to %APPDATA%\recyclarr\secrets.yml by configure_layer2_recyclarr.ps1.
 # All trash_ids verified against trash/Guides/docs/json (local TRaSH-Guides clone).
