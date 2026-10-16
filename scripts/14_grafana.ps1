@@ -927,13 +927,21 @@ foreach ($svcName in @("Loki", "Alloy", "Grafana")) {
     }
 }
 
-# Wait up to 60s for Grafana API
+# Wait up to 60s for Grafana API.
+# DuckDNS mode runs Grafana with serve_from_sub_path=true, so the app (including
+# the API) only answers under /grafana -- probe the prefixed path in that mode.
+$grafanaHealthUrl = if ($DomainMode -eq "duckdns") {
+    "http://127.0.0.1:$GrafanaPort/grafana/api/health"
+} else {
+    "http://127.0.0.1:$GrafanaPort/api/health"
+}
+Write-DebugLog "VAR Grafana health probe URL=$grafanaHealthUrl"
 Write-Host "  -> Waiting for Grafana to start (up to 60s)..." -ForegroundColor DarkGray
 $grafanaReady = $false
 $deadline     = (Get-Date).AddSeconds(60)
 while (-not $grafanaReady -and (Get-Date) -lt $deadline) {
     try {
-        Invoke-RestMethod "http://127.0.0.1:$GrafanaPort/api/health" `
+        Invoke-RestMethod $grafanaHealthUrl `
             -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop | Out-Null
         $grafanaReady = $true
     } catch { Start-Sleep -Seconds 3 }

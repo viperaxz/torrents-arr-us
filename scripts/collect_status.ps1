@@ -311,7 +311,10 @@ if ($Config.Apps.Jellyseerr -eq $true) {
 
 # Grafana / Loki / Alloy
 if ($Config.Apps.Grafana -eq $true) {
-    $gfCheck  = QuickGet 'http://127.0.0.1:3000/api/health'
+    # DuckDNS mode runs Grafana with serve_from_sub_path=true, so its API lives
+    # under /grafana -- probe the prefixed path like every other app (UBase).
+    $gfBase  = UBase 'grafana'
+    $gfCheck = QuickGet "http://127.0.0.1:3000${gfBase}/api/health"
     $svcs.Add((SvcEntry 'Grafana' 'Grafana' (TcpOpen 3000) $gfCheck.ok $gfCheck.ms))
     $lokiCheck = QuickGet 'http://127.0.0.1:3100/ready'
     $svcs.Add((SvcEntry 'Loki' 'Loki' (TcpOpen 3100) $lokiCheck.ok $lokiCheck.ms))

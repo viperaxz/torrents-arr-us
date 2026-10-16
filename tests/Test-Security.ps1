@@ -38,7 +38,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     if (Test-Path $acquisPath) {
         $acquis = Get-Content $acquisPath -Raw -ErrorAction SilentlyContinue
         $hasCaddy = $acquis -match 'caddy-access\.log'
-        $hasEvtLog = $acquis -match 'wineventlog'
+        $hasEvtLog = $acquis -match 'security-4625\.xml'
         $Script:Results.Add((New-TestResult $svc 2 'CaddyAcquisition' `
             $(if ($hasCaddy) { 'PASS' } else { 'FAIL' }) 'Caddy access log registered as a CrowdSec datasource'))
         $Script:Results.Add((New-TestResult $svc 2 'EventLogAcquisition' `
@@ -52,6 +52,15 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     $wlPath = Join-Path $CsConfigDir 'parsers\s02-enrich\seedbox-whitelist.yaml'
     $Script:Results.Add((New-TestResult $svc 2 'TrustedWhitelist' `
         $(if (Test-Path $wlPath) { 'PASS' } else { 'WARN' }) 'LAN + public IP whitelist parser installed'))
+
+    # Operator-IP auto-refresh -- keeps the WAN IP entry current on dynamic IPs
+    # (DuckDNS lines rotate), so a stale whitelist can never lock the operator out.
+    $wlTask = Get-ScheduledTask -TaskName 'Seedbox_CrowdSecWhitelistRefresh' -ErrorAction SilentlyContinue
+    $Script:Results.Add((New-TestResult $svc 2 'WhitelistRefreshTask' `
+        $(if ($wlTask) { 'PASS' } else { 'WARN' }) 'Scheduled task keeps the operator WAN IP whitelisted'))
+    $wlContent = if (Test-Path $wlPath) { Get-Content $wlPath -Raw -ErrorAction SilentlyContinue } else { '' }
+    $Script:Results.Add((New-TestResult $svc 2 'WhitelistOperatorMarker' `
+        $(if ($wlContent -match 'seedbox-operator-wan-ip') { 'PASS' } else { 'WARN' }) 'Operator WAN IP entry marked for auto-refresh'))
 
     # Bouncer must be registered against the local LAPI with a real key.
     $bouncerPath = if (Test-Path $BouncerYaml) { $BouncerYaml } elseif (Test-Path $BouncerYamlLegacy) { $BouncerYamlLegacy } else { $null }

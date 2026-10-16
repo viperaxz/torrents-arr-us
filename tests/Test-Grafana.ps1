@@ -9,6 +9,10 @@ if ($Config.Apps.Grafana -ne $true) {
     return
 }
 
+# DuckDNS mode runs Grafana with serve_from_sub_path=true, so the API is only
+# reachable under /grafana -- prefix every direct-port Grafana API call.
+$gfBase = if ($Config.General.DomainMode -eq 'duckdns') { '/grafana' } else { '' }
+
 # -- Layer 1: All three services running ---------------------------------------
 if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     foreach ($pair in @(@{n='Grafana';s='Grafana';p=3000}, @{n='Loki';s='Loki';p=3100}, @{n='Alloy';s='Alloy';p=0})) {
@@ -16,7 +20,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
         $Script:Results.Add((New-TestResult $svc 1 "$($pair.n)Running" $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) "NSSM service state: $($nssm.Status)"))
     }
 
-    $gfHealth = Invoke-ApiCheck 'http://127.0.0.1:3000/api/health' -TimeoutSec 8
+    $gfHealth = Invoke-ApiCheck "http://127.0.0.1:3000${gfBase}/api/health" -TimeoutSec 8
     $Script:Results.Add((New-TestResult $svc 1 'GrafanaApiHealth' $(if ($gfHealth.ok) { 'PASS' } else { 'FAIL' }) $gfHealth.error $gfHealth.latency_ms))
 
     $lokiReady = Invoke-ApiCheck 'http://127.0.0.1:3100/ready' -TimeoutSec 8
@@ -30,7 +34,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     $basicCred = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${adminUser}:${adminPass}"))
     $authHdr   = @{ Authorization = "Basic $basicCred" }
 
-    $ds = Invoke-ApiCheck 'http://127.0.0.1:3000/api/datasources' $authHdr -TimeoutSec 8
+    $ds = Invoke-ApiCheck "http://127.0.0.1:3000${gfBase}/api/datasources" $authHdr -TimeoutSec 8
     if ($ds.ok) {
         $lokiDs = @($ds.data | Where-Object { $_.type -eq 'loki' })
         $Script:Results.Add((New-TestResult $svc 2 'LokiDatasource' $(if ($lokiDs.Count -gt 0) { 'PASS' } else { 'FAIL' }) "$($lokiDs.Count) Loki datasource(s) in Grafana"))
@@ -38,7 +42,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         $Script:Results.Add((New-TestResult $svc 2 'LokiDatasource' 'FAIL' "Grafana /api/datasources: $($ds.error)"))
     }
 
-    $dash = Invoke-ApiCheck 'http://127.0.0.1:3000/api/search?type=dash-db' $authHdr -TimeoutSec 8
+    $dash = Invoke-ApiCheck "http://127.0.0.1:3000${gfBase}/api/search?type=dash-db" $authHdr -TimeoutSec 8
     if ($dash.ok) {
         $count = if ($dash.data -is [array]) { $dash.data.Count } else { 0 }
         $Script:Results.Add((New-TestResult $svc 2 'DashboardsProvisioned' $(if ($count -gt 0) { 'PASS' } else { 'WARN' }) "$count dashboard(s) provisioned"))

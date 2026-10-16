@@ -254,6 +254,7 @@ Write-DebugLog "INFO" "=== PHASE 3: Remove scheduled tasks ==="
 foreach ($task in @("Seedbox_Cloudflare_Updater", "Seedbox_DuckDNS_Updater",
                     "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update",
                     "Seedbox_Status_Collector",
+                    "Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh",
                     "win-seedbox Update Check")) {
     $exists = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
     Write-DebugLog "VAR task '$task' exists: $($null -ne $exists)"

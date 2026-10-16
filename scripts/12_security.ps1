@@ -389,7 +389,15 @@ statics:
         }
     }
 
-    $wlIpYaml   = ($wlIps   | ForEach-Object { "    - '$_'" }) -join "`n"
+    $wlIpYaml   = ($wlIps | ForEach-Object {
+        if ($publicIp -and $_ -eq $publicIp) {
+            # Marked so update_crowdsec_whitelist.ps1 can refresh it when the
+            # WAN IP rotates (the norm on residential / DuckDNS lines).
+            "    - '$_'  # seedbox-operator-wan-ip (auto-refreshed)"
+        } else {
+            "    - '$_'"
+        }
+    }) -join "`n"
     $wlCidrYaml = ($wlCidrs | ForEach-Object { "    - '$_'" }) -join "`n"
     Write-DebugLog "VAR whitelist ips=$($wlIps -join ',')"
     Write-DebugLog "VAR whitelist cidrs=$($wlCidrs -join ',')"
@@ -412,6 +420,31 @@ $wlCidrYaml
     if (-not $publicIp) {
         Write-Host "     WARNING: public IP not detected -- your WAN IP is NOT whitelisted." -ForegroundColor Yellow
     }
+
+    # -- 1f.5 Operator-IP auto-refresh ----------------------------------------
+    # The WAN IP whitelisted above is only current until the next IP rotation.
+    # A SYSTEM task re-detects the public IP every 5 minutes and updates the
+    # marked entry, restarting CrowdSec only when the entry actually changes.
+    $refreshSrc = Join-Path $ScriptsDir "update_crowdsec_whitelist.ps1"
+    $refreshDst = Join-Path $installScripts "update_crowdsec_whitelist.ps1"
+    Copy-Item -LiteralPath $refreshSrc -Destination $refreshDst -Force
+
+    $wlAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$refreshDst`""
+    $wlTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration ([TimeSpan]::MaxValue)
+    $wlPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+        -LogonType ServiceAccount -RunLevel Highest
+    $wlSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName "Seedbox_CrowdSecWhitelistRefresh" `
+        -Action $wlAction -Trigger $wlTrigger `
+        -Principal $wlPrincipal -Settings $wlSettings -Force | Out-Null
+
+    # Run once immediately so an IP change right after install is caught.
+    try { & $refreshDst } catch { Write-DebugLog "WARN" "Initial whitelist refresh failed: $_" }
+    Write-Host "     Operator-IP whitelist refresh task registered (Seedbox_CrowdSecWhitelistRefresh, every 5 min)." -ForegroundColor DarkGray
 
     # -- 1g. Ban duration profile ---------------------------------------------
     $profiles = @"
