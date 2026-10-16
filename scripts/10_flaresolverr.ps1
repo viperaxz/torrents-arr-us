@@ -60,6 +60,18 @@ $CachedZip = if ($CacheFile -and (Test-Path $CacheFile)) {
 Write-DebugLog "VAR cached zip found=$($null -ne $CachedZip) name=$($CachedZip.Name)"
 
 if ($CachedZip) {
+    # A cache hit is not necessarily the pinned release - a zip left over from an
+    # older version is picked up by the wildcard below. Trust the file name over
+    # the pin, otherwise the lock file and the update ledger would advertise a
+    # version that is not on disk and the updater would skip the real upgrade.
+    if ($CachedZip.Name -match '-([vV]?\d[\w\.\-]*)\.zip$') {
+        $cachedVersion = $Matches[1]
+        if ($PinnedVersion -and $cachedVersion -ne $PinnedVersion) {
+            Write-Warning "  -> Cached $($CachedZip.Name) is not the pinned $PinnedVersion; installing $cachedVersion instead."
+            Write-DebugLog "WARN" "Cached zip version '$cachedVersion' != pinned '$PinnedVersion'"
+        }
+        if (-not $PinnedVersion) { $PinnedVersion = $cachedVersion }
+    }
     Write-Host "  -> Using cached $($CachedZip.Name)..." -ForegroundColor Gray
     $ZipPath = $CachedZip.FullName
     Write-DebugLog "INFO" "Using cached zip: $ZipPath"
@@ -104,6 +116,16 @@ Write-DebugLog "VAR existing $AppName service=$(if ($existingSvc) { $existingSvc
 if ($existingSvc) {
     Write-DebugLog "INFO" "Stopping existing $AppName service before extraction..."
     Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    # NSSM only reports Stopped once the child process is gone; extracting over a
+    # still-locked chrome.dll would fail half-way, so wait for the state instead
+    # of assuming a fixed delay.
+    $stopDeadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $stopDeadline) {
+        $svcNow = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+        if (-not $svcNow -or $svcNow.Status -eq "Stopped") { break }
+        Start-Sleep -Seconds 1
+    }
+    Write-DebugLog "VAR $AppName stop wait finished, status=$(if (Get-Service -Name $AppName -ErrorAction SilentlyContinue) { (Get-Service -Name $AppName -ErrorAction SilentlyContinue).Status } else { 'NOT FOUND' })"
     Start-Sleep -Seconds 3
 }
 $appBinExists = Test-Path $AppBinDir
@@ -159,6 +181,13 @@ if (-not $svcExists) {
     Write-DebugLog "INFO" "NSSM service '$AppName' created. HOST=127.0.0.1 PORT=$AppPort"
 } else {
     Write-DebugLog "INFO" "NSSM service '$AppName' already exists"
+    # Re-assert the loopback bind: an install from an older revision could have
+    # created the service with HOST unset (FlareSolverr then defaults to
+    # 0.0.0.0) and an inbound firewall rule. The lock file is gone in that case,
+    # so this branch runs on the next install and must not leave the old bind in
+    # place.
+    nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" "HOST=127.0.0.1" "PORT=$AppPort" | Out-Null
+    Write-DebugLog "INFO" "Re-applied HOST=127.0.0.1 PORT=$AppPort to existing service"
 }
 
 # -- 5. Firewall ---------------------------------------------------------------
@@ -172,12 +201,18 @@ Get-NetFirewallRule -DisplayName "Flaresolverr" -ErrorAction SilentlyContinue |
 Write-DebugLog "INFO" "No firewall rule for $AppName (loopback-only); legacy rule removed if present"
 
 # -- 6. Start and validate -----------------------------------------------------
-# FlareSolverr initialises a headless Chromium on first start  --  allow up to 60s.
-Write-Host "  -> Starting $AppName (first startup initialises Chromium, may take ~30s)..." -ForegroundColor Gray
-Write-DebugLog "INFO" "Starting $AppName service. Waiting up to 60s for API readiness..."
+# FlareSolverr binds its HTTP listener only after it has located a browser,
+# fetched/patched chromedriver (network, first run) and launched Chrome once to
+# read the User-Agent -- see utils.get_webdriver/get_user_agent in the project.
+# A first start can therefore take longer than the old 60s budget, but a start
+# that never serves HTTP at all means the service is crash-looping: NSSM keeps
+# reporting "Running" while it restarts the process, so a bare service-state
+# check cannot tell the difference between a working and a broken install.
+Write-Host "  -> Starting $AppName (first startup initialises Chromium, may take up to 2 min)..." -ForegroundColor Gray
+Write-DebugLog "INFO" "Starting $AppName service. Waiting up to 120s for API readiness..."
 Start-Service -Name $AppName -ErrorAction SilentlyContinue
 
-$deadline = (Get-Date).AddSeconds(60)
+$deadline = (Get-Date).AddSeconds(120)
 $started  = $false
 $waited   = 0
 while (-not $started -and (Get-Date) -lt $deadline) {
@@ -189,6 +224,20 @@ while (-not $started -and (Get-Date) -lt $deadline) {
 }
 Write-DebugLog "VAR FlareSolverr HTTP API responded=$started waited=${waited}s"
 
+if (-not $started) {
+    $errLog = Join-Path $DataDir "flaresolverr-stderr.log"
+    $tail   = ""
+    if (Test-Path $errLog) {
+        $tail = ((Get-Content $errLog -Tail 3 -ErrorAction SilentlyContinue) -join " | ")
+        if ($tail.Length -gt 300) { $tail = $tail.Substring(0, 300) + "..." }
+    }
+    Write-Warning "  -> $AppName did not answer on http://127.0.0.1:$AppPort within ${waited}s."
+    if ($tail) { Write-Warning "     Last stderr: $tail" }
+    Write-Warning "     Logs: $errLog"
+    Write-DebugLog "ERROR" "$AppName HTTP API never became reachable after ${waited}s; install marked failed"
+    exit 1
+}
+
 $svc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $AppName final status=$(if ($svc) { $svc.Status } else { 'NOT FOUND' })"
 if ($svc -and $svc.Status -eq "Running") {
@@ -197,6 +246,21 @@ if ($svc -and $svc.Status -eq "Running") {
 } else {
     Write-Warning "  -> $AppName may not have started. Check $DataDir\flaresolverr-stderr.log"
     Write-DebugLog "WARN" "$AppName may not be running. Check $DataDir\flaresolverr-stderr.log"
+}
+
+# FlareSolverr performs arbitrary fetches on request, so it must never listen on
+# a routable address. The service is started with HOST=127.0.0.1; verify the
+# socket instead of trusting the environment variable.
+if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+    $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $AppPort -ErrorAction SilentlyContinue)
+    $exposed   = @($listeners | Where-Object { $_.LocalAddress -ne "127.0.0.1" -and $_.LocalAddress -ne "::1" })
+    Write-DebugLog "VAR listeners on :$AppPort = $(@($listeners | Select-Object -ExpandProperty LocalAddress) -join ',')"
+    if ($exposed.Count -gt 0) {
+        Write-Warning "  -> ! $AppName listens on $($exposed[0].LocalAddress):$AppPort - it must be loopback-only."
+        Write-DebugLog "ERROR" "$AppName listening on non-loopback address(es): $(@($exposed | Select-Object -ExpandProperty LocalAddress) -join ',')"
+    } elseif ($listeners.Count -gt 0) {
+        Write-DebugLog "INFO" "$AppName bound to loopback only on port $AppPort"
+    }
 }
 
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
