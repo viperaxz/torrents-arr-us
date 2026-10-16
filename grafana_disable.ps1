@@ -35,7 +35,13 @@ foreach ($svcName in @("Grafana", "Loki", "Alloy")) {
         Stop-Service $svcName -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         & nssm remove $svcName confirm 2>$null | Out-Null
-        Write-Host "  -> $svcName : removed." -ForegroundColor Yellow
+        # Confirm the removal: the app directories are deleted below, so a
+        # service left behind would only fail on the next boot.
+        if (Get-Service $svcName -ErrorAction SilentlyContinue) {
+            Write-Warning "  -> $svcName : removal failed (nssm exit $LASTEXITCODE). Remove it manually: nssm remove $svcName confirm"
+        } else {
+            Write-Host "  -> $svcName : removed." -ForegroundColor Yellow
+        }
     }
 }
 

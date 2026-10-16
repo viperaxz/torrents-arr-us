@@ -51,7 +51,10 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     }
 
     # Verify Loki actually accepts queries
-    $query = [System.Web.HttpUtility]::UrlEncode('{job=~".+"}')
+    # [uri]::EscapeDataString, not [System.Web.HttpUtility]::UrlEncode: the latter
+    # needs Add-Type -AssemblyName System.Web and throws "Unable to find type" on
+    # PowerShell 5.1, which test-suite.ps1 reports as a module-level FAIL.
+    $query = [uri]::EscapeDataString('{job=~".+"}')
     $endNs   = [string]([long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) * 1000000)
     $startNs = [string]([long](([DateTimeOffset]::UtcNow.AddMinutes(-10)).ToUnixTimeMilliseconds()) * 1000000)
     $lokiQ = Invoke-ApiCheck "http://127.0.0.1:3100/loki/api/v1/query_range?query=$query&start=$startNs&end=$endNs&limit=5" -TimeoutSec 10
@@ -66,7 +69,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
         # Use 60-min window: checks pipeline health, not recent activity
         $since   = (Get-Date).AddMinutes(-60)
         $sinceNs = [string]([long]([DateTimeOffset]::new($since.ToUniversalTime(), [TimeSpan]::Zero).ToUnixTimeMilliseconds()) * 1000000)
-        $q    = [System.Web.HttpUtility]::UrlEncode("{job=`"$job`"}")
+        $q    = [uri]::EscapeDataString("{job=`"$job`"}")
         $resp = Invoke-ApiCheck "http://127.0.0.1:3100/loki/api/v1/query_range?query=$q&start=$sinceNs&end=$endNs&limit=1" -TimeoutSec 10
         if ($resp.ok) {
             $hasLines = ($resp.data.data -and $resp.data.data.result -and $resp.data.data.result.Count -gt 0)

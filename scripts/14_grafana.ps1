@@ -854,7 +854,12 @@ $serveSubPath = if ($DomainMode -eq "duckdns") { "true" } else { "false" }
 Write-DebugLog "VAR grafanaRootUrl=$grafanaRootUrl serveSubPath=$serveSubPath"
 
 # Loki
-if (-not (Get-Service "Loki" -ErrorAction SilentlyContinue)) {
+# Guarded like Alloy below: a failed Loki download leaves $lokiExe empty and
+# nssm would otherwise register a service whose application path is "".
+if (-not $lokiExe) {
+    Write-Warning "  -> Loki executable missing. Skipping Loki service registration."
+    Write-DebugLog "WARN" "Loki exe was never resolved - service registration skipped"
+} elseif (-not (Get-Service "Loki" -ErrorAction SilentlyContinue)) {
     nssm install Loki "`"$lokiExe`"" | Out-Null
     nssm set Loki AppParameters "--config.file=`"$LokiConfig`"" | Out-Null
     nssm set Loki AppDirectory $LokiDir | Out-Null
@@ -982,10 +987,20 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe) {
             Write-DebugLog "INFO" "Grafana subdomain block appended (cloudflare mode)"
         }
     } else {
-        # DuckDNS: insert handle /grafana* before the dashboard catch-all
+        # DuckDNS: insert handle /grafana* before the site-root catch-all.  The root
+        # block is rendered by 01_webserver.ps1 (Jellyseerr owns "/" and the dashboard
+        # sits at /dashboard when Jellyseerr is enabled, otherwise the dashboard owns
+        # "/"), so anchor on the catch-all itself -- a "handle" with no matcher, which is
+        # the last routing rule 01_webserver.ps1 emits.  /grafana* carries a path matcher,
+        # so Caddy always evaluates it before that matcher-less catch-all.
         if ($caddyContent -notmatch "handle /grafana\*") {
             $grafanaHandle = "    handle /grafana* {`n        reverse_proxy 127.0.0.1:$GrafanaPort`n    }`n`n"
-            if ($caddyContent -match "# Dashboard at root") {
+            $beforePatch = $caddyContent
+            $catchAll = [regex]::Match($caddyContent, "(?m)^[ \t]*handle \{")
+            if ($catchAll.Success) {
+                $caddyContent = $caddyContent.Insert($catchAll.Index, $grafanaHandle)
+            } elseif ($caddyContent -match "# Dashboard at root") {
+                # Older render: the dashboard catch-all sat under this comment.
                 $caddyContent = $caddyContent -replace "(?m)([\t ]*# Dashboard at root)", ($grafanaHandle + '$1')
             } else {
                 # Fallback: insert before the final handle { (dashboard catch-all)
@@ -995,8 +1010,17 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe) {
                     "`n" + $grafanaHandle + '$1' + "`n"
                 )
             }
-            $grafanaAdded = $true
-            Write-DebugLog "INFO" "Grafana handle inserted (duckdns mode)"
+            # If neither anchor matched (hand-edited Caddyfile) the content is
+            # unchanged: report it instead of reloading Caddy and claiming the
+            # route was added.
+            if ($caddyContent -eq $beforePatch -or $caddyContent -notmatch "handle /grafana\*") {
+                $caddyContent = $beforePatch
+                Write-Warning "  -> No insertion point found for the Grafana route. Add 'handle /grafana*' manually."
+                Write-DebugLog "WARN" "Grafana handle NOT inserted (duckdns mode): no anchor matched in $CaddyfilePath"
+            } else {
+                $grafanaAdded = $true
+                Write-DebugLog "INFO" "Grafana handle inserted (duckdns mode)"
+            }
         }
     }
 
@@ -1049,13 +1073,15 @@ if ($DomainMode -eq "cloudflare") {
 [System.IO.File]::WriteAllText($LockFile, "installed", $utf8NoBom)
 Write-DebugLog "INFO" "14_grafana.ps1 complete. Lock: $LockFile"
 
-# Ledger entries for the updater (single source of truth for versions)
+# Ledger entries for the updater (single source of truth for versions).
+# Loki/Alloy are optional: a failed download must not be recorded as installed,
+# or the updater would report the missing component as "current".
 if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "update_common.ps1")
 }
 if ($grafanaVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "Grafana" -Version $grafanaVer }
-if ($lokiTag)    { Set-InstalledVersion -InstallDir $InstallDir -AppName "Loki" -Version $lokiTag }
-if ($alloyTag)   { Set-InstalledVersion -InstallDir $InstallDir -AppName "Alloy" -Version $alloyTag }
+if ($lokiTag  -and $lokiExe)  { Set-InstalledVersion -InstallDir $InstallDir -AppName "Loki"  -Version $lokiTag }
+if ($alloyTag -and $alloyExe) { Set-InstalledVersion -InstallDir $InstallDir -AppName "Alloy" -Version $alloyTag }
 Write-Host "[$AppName] Done." -ForegroundColor Cyan
 $grafanaUrl = if ($DomainMode -eq "cloudflare") {
     "https://grafana.$($Config.General.Domain)"
