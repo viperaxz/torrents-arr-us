@@ -1404,10 +1404,19 @@ def main() -> None:
     args = parser.parse_args()
 
     steps_to_run: set = set()
+    invalid_steps: List[str] = []
     for part in args.steps.split(","):
         part = part.strip()
-        if part.isdigit():
+        if part == "":
+            continue
+        if part.isdigit() and 0 <= int(part) <= 5:
             steps_to_run.add(int(part))
+        else:
+            invalid_steps.append(part)
+    if invalid_steps:
+        sys.exit(f"ERROR: --steps accepts digits 0-5 (comma separated); got: {', '.join(invalid_steps)}")
+    if not steps_to_run:
+        sys.exit("ERROR: --steps selected no steps. Use e.g. --steps 0 or --steps 0,1,2,3,4,5")
 
     script_dir      = os.path.dirname(os.path.abspath(__file__))
     sanity_cfg_path = args.config or os.path.join(script_dir, "sanity_config.json")

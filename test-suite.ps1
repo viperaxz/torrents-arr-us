@@ -6,8 +6,11 @@
 #   .\test-suite.ps1 -Service Sonarr -Layer 2 # one service, one layer
 #   .\test-suite.ps1 -Quick                   # L1 only across all services
 #
-# Results are written to <InstallDir>\dashboard\test_results.json
-# and pushed to Loki when Apps.Grafana = true.
+# Results are pushed to Loki when Apps.Grafana = true (works unelevated) and also
+# exported to <InstallDir>\dashboard\test_results.json. That directory is
+# administrator-only (README: "Install directory permissions"), so run this from
+# an elevated prompt when you want the JSON export -- an unelevated run still
+# reports to the console and to Loki and prints the grant command instead.
 
 param(
     [string]$Service = '',
@@ -53,6 +56,17 @@ $modules = [ordered]@{
 # -- Run selected modules -------------------------------------------------------
 $testsDir = Join-Path $PSScriptRoot 'tests'
 
+# Fail fast on a typo'd -Service instead of running zero modules and reporting
+# a green PASS:0 summary.
+if ($Service) {
+    $matched = @($modules.Keys | Where-Object { $_ -ieq $Service })
+    if ($matched.Count -eq 0) {
+        Write-Error "Unknown -Service '$Service'. Valid values: $($modules.Keys -join ', ')"
+        exit 1
+    }
+    $Service = $matched[0]
+}
+
 foreach ($key in $modules.Keys) {
     if ($Service -and $key -ne $Service) { continue }
     $modPath = Join-Path $testsDir $modules[$key]
@@ -69,7 +83,20 @@ foreach ($key in $modules.Keys) {
 
 # -- Output --------------------------------------------------------------------
 $resultJson = Join-Path $InstallDir 'dashboard\test_results.json'
-Export-TestResults -Results $Script:Results.ToArray() -OutputPath $resultJson -StartTime $StartTime
+try {
+    Export-TestResults -Results $Script:Results.ToArray() -OutputPath $resultJson -StartTime $StartTime
+} catch {
+    # <InstallDir> is administrator-only, so an unelevated run cannot drop the
+    # JSON next to the dashboard.  The console summary and the Loki/Grafana push
+    # below are unaffected -- say so, and print the same grant command the
+    # installer prints so the operator can restore the export deliberately.
+    $dashboardDir = Split-Path -Parent $resultJson
+    Write-Warning "Could not write $resultJson : $($_.Exception.Message)"
+    Write-Host "  <InstallDir> is administrator-only (see README: 'Install directory permissions')." -ForegroundColor DarkGray
+    Write-Host "  Run this script from an elevated prompt, or grant write access to just the dashboard directory:" -ForegroundColor DarkGray
+    Write-Host "    icacls `"$dashboardDir`" /grant `"$env:USERDOMAIN\${env:USERNAME}:(OI)(CI)(M)`"" -ForegroundColor DarkGray
+    Write-Host "  (Granting the whole install tree instead would also expose the service binaries and secrets\ to that account.)" -ForegroundColor DarkGray
+}
 
 if ($Script:LokiEnabled) {
     Push-TestResultsToLoki -Results $Script:Results.ToArray()

@@ -154,8 +154,21 @@ function Install-ChocoPackage {
 
 # Define required packages, optionally with minimum versions
 # Format: @{ "PackageName" = "MinVersion" } or just name if no min version
+# NSSM is pinned by versions.json so a bump of the manifest pin actually reaches
+# an existing install (an already-present package is never upgraded otherwise).
+$NssmMinVersion = "2.24"
+if ($Config -and $Config.PSObject.Properties['_Versions'] -and $Config._Versions.apps) {
+    $nssmEntry = $Config._Versions.apps.PSObject.Properties['NSSM']
+    if ($nssmEntry -and $nssmEntry.Value.PSObject.Properties['version'] -and $nssmEntry.Value.version) {
+        $pinned = [string]$nssmEntry.Value.version
+        if (Test-MinimumVersion -CurrentVersion $pinned -RequiredVersion $NssmMinVersion) {
+            $NssmMinVersion = $pinned
+            Write-DebugLog "INFO" "NSSM minimum version raised to the versions.json pin: $NssmMinVersion"
+        }
+    }
+}
 $Packages = @(
-    @{ Name = "nssm"; MinVersion = "2.24" },
+    @{ Name = "nssm"; MinVersion = $NssmMinVersion },
     @{ Name = "vcredist140"; MinVersion = "" }
 )
 

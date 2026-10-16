@@ -85,6 +85,9 @@ switch ($Command.ToLower()) {
     }
     $extraArgs = if ($AutoApprove) { @("-AutoApprove") } else { @() }
     & $updateScript @extraArgs
+    # Propagate the update result: master_update.ps1 exits 1 when an app failed
+    # or rolled back (a bare '&' call would otherwise report success).
+    exit $LASTEXITCODE
 }
 
 # -- box check -----------------------------------------------------------------
@@ -204,6 +207,10 @@ switch ($Command.ToLower()) {
         }
     }
     Write-Host ""
+    # Deliberately exit 0: 'box check' is informational and the daily
+    # 'win-seedbox Update Check' task uses check_updates.ps1 instead. Without
+    # this, the exit code would leak git's from the SHA comparison above.
+    exit 0
 }
 
 # -- box uninstall -------------------------------------------------------------
@@ -217,6 +224,7 @@ switch ($Command.ToLower()) {
     }
     $extraArgs = if ($Force) { @("-Force") } else { @() }
     & $uninstallScript @extraArgs
+    exit $LASTEXITCODE
 }
 
 # -- unknown / help ------------------------------------------------------------

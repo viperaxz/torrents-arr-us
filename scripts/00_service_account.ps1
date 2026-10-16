@@ -185,6 +185,159 @@ function global:Grant-SeedboxDirAccess {
     Write-DebugLog "INFO" "ACL applied: $Username -> $Rights on $Path"
 }
 
+# Install-tree lockdown helper.
+#
+# Everything under InstallDir is ours: binaries that run as seedbox-svc or
+# LocalSystem (Alloy/Loki/Grafana), plus credential files (secrets\, Zurg's
+# config.yml). A drive root (D:\ or C:\) hands every child created without an
+# explicit DACL "Authenticated Users: Modify" + "Everyone: ReadAndExecute", so
+# by default any local user could rewrite those binaries (local privilege
+# escalation to seedbox-svc/LocalSystem) or rename InstallDir and recreate it
+# with their own ACL, after which the next install writes secrets into a
+# directory they control.
+#
+# This applies the C:\Program Files model instead: Administrators + SYSTEM +
+# seedbox-svc FullControl, Authenticated Users read-only (which keeps
+# non-elevated reads such as `box check` working). Media directories that live
+# under InstallDir are re-opened for shared write so file management over
+# Explorer/SMB keeps working exactly as before.
+function global:Set-SeedboxInstallTreeAcl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$SvcUsername = "seedbox-svc",
+        [string[]]$SharedWritePaths = @()
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+        Write-DebugLog "INFO" "Created install directory for ACL: $Path"
+    }
+
+    # Well-known SIDs: the localized names of these groups do not resolve on
+    # every Windows language, SIDs always do.
+    $sidAdmins   = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $sidSystem   = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+    $sidAuthUser = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+    $sidSvc      = $null
+    try {
+        $sidSvc = (New-Object System.Security.Principal.NTAccount($SvcUsername)).Translate([System.Security.Principal.SecurityIdentifier])
+        Write-DebugLog "VAR service account SID: $SvcUsername = $($sidSvc.Value)"
+    } catch {
+        Write-Warning "  -> Could not resolve service account '$SvcUsername' -- its ACE will not be applied to $Path."
+        Write-DebugLog "WARN" "Unresolvable service account '$SvcUsername': $_"
+    }
+
+    $full   = [System.Security.AccessControl.FileSystemRights]"FullControl"
+    $read   = [System.Security.AccessControl.FileSystemRights]"Read,ReadAndExecute,ListDirectory"
+    $modify = [System.Security.AccessControl.FileSystemRights]"Modify"
+    $inh    = "ContainerInherit,ObjectInherit"
+    $none   = "None"
+    $allow  = [System.Security.AccessControl.AccessControlType]::Allow
+
+    # Bits that let a principal replace binaries or forge data: write data,
+    # append data, write EA, write attributes, create/delete, delete-child,
+    # WRITE_DAC, WRITE_OWNER.
+    $writeBits = 0xD0156
+    # Principals nobody means to give write access to the service tree.
+    $broadSids = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-32-546", "S-1-5-4", "S-1-5-2", "S-1-5-7")
+
+    function Get-AceSidValue($identity) {
+        try { return $identity.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { return $null }
+    }
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+
+        # Report exactly which write access is about to disappear.
+        foreach ($rule in @($acl.Access)) {
+            if ($rule.AccessControlType -ne $allow) { continue }
+            if (([int]$rule.FileSystemRights -band $writeBits) -eq 0) { continue }
+            $rid = Get-AceSidValue $rule.IdentityReference
+            if ($rid -eq $sidAdmins.Value -or $rid -eq $sidSystem.Value) { continue }
+            if ($sidSvc -and $rid -eq $sidSvc.Value) { continue }
+            $origin = if ($rule.IsInherited) { ", inherited" } else { ", explicit" }
+            Write-Host "  -> Closing write access on $Path : $($rule.IdentityReference) ($($rule.FileSystemRights)$origin)" -ForegroundColor DarkGray
+        }
+
+        # Break inheritance (drops the drive-root grants) and drop any explicit
+        # writable ACE held by a broad principal.
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) {
+            if ($rule.AccessControlType -ne $allow) { continue }
+            if (([int]$rule.FileSystemRights -band $writeBits) -eq 0) { continue }
+            $rid = Get-AceSidValue $rule.IdentityReference
+            if ($rid -eq $sidAdmins.Value -or $rid -eq $sidSystem.Value) { continue }
+            if ($sidSvc -and $rid -eq $sidSvc.Value) { continue }
+            if ($rid -and ($broadSids -contains $rid)) {
+                if ($acl.RemoveAccessRule($rule)) {
+                    Write-Host "  -> Removed writable ACE '$($rule.IdentityReference)' ($($rule.FileSystemRights)) on $Path" -ForegroundColor Yellow
+                    Write-DebugLog "INFO" "Removed explicit writable ACE $($rule.IdentityReference)=$($rule.FileSystemRights) on $Path"
+                }
+            } else {
+                Write-Warning "  -> $Path : '$($rule.IdentityReference)' keeps write access ($($rule.FileSystemRights)) -- that principal can replace service binaries in this tree."
+                Write-DebugLog "WARN" "Explicit write ACE kept on $Path for $($rule.IdentityReference)"
+            }
+        }
+
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,   $full, $inh, $none, $allow)))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,   $full, $inh, $none, $allow)))
+        if ($sidSvc) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSvc,  $full, $inh, $none, $allow)))
+        }
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAuthUser, $read, $inh, $none, $allow)))
+        Set-Acl -LiteralPath $Path -AclObject $acl
+
+        $svcLabel = if ($sidSvc) { ", $SvcUsername Full" } else { "" }
+        Write-Host "  -> $Path locked down (Administrators/SYSTEM$svcLabel, Authenticated Users read-only)." -ForegroundColor Green
+        Write-Host "     A non-administrator account that must still write here needs an explicit grant:" -ForegroundColor DarkGray
+        Write-Host "     icacls `"$Path`" /grant `"<account>:(OI)(CI)(M)`"" -ForegroundColor DarkGray
+        Write-DebugLog "INFO" "Install tree ACL applied on $Path (Administrators/SYSTEM$svcLabel Full, Authenticated Users Read)"
+    } catch {
+        Write-Warning "  -> Could not lock down '$Path': $_"
+        Write-DebugLog "ERROR" "Set-SeedboxInstallTreeAcl failed on $Path : $_"
+    }
+
+    # Media libraries that live under InstallDir must stay writable by normal
+    # users (Explorer/SMB file management, downloads uploads). Media paths
+    # outside InstallDir are left exactly as the operator set them up.
+    $rootFull = $null
+    try { $rootFull = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\') } catch { $rootFull = $null }
+    foreach ($mediaPath in $SharedWritePaths) {
+        if ([string]::IsNullOrWhiteSpace($mediaPath)) { continue }
+        if (-not (Test-Path -LiteralPath $mediaPath)) {
+            Write-DebugLog "VAR media path not present yet, ACL unchanged: $mediaPath"
+            continue
+        }
+        $mediaFull = (Get-Item -LiteralPath $mediaPath).FullName.TrimEnd('\')
+        if (-not $rootFull -or $mediaFull -ieq $rootFull) {
+            Write-Warning "  -> Media path '$mediaFull' is the install directory itself -- leaving it locked down."
+            continue
+        }
+        if (-not $mediaFull.StartsWith($rootFull + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "  -> Media path outside the install directory, left untouched: $mediaFull" -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Media path outside InstallDir, untouched: $mediaFull"
+            continue
+        }
+        try {
+            $mediaAcl = Get-Acl -LiteralPath $mediaFull
+            $mediaAcl.SetAccessRuleProtection($true, $false)
+            foreach ($rule in @($mediaAcl.Access)) { $mediaAcl.RemoveAccessRule($rule) | Out-Null }
+            $mediaAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdmins,   $full,   $inh, $none, $allow)))
+            $mediaAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSystem,   $full,   $inh, $none, $allow)))
+            if ($sidSvc) {
+                $mediaAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSvc,  $full,   $inh, $none, $allow)))
+            }
+            $mediaAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAuthUser, $modify, $inh, $none, $allow)))
+            Set-Acl -LiteralPath $mediaFull -AclObject $mediaAcl
+            Write-Host "  -> Media path keeps shared write access: $mediaFull" -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Media path re-opened for shared write (Authenticated Users Modify): $mediaFull"
+        } catch {
+            Write-Warning "  -> Could not set ACL on media path '$mediaFull': $_"
+            Write-DebugLog "WARN" "Media path ACL failed on $mediaFull : $_"
+        }
+    }
+}
+
 # ACL helper for the secrets directory: removes inherited permissions,
 # grants only Administrators (FullControl) + seedbox-svc (Read) + SYSTEM (FullControl).
 function global:Set-SecretsDirAcl {
@@ -204,18 +357,43 @@ function global:Set-SecretsDirAcl {
     $none = "None"
     $allow = [System.Security.AccessControl.AccessControlType]::Allow
 
-    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("BUILTIN\Administrators", $full, $inh, $none, $allow))
-    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("NT AUTHORITY\SYSTEM",    $full, $inh, $none, $allow))
-    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($SvcUsername,             $read, $inh, $none, $allow))
+    # Well-known SIDs: the localized names of these groups do not resolve on
+    # every Windows language, SIDs always do.
+    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sidAdmins, $full, $inh, $none, $allow))
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sidSystem, $full, $inh, $none, $allow))
+    $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($SvcUsername, $read, $inh, $none, $allow))
     Set-Acl -Path $Path -AclObject $acl
     Write-DebugLog "INFO" "Secrets ACL applied: inheritance broken, Admins=Full, SYSTEM=Full, $SvcUsername=Read"
 }
 
-# -- 4. Grant access to InstallDir (already exists) ---------------------------
-Write-Host "  -> Granting '$SvcUser' access to install directory..." -ForegroundColor Gray
+# -- 4. Lock down the install tree --------------------------------------------
+# Replaces a plain "give seedbox-svc FullControl" grant: the tree is created
+# under a drive root, so it would otherwise inherit Everyone:ReadAndExecute and
+# Authenticated Users:Modify -- write access to service binaries and credentials
+# for every local user.
+Write-Host "  -> Locking down install directory..." -ForegroundColor Gray
 $installDir = $Config.General.InstallDir
-Write-DebugLog "INFO" "Granting $SvcUser FullControl on InstallDir=$installDir"
-Grant-SeedboxDirAccess -Path $installDir -Username $SvcUser
+
+$sharedWritePaths = @()
+if ($Config.PSObject.Properties['Paths'] -and $Config.Paths) {
+    foreach ($pathKey in @("Downloads", "Movies", "TV")) {
+        if ($Config.Paths.PSObject.Properties[$pathKey] -and $Config.Paths.$pathKey) {
+            $sharedWritePaths += [string]$Config.Paths.$pathKey
+        }
+    }
+}
+Write-DebugLog "VAR InstallDir ACL target=$installDir sharedWritePaths=$($sharedWritePaths -join ', ')"
+
+$projectRoot = Split-Path -Parent $PSScriptRoot
+if ($projectRoot -and $installDir -and
+    $projectRoot.TrimEnd('\').StartsWith($installDir.TrimEnd('\') + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+    Write-Warning "  -> The project directory lives inside InstallDir ($projectRoot); config.json and the scripts will also become administrator-only."
+}
+
+Set-SeedboxInstallTreeAcl -Path $installDir -SvcUsername $SvcUser -SharedWritePaths $sharedWritePaths
 
 Write-Host "[ServiceAccount] Done." -ForegroundColor Cyan
 Write-DebugLog "INFO" "00_service_account.ps1 complete"

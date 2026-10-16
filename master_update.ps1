@@ -66,7 +66,11 @@ if ($isGitRepo) {
             Write-Host ""
 
             $apply = $AutoApprove
-            if (-not $apply) {
+            if ($WhatIf) {
+                Write-Host "  Dry run (-WhatIf): project update NOT applied." -ForegroundColor Yellow
+                Write-DebugLog "INFO" "Self-update skipped: -WhatIf"
+                $apply = $false
+            } elseif (-not $apply) {
                 $answer = Read-Host "  Apply project update? [Y/n]"
                 $apply = ($answer -eq "" -or $answer -match '^[Yy]')
             }
@@ -75,14 +79,24 @@ if ($isGitRepo) {
                 Write-Host "  -> Applying project update (git pull)..." -ForegroundColor Yellow
                 Write-DebugLog "INFO" "Running git pull origin main"
                 & git -C $PSScriptRoot pull origin main 2>&1 | Out-Null
-                Write-Host "  -> Project updated. Re-launching update script..." -ForegroundColor Green
-                Write-DebugLog "INFO" "Self-update applied. Re-executing master_update.ps1."
-                $relaunchArgs = @()
-                if ($AutoApprove) { $relaunchArgs += "-AutoApprove" }
-                if ($App)        { $relaunchArgs += "-App"; $relaunchArgs += $App }
-                if ($WhatIf)     { $relaunchArgs += "-WhatIf" }
-                & powershell.exe -ExecutionPolicy Bypass -File "$PSScriptRoot\master_update.ps1" @relaunchArgs
-                exit $LASTEXITCODE
+                $pulledSha = (& git -C $PSScriptRoot rev-parse HEAD 2>&1).Trim()
+                if ($pulledSha -eq $localSha) {
+                    # A local commit, a diverged branch, or a failed merge leaves
+                    # HEAD unchanged. Re-launching in that state would loop
+                    # forever (each child re-detects the same difference), so
+                    # continue with the scripts that are already on disk.
+                    Write-Warning "  -> git pull did not change HEAD (local commits, diverged branch, or failed merge). Continuing with the current scripts."
+                    Write-DebugLog "WARN" "Self-update pull was a no-op: HEAD still $localSha (origin/main $remoteSha)"
+                } else {
+                    Write-Host "  -> Project updated. Re-launching update script..." -ForegroundColor Green
+                    Write-DebugLog "INFO" "Self-update applied ($localSha -> $pulledSha). Re-executing master_update.ps1."
+                    $relaunchArgs = @()
+                    if ($AutoApprove) { $relaunchArgs += "-AutoApprove" }
+                    if ($App)        { $relaunchArgs += "-App"; $relaunchArgs += $App }
+                    if ($WhatIf)     { $relaunchArgs += "-WhatIf" }
+                    & powershell.exe -ExecutionPolicy Bypass -File "$PSScriptRoot\master_update.ps1" @relaunchArgs
+                    exit $LASTEXITCODE
+                }
             } else {
                 Write-Host "  -> Project update skipped." -ForegroundColor DarkGray
                 Write-DebugLog "INFO" "Self-update skipped by user."
@@ -152,9 +166,14 @@ foreach ($prop in $RemoteVersions.apps.PSObject.Properties) {
     if ($installed -ieq "unknown" -or $null -eq $installed) {
         $detected = Detect-InstalledVersion -AppName $appName -Entry $prop.Value -InstallDir $InstallDir
         if ($detected) {
-            Set-InstalledVersion -InstallDir $InstallDir -AppName $appName -Version $detected
-            Write-Host ("  {0,-18} detected installed version: {1}" -f $appName, $detected) -ForegroundColor DarkGray
-            Write-DebugLog "INFO" "Ledger migration: $appName -> $detected"
+            if ($WhatIf) {
+                # -WhatIf must not touch the ledger either.
+                Write-Host ("  {0,-18} would register detected version: {1}" -f $appName, $detected) -ForegroundColor DarkGray
+            } else {
+                Set-InstalledVersion -InstallDir $InstallDir -AppName $appName -Version $detected
+                Write-Host ("  {0,-18} detected installed version: {1}" -f $appName, $detected) -ForegroundColor DarkGray
+                Write-DebugLog "INFO" "Ledger migration: $appName -> $detected"
+            }
         }
     }
 }
@@ -290,4 +309,15 @@ if ($manual.Count -gt 0) {
     }
 }
 
-Write-DebugLog "INFO" "master_update.ps1 finished."
+# Failures must be visible to the caller (box.ps1/box.cmd propagate this exit
+# code); a rolled-back app leaves the previous binaries in place, which is not
+# success.
+$failedUpdates = @($updateResults | Where-Object { $_.Status -eq "FAILED" -or $_.Status -eq "ROLLBACK" })
+Write-DebugLog "INFO" "master_update.ps1 finished. updates=$($updateResults.Count) failed=$($failedUpdates.Count)"
+if ($failedUpdates.Count -gt 0) {
+    Write-Host ""
+    Write-Warning "$($failedUpdates.Count) update(s) failed: $($failedUpdates.App -join ', ')"
+    exit 1
+}
+
+exit 0

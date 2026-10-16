@@ -63,9 +63,16 @@ foreach ($item in $plan) {
     if ($item.State -eq "unknown" -or $item.State -eq "notinstalled") {
         # Self-heal: try to detect the real installed version and record it
         # (covers legacy lock values and apps without any lock file).
+        # This task runs as the interactive user, which is not elevated, and the
+        # install tree is administrator-only -- so writing the ledger can fail;
+        # that is not fatal (the running plan is already computed).
         $detected = Detect-InstalledVersion -AppName $item.App -Entry $item.Entry -InstallDir $InstallDir
         if ($detected) {
-            Set-InstalledVersion -InstallDir $InstallDir -AppName $item.App -Version $detected
+            try {
+                Set-InstalledVersion -InstallDir $InstallDir -AppName $item.App -Version $detected
+            } catch {
+                Write-Host "  (ledger not writable without elevation -- $($item.App) will be re-detected next run)"
+            }
         }
     } elseif ($item.State -eq "update") {
         $pendingApps.Add($item.App)
@@ -120,16 +127,31 @@ function Show-ToastNotification {
 
     # Method 3: Always write a notification file so the dashboard UI and
     # 'box check' can surface pending updates even when the user is logged out.
+    # <InstallDir>\dashboard is administrator-only (the install tree is locked
+    # down), and this task runs unelevated, so fall back to the user's own
+    # AppData directory when that write is denied.
     try {
-        $notifDir  = Join-Path $InstallDir "dashboard"
-        $notifFile = Join-Path $notifDir "update_notification.json"
-        if (-not (Test-Path $notifDir)) { New-Item -Path $notifDir -ItemType Directory -Force | Out-Null }
         $notifData = @{
             title      = $Title
             body       = $Body
             detectedAt = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
         } | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText($notifFile, $notifData, (New-Object System.Text.UTF8Encoding($false)))
+
+        $notifFile = $null
+        $notifDir  = Join-Path $InstallDir "dashboard"
+        try {
+            if (-not (Test-Path $notifDir)) { New-Item -Path $notifDir -ItemType Directory -Force | Out-Null }
+            $notifFile = Join-Path $notifDir "update_notification.json"
+            [System.IO.File]::WriteAllText($notifFile, $notifData, (New-Object System.Text.UTF8Encoding($false)))
+        } catch {
+            $notifFile = $null
+        }
+        if (-not $notifFile) {
+            $notifDir  = Join-Path $env:LOCALAPPDATA "win-seedbox"
+            if (-not (Test-Path $notifDir)) { New-Item -Path $notifDir -ItemType Directory -Force | Out-Null }
+            $notifFile = Join-Path $notifDir "update_notification.json"
+            [System.IO.File]::WriteAllText($notifFile, $notifData, (New-Object System.Text.UTF8Encoding($false)))
+        }
     } catch { }
 }
 

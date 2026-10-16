@@ -1,4 +1,4 @@
-﻿{
+{
   "General": {
     "DomainMode": "cloudflare",
     "TlsMode": "letsencrypt",

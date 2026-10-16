@@ -63,7 +63,7 @@ $layer2Configs = @(
     # Jellyfin runs first: creates persistent API key used by Sonarr/Radarr notifications
     @{ Name = "Jellyfin";              Script = "configure_layer2_jellyfin_libraries.ps1" }
     @{ Name = "Jellyfin Transcoding"; Script = "configure_layer2_jellyfin_transcoding.ps1";
-       Enabled = { $Config.Apps.Jellyfin -eq $true -and $Config.Layer2.PSObject.Properties['Jellyfin'] -and $Config.Layer2.Jellyfin.PSObject.Properties['GPU'] -and $Config.Layer2.Jellyfin.GPU } }
+       Enabled = { $Config.Apps.Jellyfin -eq $true -and $Config.Layer2 -and $Config.Layer2.PSObject.Properties['Jellyfin'] -and $Config.Layer2.Jellyfin.PSObject.Properties['GPU'] -and $Config.Layer2.Jellyfin.GPU } }
     @{ Name = "Recyclarr"; Script = "configure_layer2_recyclarr.ps1";
        Enabled = { $Config.Apps.Sonarr -eq $true -or $Config.Apps.Radarr -eq $true } }
     # Prowlarr runs before Sonarr/Radarr: it adds indexers and syncs them to the
@@ -86,7 +86,7 @@ Write-DebugLog "INFO" "=== Layer 2: $($layer2Configs.Count) steps configured ===
 foreach ($app in $layer2Configs) {
     $isEnabled = if ($app.ContainsKey('Enabled')) {
         & $app.Enabled
-    } elseif ($Config.Apps.PSObject.Properties[$app.Name]) {
+    } elseif ($Config.Apps -and $Config.Apps.PSObject.Properties[$app.Name]) {
         $Config.Apps.$($app.Name) -eq $true
     } else {
         Write-DebugLog "WARN" "[$($app.Name)] no Enabled block and no Apps key -- did the manifest lose a custom check?"

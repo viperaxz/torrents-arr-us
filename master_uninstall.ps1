@@ -66,10 +66,15 @@ function Remove-NssmService {
 Write-Host "[1/8] Stopping processes..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 1: Stop stray processes ==="
 # Bazarr runs as a Python child process; kill it before NSSM service removal.
-$bazarrProcs = Get-Process -Name "python", "python3", "python312" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like "*bazarr*" }
+# The command line has to come from CIM: System.Diagnostics.Process objects
+# (what Get-Process returns under Windows PowerShell 5.1) expose no CommandLine
+# property, so a Get-Process filter here silently matched nothing.
+$bazarrProcs = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like "*bazarr*" })
 Write-DebugLog "VAR bazarr Python processes found: $($bazarrProcs.Count)"
-$bazarrProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+foreach ($bazarrProc in $bazarrProcs) {
+    Stop-Process -Id $bazarrProc.ProcessId -Force -ErrorAction SilentlyContinue
+}
 if ($bazarrProcs.Count -gt 0) { Write-DebugLog "INFO" "Killed $($bazarrProcs.Count) bazarr Python process(es)" }
 
 # -- 2. Remove NSSM services ---------------------------------------------------
@@ -84,6 +89,11 @@ if ($Config -and (Test-Path $CaddyDataDir) -and
     (Get-ChildItem $CaddyDataDir -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
     Write-Host "  -> Backing up Caddy cert cache..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Backing up Caddy cert cache from $CaddyDataDir"
+    # Stop Caddy first so the store is quiescent -- an ACME renewal writing into
+    # caddy-data/ while the tree is being zipped would corrupt the archive.
+    Stop-Service -Name "Caddy" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Write-DebugLog "INFO" "Caddy service stopped for cert cache backup"
     try {
         . (Join-Path $PSScriptRoot "scripts\cert_cache_helpers.ps1")
         $CertCacheFile = Join-Path $PSScriptRoot "cert-cache\caddy-data.enc"
@@ -145,16 +155,31 @@ Remove-NssmService "Alloy"
 # Killing the rclone process without unmounting leaves the drive letter stuck
 # (Windows treats it as an in-use mount point until the next reboot).
 Write-DebugLog "INFO" "Checking for rclone mounts to unmount..."
-$rcloneExe = Get-Command rclone.exe -ErrorAction SilentlyContinue
-if ($rcloneExe -and $Config -and $Config.RealDebrid.PSObject.Properties['MountLetter']) {
-    $mountLetter = $Config.RealDebrid.MountLetter
+# rclone is never added to PATH (the mount service points at the absolute path
+# under InstallDir), so look there first and only then fall back to PATH --
+# otherwise this whole cleanup was skipped on every normal uninstall.
+$rclonePath = Join-Path $InstallDir "rclone\rclone.exe"
+if (-not (Test-Path $rclonePath)) {
+    $rcloneCmd = Get-Command rclone.exe -ErrorAction SilentlyContinue
+    $rclonePath = if ($rcloneCmd) { $rcloneCmd.Source } else { $null }
+}
+Write-DebugLog "VAR rclone executable = $rclonePath"
+
+$rdMountLetter = $null
+if ($Config -and $Config.PSObject.Properties['RealDebrid'] -and $Config.RealDebrid -and
+    $Config.RealDebrid.PSObject.Properties['MountLetter'] -and $Config.RealDebrid.MountLetter) {
+    $rdMountLetter = [string]$Config.RealDebrid.MountLetter
+}
+
+if ($rclonePath -and $rdMountLetter) {
+    $mountLetter = $rdMountLetter
     $mountPath   = "${mountLetter}:\"
     Write-DebugLog "VAR Checking mount path=$mountPath exists=$(Test-Path $mountPath)"
     if (Test-Path $mountPath) {
         Write-Host "  -> Unmounting rclone drive ${mountLetter}: ..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Unmounting rclone drive $mountLetter before service removal"
         try {
-            & $rcloneExe.Source unmount "${mountLetter}:" 2>&1 | Out-Null
+            & $rclonePath unmount "${mountLetter}:" 2>&1 | Out-Null
             Write-Host "  -> rclone drive ${mountLetter}: unmounted." -ForegroundColor Yellow
             Write-DebugLog "INFO" "rclone unmount ${mountLetter}: succeeded"
         } catch {
@@ -164,10 +189,10 @@ if ($rcloneExe -and $Config -and $Config.RealDebrid.PSObject.Properties['MountLe
     } else {
         Write-DebugLog "INFO" "No rclone mount at $mountPath; skipping unmount"
     }
-} elseif ($rcloneExe) {
-    Write-DebugLog "INFO" "rclone.exe found but config/RealDebrid.MountLetter missing; skipping unmount"
+} elseif ($rclonePath) {
+    Write-DebugLog "INFO" "rclone found but config.json has no RealDebrid.MountLetter; skipping unmount"
 } else {
-    Write-DebugLog "INFO" "rclone.exe not found on PATH; skipping unmount"
+    Write-DebugLog "INFO" "rclone.exe not found (PATH or $InstallDir\rclone); skipping unmount"
 }
 Remove-NssmService "rclone-rd-movies"
 Remove-NssmService "rclone-rd"
@@ -490,3 +515,7 @@ if ($Config) {
 Write-Host "    - Sonarr / Radarr data -> $env:LOCALAPPDATA\win-seedbox\arr-backup (restored on reinstall)" -ForegroundColor Gray
 Write-Host "  Run master_install.ps1 to reinstall from scratch." -ForegroundColor Green
 Write-Host "=============================================" -ForegroundColor Green
+
+# Explicit exit code so callers (box.ps1 / box.cmd) get a deterministic 0
+# instead of whatever $LASTEXITCODE the last native command left behind.
+exit 0

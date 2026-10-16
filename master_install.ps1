@@ -48,6 +48,23 @@ Write-DebugLog "VAR Apps enabled: Jellyfin=$($Config.Apps.Jellyfin) Sonarr=$($Co
 Write-Host "Domain mode: $($DomainMode.ToUpper())" -ForegroundColor Cyan
 Write-Host "TLS mode:    $($Config.General.TlsMode)" -ForegroundColor Cyan
 
+# -- Warn on blank / example-default credentials --------------------------------
+# These values are used for Caddy basic-auth, the app logins, and Grafana, so a
+# leftover placeholder from config.json.example is an open door on a public host.
+# (ServiceAccountPassword is checked by 00_service_account.ps1.)
+if ([string]::IsNullOrWhiteSpace($Config.General.AdminPassword)) {
+    Write-Warning "AdminPassword is blank in config.json -- Caddy basic-auth and every app login will be unusable."
+    Write-DebugLog "WARN" "AdminPassword is blank"
+} elseif ($Config.General.AdminPassword -in @("SuperSecretPassword123!", "changeme", "password", "admin")) {
+    Write-Warning "AdminPassword is still the placeholder value from config.json.example. Change it before exposing this host."
+    Write-DebugLog "WARN" "AdminPassword is a known placeholder value"
+}
+if ($Config.General.PSObject.Properties['DefaultUserPassword'] -and
+    $Config.General.DefaultUserPassword -in @("UserPass123!", "Welcome1!", "changeme", "password")) {
+    Write-Warning "DefaultUserPassword is still the placeholder value from config.json.example. Change it before creating the Jellyfin users."
+    Write-DebugLog "WARN" "DefaultUserPassword is a known placeholder value"
+}
+
 # Ensure lock directory and media paths exist
 $LocksDir = Join-Path $Config.General.InstallDir ".locks"
 Write-DebugLog "VAR LocksDir = $LocksDir"
@@ -88,6 +105,12 @@ $ForceServiceMap = @{
 $ForceBinMap = @{
     "rclone-rd" = "rclone"
 }
+# Infrastructure packages that are Chocolatey-only: they own no directory under
+# InstallDir and no installer lock file, so -Force has to upgrade them directly.
+$ForceChocoMap = @{
+    "nssm"      = @{ Package = "nssm";      ManifestApp = "NSSM" }
+    "python312" = @{ Package = "python312"; ManifestApp = "Python312" }
+}
 # -- -Force <AppName>: wipe binaries so the installer runs fresh ----------------
 if ($Force -ne "") {
     $ForceAppLower = $Force.ToLower()
@@ -127,6 +150,54 @@ if ($Force -ne "") {
         Write-Host "[Force] No binary directory at '$ForceBinDir' (may be Choco-installed or CLI-only)." -ForegroundColor DarkGray
     }
 
+    # Infrastructure packages (NSSM, python312) are Chocolatey-only: they have no
+    # directory under InstallDir, no installer lock file, and no update_*.ps1, so
+    # without this branch `master_install.ps1 -Force NSSM` would silently do
+    # nothing while `box check` keeps reporting a pending manual update.
+    if ($ForceChocoMap.ContainsKey($ForceAppLower)) {
+        $chocoPkg    = $ForceChocoMap[$ForceAppLower].Package
+        $manifestApp = $ForceChocoMap[$ForceAppLower].ManifestApp
+        $pinVersion  = $null
+        if ($Versions -and $Versions.apps -and $Versions.apps.PSObject.Properties[$manifestApp]) {
+            $pinVersion = $Versions.apps.$manifestApp.version
+        }
+
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Write-Warning "[Force] Chocolatey not found -- cannot upgrade '$chocoPkg'."
+        } else {
+            $pinLabel = if ($pinVersion) { " to $pinVersion" } else { "" }
+            Write-Host "[Force] Upgrading Chocolatey package '$chocoPkg'$pinLabel..." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "choco upgrade $chocoPkg$pinLabel"
+            $savedEap = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = "Continue"
+                $global:LASTEXITCODE = 0
+                if ($pinVersion) {
+                    choco upgrade $chocoPkg --version $pinVersion -y --no-progress 2>&1 | Out-Null
+                } else {
+                    choco upgrade $chocoPkg -y --no-progress 2>&1 | Out-Null
+                }
+                $chocoExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $savedEap
+            }
+
+            if ($chocoExit -ne 0) {
+                Write-Warning "[Force] choco upgrade $chocoPkg exited with code $chocoExit -- version may be unchanged."
+                Write-DebugLog "ERROR" "choco upgrade $chocoPkg failed (exit $chocoExit)"
+            }
+
+            # Record the real installed version so `box check` stops reporting it as pending.
+            . (Join-Path $ScriptsDir "update_common.ps1")
+            $entry = if ($Versions -and $Versions.apps) { $Versions.apps.$manifestApp } else { $null }
+            $detected = Detect-InstalledVersion -AppName $manifestApp -Entry $entry -InstallDir $Config.General.InstallDir
+            if ($detected) {
+                Set-InstalledVersion -InstallDir $Config.General.InstallDir -AppName $manifestApp -Version $detected
+                Write-Host "[Force] $manifestApp installed version recorded: $detected" -ForegroundColor DarkGray
+            }
+        }
+    }
+
     Write-Host "[Force] $Force ready for reinstall." -ForegroundColor Green
     Write-Host ""
 }
@@ -135,7 +206,7 @@ Write-DebugLog "VAR ScriptsDir = $ScriptsDir"
 
 # 1. Prerequisites (fatal  --  nothing else works without these)
 Write-DebugLog "INFO" "=== PHASE: Prerequisites ==="
-& (Join-Path $ScriptsDir "00_prerequisites.ps1")
+& (Join-Path $ScriptsDir "00_prerequisites.ps1") -Config $Config
 Write-DebugLog "INFO" "=== Prerequisites complete. LASTEXITCODE=$LASTEXITCODE ==="
 
 # 1b. Service account (fatal  --  all services depend on this)
@@ -317,6 +388,17 @@ Write-Host "=============================================" -ForegroundColor Gree
 Write-Host "  Installation complete!" -ForegroundColor Green
 Write-Host "=============================================" -ForegroundColor Green
 
+# Optional LLM proxy (rendered by 01_webserver.ps1 only when LLM.Enabled is true)
+$LlmSummaryEnabled = ($Config.PSObject.Properties['LLM'] -and
+                      $Config.LLM.PSObject.Properties['Enabled'] -and
+                      $Config.LLM.Enabled -eq $true)
+$LlmSummarySub = if ($LlmSummaryEnabled -and $Config.LLM.PSObject.Properties['Subdomain'] -and $Config.LLM.Subdomain) {
+    ([string]$Config.LLM.Subdomain).ToLower()
+} else { "llm" }
+$LlmSummaryUi = -not ($LlmSummaryEnabled -and
+                      $Config.LLM.PSObject.Properties['ExposeUi'] -and
+                      $Config.LLM.ExposeUi -eq $false)
+
 if ($DomainMode -eq "cloudflare") {
     $Domain = $Config.General.Domain
     Write-Host "  Dashboard:    https://$Domain" -ForegroundColor Cyan
@@ -328,17 +410,30 @@ if ($DomainMode -eq "cloudflare") {
     if ($Config.Apps.Bazarr      -eq $true) { Write-Host "  Bazarr:       https://bazarr.$Domain"          -ForegroundColor Cyan }
     if ($Config.Apps.Jellyseerr  -eq $true) { Write-Host "  Jellyseerr:   https://jellyseerr.$Domain"      -ForegroundColor Cyan }
     if ($Config.Apps.Grafana     -eq $true) { Write-Host "  Grafana:      https://grafana.$Domain/dashboards" -ForegroundColor Cyan }
+    if ($LlmSummaryEnabled) {
+        Write-Host "  LLM API:      https://$LlmSummarySub.$Domain/v1" -ForegroundColor Cyan
+        if ($LlmSummaryUi) { Write-Host "  LLM UI:       https://$LlmSummarySub.$Domain" -ForegroundColor Cyan }
+    }
 } else {
     $DuckHost = $Config.General.DuckDnsDomain
-    Write-Host "  Dashboard:    https://$DuckHost" -ForegroundColor Cyan
+    # Path mode: Jellyseerr (when enabled) owns the site root and the dashboard
+    # lives on /dashboard; with Jellyseerr disabled the root falls back to the
+    # dashboard. Keep this in step with the DuckDNS Caddyfile routing.
+    if ($Config.Apps.Jellyseerr  -eq $true) {
+        Write-Host "  Jellyseerr:   https://$DuckHost"                        -ForegroundColor Cyan
+        Write-Host "  Dashboard:    https://$DuckHost/dashboard"              -ForegroundColor Cyan
+    } else {
+        Write-Host "  Dashboard:    https://$DuckHost"                        -ForegroundColor Cyan
+        Write-Host "                https://$DuckHost/dashboard (Jellyseerr is disabled)" -ForegroundColor DarkGray
+    }
     if ($Config.Apps.Jellyfin    -eq $true) { Write-Host "  Jellyfin:     https://$DuckHost/jellyfin"              -ForegroundColor Cyan }
     if ($Config.Apps.Sonarr      -eq $true) { Write-Host "  Sonarr:       https://$DuckHost/sonarr"                -ForegroundColor Cyan }
     if ($Config.Apps.Radarr      -eq $true) { Write-Host "  Radarr:       https://$DuckHost/radarr"                -ForegroundColor Cyan }
     if ($Config.Apps.Prowlarr    -eq $true) { Write-Host "  Prowlarr:     https://$DuckHost/prowlarr"              -ForegroundColor Cyan }
     if ($Config.Apps.Deluge       -eq $true) { Write-Host "  Deluge:       https://$DuckHost/deluge"               -ForegroundColor Cyan }
     if ($Config.Apps.Bazarr      -eq $true) { Write-Host "  Bazarr:       https://$DuckHost/bazarr"                -ForegroundColor Cyan }
-    if ($Config.Apps.Jellyseerr  -eq $true) { Write-Host "  Jellyseerr:   https://$DuckHost/jellyseerr"            -ForegroundColor Cyan }
     if ($Config.Apps.Grafana     -eq $true) { Write-Host "  Grafana:      https://$DuckHost/grafana/dashboards"    -ForegroundColor Cyan }
+    if ($LlmSummaryEnabled) { Write-Host "  LLM API:      https://$DuckHost/llm/v1 (API only - the LLM UI is not published in DuckDNS mode)" -ForegroundColor Cyan }
     Write-Host ""
     if ($Config.General.TlsMode -eq "internal") {
         Write-Host "  NOTE: To trust the local Caddy root CA (removes browser warnings):" -ForegroundColor Yellow
