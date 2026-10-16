@@ -173,6 +173,47 @@ function Test-PythonCandidate {
     return $null
 }
 
+# Enumerate Python interpreters that already EXIST on this machine, so Step 4 can
+# refuse to install over them. Deliberately includes interpreters
+# Test-PythonCandidate rejects: an existing-but-unusable Python is precisely the
+# case where running an install would destroy something.
+function Find-ExistingPython {
+    $found = New-Object System.Collections.Generic.List[string]
+
+    # Per-user installs -- python.org's default when not elevated, winget, etc.
+    # These live under a user profile and are what `choco install python312`
+    # removes.
+    $usersRoot = Join-Path $env:SystemDrive 'Users'
+    Get-ChildItem $usersRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $pyRoot = Join-Path $_.FullName 'AppData\Local\Programs\Python'
+        if (Test-Path $pyRoot) {
+            Get-ChildItem $pyRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $exe = Join-Path $_.FullName 'python.exe'
+                if (Test-Path $exe) { $found.Add($exe) }
+            }
+        }
+    }
+
+    # Machine-wide installs other than our own Chocolatey target C:\Python312,
+    # which is ours to repair or replace.
+    Get-ChildItem (Join-Path $env:SystemDrive 'Python3*') -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -ne 'Python312') {
+            $exe = Join-Path $_.FullName 'python.exe'
+            if (Test-Path $exe) { $found.Add($exe) }
+        }
+    }
+
+    # Whatever `python` resolves to. The Microsoft Store alias is an App
+    # Execution Alias, not an interpreter, so it must not count as "a Python
+    # exists" -- otherwise it would block every install on a clean machine.
+    $gc = Get-Command python -ErrorAction SilentlyContinue
+    if ($gc -and $gc.Source -notlike '*\WindowsApps\*' -and $gc.Source -notlike '*\Python312\*') {
+        $found.Add($gc.Source)
+    }
+
+    return ($found | Select-Object -Unique)
+}
+
 # Step 1: Check C:\Python312 (Chocolatey default)
 $candidate = Test-PythonCandidate "C:\Python312\python.exe"
 if ($candidate) { $PythonExe = $candidate.Path; Write-DebugLog "INFO" "Found Python $($candidate.VersionStr) at $PythonExe (Chocolatey default)" }
@@ -212,6 +253,27 @@ Write-DebugLog "VAR PythonExe after auto-detection=$PythonExe"
 
 # Step 4: If still not found, install via Chocolatey
 if (-not $PythonExe) {
+    # Nothing USABLE was found -- but a Python may still be PRESENT, typically a
+    # per-user install the service account cannot read. Never install over it:
+    # `choco install python312` performs an InstallAllUsers=1 install, and where a
+    # per-user Python 3.12 already exists the python.org bundle REMOVES it and can
+    # leave orphaned per-user MSI state that makes every later attempt fail with
+    # 1603 ("Error 0x80070643: Failed to uninstall MSI package"). On a real
+    # machine that destroyed a working interpreter. Install only when there is
+    # genuinely nothing to destroy.
+    $existingPython = @(Find-ExistingPython)
+    if ($existingPython.Count -gt 0) {
+        Write-Host ""
+        Write-Warning "[$AppName] A Python installation already exists but cannot be used for the service:"
+        $existingPython | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+        Write-Warning "  NOT installing python312 -- that package installs for all users and would REMOVE the above."
+        Write-Warning "  Resolve either way, then re-run .\master_install.ps1:"
+        Write-Host "    (a) reinstall Python 3.12 'for all users' so the '$SvcUser' account can read it, or" -ForegroundColor Gray
+        Write-Host "    (b) uninstall that Python yourself -- this script will then install the machine-wide copy." -ForegroundColor Gray
+        Write-DebugLog "ERROR" "Refusing to install python312: existing Python found at $($existingPython -join '; '). An InstallAllUsers=1 install would remove it."
+        exit 1
+    }
+
     Write-Host "  -> Python 3.12 not found. Installing via Chocolatey..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Python not found on system. Installing python312 via choco..."
     $pythonInstall = Invoke-Choco -Arguments @('install', 'python312', '-y', '--no-progress')
