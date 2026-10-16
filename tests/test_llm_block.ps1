@@ -80,6 +80,15 @@ foreach ($s in $scenarios) {
         } else {
             if ($block -notmatch '(?m)^        respond 404') { Write-Host 'RESULT: FAIL (404 not inside a handle block)'; $failures++; continue }
         }
+    } else {
+        # DuckDNS path mode publishes the API only.  handle_path must strip exactly
+        # "/llm" (so the backend receives /v1/... -- the path its OpenAI-compatible
+        # clients require) and every path outside /v1 must be 404'd, otherwise the
+        # stripped root would serve the backend UI, which cannot work under a prefix.
+        if ($block -notmatch '(?m)^    handle_path /llm\* \{') { Write-Host 'RESULT: FAIL (no handle_path /llm* block)'; $failures++; continue }
+        if ($block -match 'handle_path\s+/llm/v1') { Write-Host 'RESULT: FAIL (handle_path would strip /llm/v1 and break the API path)'; $failures++; continue }
+        if ($block -notmatch '(?m)^        @llmapi path /v1/\*') { Write-Host 'RESULT: FAIL (API not scoped to the stripped /v1/* path)'; $failures++; continue }
+        if ($block -notmatch '(?m)^        respond 404') { Write-Host 'RESULT: FAIL (non-API paths under /llm are not 404d -- backend UI would be exposed)'; $failures++; continue }
     }
 
     # 3. CORS preflights (OPTIONS) never carry credentials, so a bearer-gated API

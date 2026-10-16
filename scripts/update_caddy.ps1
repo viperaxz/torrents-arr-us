@@ -22,7 +22,7 @@ $AppName = "Caddy"
 $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $AppName
 
 if ($WhatIf) {
-    return [PSCustomObject]@{ App = $AppName; Status = "DRYRUN"; Installed = $installed; Target = $Version; Detail = "choco upgrade caddy + reload config" }
+    return [PSCustomObject]@{ App = $AppName; Status = "DRYRUN"; Installed = $installed; Target = $Version; Detail = "choco upgrade caddy + restart service" }
 }
 if (-not $installed -or $installed -ieq "unknown") {
     return [PSCustomObject]@{ App = $AppName; Status = "SKIPPED"; Installed = $installed; Target = $Version; Detail = "not installed or installed version unknown" }
@@ -43,9 +43,13 @@ try {
     # caddy writes JSON logs to stderr even on success; suppress safely.
     try { & $caddyExe reload --config $caddyfile 2>&1 | Out-Null } catch {}
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "caddy reload failed (exit $LASTEXITCODE); restarting service instead."
-        Restart-Service -Name "Caddy" -Force
+        Write-Warning "caddy reload failed (exit $LASTEXITCODE)."
     }
+
+    # Chocolatey only swaps caddy.exe on disk -- the NSSM service keeps running the
+    # old image, and a reload only talks to that old process, so the upgrade would
+    # otherwise never take effect (while the version ledger records it as done).
+    Restart-Service -Name "Caddy" -Force
 
     Start-Sleep -Seconds 5
     $svcAfter = Get-Service -Name "Caddy" -ErrorAction SilentlyContinue

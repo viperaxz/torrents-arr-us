@@ -7,7 +7,7 @@ $svc = 'Caddy'
 
 # -- Layer 1: Health -----------------------------------------------------------
 if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
-    $pos = Get-LogPosition (Join-Path $InstallDir 'logs\caddy\access.log')
+    $pos = Get-LogPosition (Join-Path $InstallDir 'logs\caddy-access.log')
     $t0  = Get-Date
 
     $p80 = Test-TcpPort 80
@@ -28,7 +28,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     $nssm = Get-Service 'Caddy' -ErrorAction SilentlyContinue
     $Script:Results.Add((New-TestResult $svc 1 'ServiceRunning' $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) 'NSSM service state'))
 
-    Get-LogValidationResult $svc 1 (Join-Path $InstallDir 'logs\caddy\access.log') $pos '' $t0 $Script:LokiEnabled
+    Get-LogValidationResult $svc 1 (Join-Path $InstallDir 'logs\caddy-access.log') $pos '' $t0 $Script:LokiEnabled
 }
 
 # -- Layer 2: Inter-service (backends reachable through Caddy) -----------------
@@ -46,15 +46,21 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
 
 # -- Layer 3: Feature (basic-auth rejects wrong credentials) -------------------
 if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
-    $domain    = if ($Config.General.DomainMode -eq 'duckdns') { $Config.General.DuckDnsDomain } else { $Config.General.Domain }
-    $delugePath = if ($Config.General.DomainMode -eq 'duckdns') { "https://$domain/deluge/" } else { "https://deluge.$domain/" }
+    $domain = if ($Config.General.DomainMode -eq 'duckdns') { $Config.General.DuckDnsDomain } else { $Config.General.Domain }
 
+    # The dashboard is the only Caddy-level basic_auth protected route.  It lives at the
+    # root domain in Cloudflare mode, and in DuckDNS mode at /dashboard once Jellyseerr
+    # owns "/" (Jellyseerr has no basePath support); otherwise it keeps the site root.
+    $dashPath = if ($Config.General.DomainMode -eq 'duckdns' -and $Config.Apps.Jellyseerr -eq $true) { '/dashboard/' } else { '/' }
+
+    # The app routes (Sonarr, Deluge, ...) authenticate in the app itself, so they
+    # answer 200, not 401 -- probing them would only ever produce a WARN.
     $code = 0
     try {
-        $resp = Invoke-WebRequest $delugePath -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop -MaximumRedirection 0
+        $resp = Invoke-WebRequest "https://$domain$dashPath" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop -MaximumRedirection 0
         $code = [int]$resp.StatusCode
     } catch {
         if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
     }
-    $Script:Results.Add((New-TestResult $svc 3 'BasicAuthPresent' $(if ($code -eq 401) { 'PASS' } else { 'WARN' }) "Deluge Web UI returned $code (expect 401)"))
+    $Script:Results.Add((New-TestResult $svc 3 'BasicAuthPresent' $(if ($code -eq 401) { 'PASS' } else { 'WARN' }) "Dashboard ($dashPath) returned $code (expect 401 without credentials)"))
 }

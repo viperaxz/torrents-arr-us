@@ -34,7 +34,9 @@ $LlmHost      = "127.0.0.1"
 $LlmPort      = 8081
 $LlmApiKey    = ""
 $LlmExposeUi  = $true
-if ($Config.PSObject.Properties["LLM"]) {
+# NB: the property can exist with a null/absent value ("LLM": null). Indexing into a
+# null $lc.PSObject.Properties throws, so guard the value too.
+if ($Config.PSObject.Properties["LLM"] -and $Config.LLM) {
     $lc = $Config.LLM
     if ($lc.PSObject.Properties["Enabled"] -and $lc.Enabled -eq $true) { $LlmEnabled = $true }
     if ($lc.PSObject.Properties["Subdomain"] -and $lc.Subdomain) { $LlmSubdomain = [string]$lc.Subdomain }
@@ -47,6 +49,12 @@ Write-DebugLog "VAR LLM enabled=$LlmEnabled backend=${LlmHost}:${LlmPort} subdom
 if ($LlmEnabled -and $LlmPort -eq 8080) {
     Write-Warning "[WebServer] LLM.BackendPort is 8080 -- that port belongs to CrowdSec LAPI. Use 8081 for the LLM backend."
     Write-DebugLog "WARN" "LLM.BackendPort=8080 conflicts with CrowdSec LAPI"
+}
+if ($LlmEnabled -and $DomainMode -ne "cloudflare" -and $LlmExposeUi) {
+    # Path mode cannot host the LLM UI: like Jellyseerr, the backend UI requests its
+    # own assets from absolute paths, which a /llm prefix cannot serve.
+    Write-Warning "[WebServer] LLM.ExposeUi is ignored in $DomainMode mode -- only the /llm/v1 API is published."
+    Write-DebugLog "WARN" "LLM.ExposeUi=true has no effect in $DomainMode mode (API-only)"
 }
 
 # Load ACL helpers from 00_service_account.ps1 if not already loaded
@@ -446,6 +454,10 @@ if (-not (Test-Path $DashTemplatePath)) {
         $suffix = if ($a.Suffix) { $a.Suffix } else { "" }
         $url = if ($DomainMode -eq "cloudflare") {
             "https://$($a.Slug).$cfgDomain$suffix"
+        } elseif ($a.Key -eq "Jellyseerr") {
+            # Jellyseerr is served from the DuckDNS site root (no basePath support),
+            # so its card must not carry the /jellyseerr prefix.
+            "https://$cfgDuck$suffix"
         } else {
             "https://$cfgDuck/$($a.Slug)$suffix"
         }
@@ -605,32 +617,47 @@ $LlmUiPart
 }
 "@
     } else {
+        # Path mode publishes the API only.  handle_path strips exactly "/llm", so the
+        # backend receives "/v1/..." (the URL its OpenAI-compatible clients require).
+        # Everything else under the prefix -- notably the backend's own UI at the stripped
+        # root -- is 404'd: that UI loads its assets from absolute paths and cannot be
+        # served under a path prefix, so it must not leak through the strip either.
+        # (Scoping the matcher to "/llm/v1*" is NOT an option: handle_path would then strip
+        # "/llm/v1" and the backend would see "/models" instead of "/v1/models".)
         if ([string]::IsNullOrWhiteSpace($LlmApiKey)) {
             $LlmBlock = @"
-# Local LLM API -- external backend under /llm (UI not available in DuckDNS path mode)
+# Local LLM API -- external backend under /llm/v1 (API only, the backend UI is not published)
     handle_path /llm* {
-        reverse_proxy $LlmBackend {
-            header_up Host $LlmBackend
+        @llmapi path /v1/*
+        handle @llmapi {
+            reverse_proxy $LlmBackend {
+                header_up Host $LlmBackend
+            }
         }
+        respond 404
     }
 "@
         } else {
             $LlmBlock = @"
-# Local LLM API -- external backend under /llm (UI not available in DuckDNS path mode)
+# Local LLM API -- external backend under /llm/v1 (API only, the backend UI is not published)
     handle_path /llm* {
-        @preflight method OPTIONS
-        handle @preflight {
-            reverse_proxy $LlmBackend {
-                header_up Host $LlmBackend
+        @llmapi path /v1/*
+        handle @llmapi {
+            @preflight method OPTIONS
+            handle @preflight {
+                reverse_proxy $LlmBackend {
+                    header_up Host $LlmBackend
+                }
             }
-        }
-        @llmkey header Authorization "Bearer $LlmApiKey"
-        handle @llmkey {
-            reverse_proxy $LlmBackend {
-                header_up Host $LlmBackend
+            @llmkey header Authorization "Bearer $LlmApiKey"
+            handle @llmkey {
+                reverse_proxy $LlmBackend {
+                    header_up Host $LlmBackend
+                }
             }
+            respond 401
         }
-        respond 401
+        respond 404
     }
 "@
         }
@@ -669,6 +696,53 @@ if ($DomainMode -eq "cloudflare") {
 $Content = $Content.Replace('{$LLM_BLOCK}', $LlmBlock)
 Write-DebugLog "VAR LLM block rendered: size=$($LlmBlock.Length) chars"
 
+# -- DuckDNS site root: who owns "/" ------------------------------------------
+# Jellyseerr has no basePath support, so when it is installed it owns the site root and
+# the dashboard moves to /dashboard (matching the Cloudflare layout, where the dashboard
+# is also separate).  Without Jellyseerr the dashboard keeps "/" so the root is never a
+# dead end.  Cloudflare mode always keeps the dashboard at the root domain.
+$RootBlock = ""
+if ($DomainMode -ne "cloudflare") {
+    if ($Config.Apps.Jellyseerr -eq $true) {
+        Write-DebugLog "INFO" "DuckDNS root: Jellyseerr owns '/', dashboard served from /dashboard"
+        # The dashboard root is InstallDir (not InstallDir/dashboard) and the prefix is
+        # NOT stripped, so /dashboard/ maps to <InstallDir>/dashboard/ and the dashboard's
+        # relative fetch of ./current_status.json resolves to /dashboard/current_status.json.
+        $RootBlock = @"
+# Jellyseerr owns the site root: it has no basePath support, so serving it at "/" makes
+# the absolute paths it emits (/_next, /api, /login, /movie/...) resolve as-is.
+    handle {
+        reverse_proxy 127.0.0.1:$JellyseerrPort {
+            header_up X-Real-IP {remote_host}
+        }
+    }
+
+    # Dashboard -- moved off the root so Jellyseerr can own "/".  basicauth only.
+    handle /dashboard* {
+        basic_auth {
+            $AdminUsername $AdminBcryptHash
+        }
+        root * "$SafeInstallDir"
+        file_server
+    }
+"@
+    } else {
+        Write-DebugLog "INFO" "DuckDNS root: dashboard owns '/' (Jellyseerr not enabled)"
+        $RootBlock = @"
+# Dashboard at root -- catches everything else (static HTML)
+    handle {
+        basic_auth {
+            $AdminUsername $AdminBcryptHash
+        }
+        root * "$SafeInstallDir/dashboard"
+        file_server
+    }
+"@
+    }
+}
+$Content = $Content.Replace('{$ROOT_BLOCK}', $RootBlock)
+Write-DebugLog "VAR root block rendered: size=$($RootBlock.Length) chars"
+
 $CaddyfilePath = Join-Path $CaddyDir "Caddyfile"
 # BOM-free: the Caddyfile is parsed by Caddy (Go), not PowerShell. Set-Content
 # -Encoding UTF8 on PS 5.1 prepends EF BB BF ahead of the global-options '{'.
@@ -677,8 +751,35 @@ Write-Host "  -> Caddyfile written to $CaddyfilePath" -ForegroundColor Green
 Write-DebugLog "INFO" "Caddyfile written to $CaddyfilePath (size=$($Content.Length) chars)"
 
 # Normalize formatting so Caddy's startup warning ("not formatted") is suppressed.
-caddy fmt --overwrite $CaddyfilePath 2>$null
-Write-DebugLog "INFO" "Caddyfile formatted (caddy fmt)"
+# caddy fmt tolerates syntactic errors (it always exits 0 on a malformed file), so the
+# exit code is only useful for "file missing"-class failures -- log it either way.
+& $caddyExe fmt --overwrite $CaddyfilePath 2>$null
+$fmtExit = $LASTEXITCODE
+Write-DebugLog "INFO" "Caddyfile formatted (caddy fmt, exit=$fmtExit)"
+if ($fmtExit -ne 0) {
+    Write-Warning "[WebServer] caddy fmt failed (exit $fmtExit). Check $CaddyfilePath."
+    Write-DebugLog "WARN" "caddy fmt exited $fmtExit"
+}
+
+# Fail fast on an invalid render: NSSM keeps the service "Running" while caddy.exe
+# crash-loops on a config error, so the service-state check below cannot catch it.
+$savedEAP = $ErrorActionPreference
+$caddyValidateExit = 1
+$caddyValidateOut  = ""
+try {
+    $ErrorActionPreference = "Continue"
+    $caddyValidateOut  = (& $caddyExe validate --adapter caddyfile --config $CaddyfilePath 2>&1 | Out-String).Trim()
+    $caddyValidateExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedEAP
+}
+if ($caddyValidateExit -ne 0) {
+    Write-DebugLog "ERROR" "caddy validate FAILED (exit=$caddyValidateExit): $caddyValidateOut"
+    Write-Error "[WebServer] Generated Caddyfile is not valid (caddy validate exit $caddyValidateExit).$([Environment]::NewLine)$caddyValidateOut"
+    exit 1
+}
+Write-Host "  -> Caddyfile validated (caddy validate)." -ForegroundColor Green
+Write-DebugLog "INFO" "Caddyfile validated OK (caddy validate)"
 
 # -- 5. Caddy service ----------------------------------------------------------
 Write-Host "[WebServer] Configuring Caddy service..." -ForegroundColor Yellow

@@ -55,73 +55,13 @@
         }
     }
 
-    # Jellyseerr -- /jellyseerr prefix stripped before proxying.
-    # Next.js assets (/_next*), the API (/api*), and image proxies are routed
-    # directly to Jellyseerr because the browser requests them without the prefix.
+    # Jellyseerr -- legacy alias only.  The app itself is served from the site root
+    # (see the root routing at the end of this site block): it has no basePath support,
+    # so serving it at "/" makes every absolute path it emits (/_next, /api, /login,
+    # /movie/...) resolve without any per-route rules.  This prefix is kept so existing
+    # /jellyseerr bookmarks and URLs printed by older installs keep working; the prefix
+    # is stripped before proxying, exactly as before.
     handle_path /jellyseerr* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /_next* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /api* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /imageproxy* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /avatarproxy* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    # Jellyseerr has no basePath support -- server-side redirects send the browser
-    # to /login, /setup, etc. (without the /jellyseerr prefix). These handles ensure
-    # all Jellyseerr pages are reachable directly.
-    handle /login* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /setup* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /requests* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /profile* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /users* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /issues* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /blocklist* {
-        reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
-            header_up X-Real-IP {remote_host}
-        }
-    }
-    handle /resetpassword* {
         reverse_proxy 127.0.0.1:{$JELLYSEERR_PORT} {
             header_up X-Real-IP {remote_host}
         }
@@ -137,12 +77,9 @@
 
     {$LLM_BLOCK}
 
-    # Dashboard at root — catches everything else (static HTML)
-    handle {
-        basic_auth {
-            {$ADMIN_USER} {$ADMIN_HASH_BCRYPT}
-        }
-        root * "{$INSTALL_DIR}/dashboard"
-        file_server
-    }
+    # Root routing is rendered by scripts/01_webserver.ps1 -- see $RootBlock there:
+    # with Jellyseerr enabled it owns "/" (no basePath support) and the dashboard is
+    # served from /dashboard; without Jellyseerr the dashboard keeps "/" so the root
+    # is never a dead end.
+    {$ROOT_BLOCK}
 }
