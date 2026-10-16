@@ -1,53 +1,53 @@
 {
   "schema": 2,
-  "updated": "2026-08-27",
+  "updated": "2026-10-16",
   "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
   "apps": {
     "Sonarr": {
-      "version": "v4.0.19.2979",
+      "version": "v4.0.20.3014",
       "source": "github",
       "repo": "Sonarr/Sonarr",
       "asset": "*win-x64.zip"
     },
     "Radarr": {
-      "version": "v6.3.0.10514",
+      "version": "v6.4.4.10685",
       "source": "github",
       "repo": "Radarr/Radarr",
       "asset": "*windows-core-x64*.zip"
     },
     "Prowlarr": {
-      "version": "v2.5.2.5491",
+      "version": "v2.6.5.5623",
       "source": "github",
       "repo": "Prowlarr/Prowlarr",
       "asset": "*windows-core-x64*.zip"
     },
     "Bazarr": {
-      "version": "v1.6.0",
+      "version": "v1.6.2",
       "source": "github",
       "repo": "morpheus65535/bazarr",
       "asset": "bazarr.zip"
     },
     "Flaresolverr": {
-      "version": "v3.5.0",
+      "version": "v3.5.2",
       "source": "github",
       "repo": "FlareSolverr/FlareSolverr",
       "asset": "flaresolverr_windows_x64.zip"
     },
 
     "Jellyseerr": {
-      "version": "v3.4.1",
+      "version": "v3.5.0",
       "source": "github_source",
       "repo": "Fallenbagel/jellyseerr",
       "note": "Built from source (Node.js + pnpm). Updated by scripts\\update_jellyseerr.ps1 (rebuild from source)."
     },
     "Recyclarr": {
-      "version": "v8.7.1",
+      "version": "v8.8.0",
       "source": "github",
       "repo": "recyclarr/recyclarr",
       "asset": "*win-x64.zip"
     },
     "Jellyfin": {
-      "version": "10.11.11",
+      "version": "12.2.0",
       "source": "chocolatey",
       "package": "jellyfin"
     },
@@ -67,7 +67,7 @@
       "asset": "*portable_win64-clang-gpl.zip"
     },
     "Caddy": {
-      "version": "2.11.4",
+      "version": "2.11.7",
       "source": "chocolatey",
       "package": "caddy"
     },
@@ -82,7 +82,7 @@
       "package": "python312"
     },
     "CrowdSec": {
-      "version": "1.7.8",
+      "version": "1.8.0",
       "source": "chocolatey",
       "package": "crowdsec"
     },
@@ -92,18 +92,18 @@
       "package": "crowdsec-windows-firewall-bouncer"
     },
     "Grafana": {
-      "version": "13.2.0",
+      "version": "13.2.4",
       "source": "dl.grafana.com",
       "note": "Pinned stable version. scripts\\bump_versions.ps1 refreshes this pin from grafana.com/api/grafana/versions/stable. Binaries at dl.grafana.com/oss/release/"
     },
     "Loki": {
-      "version": "v3.7.6",
+      "version": "v3.7.8",
       "source": "github",
       "repo": "grafana/loki",
       "asset": "loki-windows-amd64.exe.zip"
     },
     "Alloy": {
-      "version": "v1.18.1",
+      "version": "v1.20.1",
       "source": "github",
       "repo": "grafana/alloy",
       "asset": "alloy-windows-amd64.exe.zip",
@@ -117,7 +117,7 @@
       "note": "Real-Debrid WebDAV bridge. Requires a valid RealDebrid.ApiKey in config.json."
     },
     "rclone": {
-      "version": "v1.75.0",
+      "version": "v1.75.2",
       "source": "github",
       "repo": "rclone/rclone",
       "asset": "*windows-amd64.zip",
