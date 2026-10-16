@@ -37,6 +37,9 @@ $BinDir    = Join-Path $PSScriptRoot "..\bin"
 
 $GrafanaPort = 3000
 $LokiPort    = 3100
+# Shared with the Alloy NSSM --server.http.listen-addr below and the readiness
+# probe that follows the service starts, so the two cannot drift apart.
+$AlloyListenAddr = "127.0.0.1:12345"
 
 foreach ($d in @($GrafanaDir, $GrafanaData, $LokiDir, $LokiData, $AlloyDir, $AlloyData, $BinDir)) {
     if (-not (Test-Path $d)) { New-Item $d -ItemType Directory -Force | Out-Null }
@@ -876,7 +879,7 @@ if (-not $lokiExe) {
 # Alloy
 if ($alloyExe -and -not (Get-Service "Alloy" -ErrorAction SilentlyContinue)) {
     nssm install Alloy "`"$alloyExe`"" | Out-Null
-    nssm set Alloy AppParameters "run `"$AlloyConfig`" --storage.path=`"$AlloyData`" --server.http.listen-addr=127.0.0.1:12345" | Out-Null
+    nssm set Alloy AppParameters "run `"$AlloyConfig`" --storage.path=`"$AlloyData`" --server.http.listen-addr=$AlloyListenAddr" | Out-Null
     nssm set Alloy AppDirectory $AlloyDir | Out-Null
     nssm set Alloy Description "Alloy - Log shipper for Loki (win-seedbox)" | Out-Null
     nssm set Alloy Start SERVICE_AUTO_START | Out-Null
@@ -930,6 +933,91 @@ foreach ($svcName in @("Loki", "Alloy", "Grafana")) {
         Start-Service $svcName -ErrorAction SilentlyContinue
         Write-DebugLog "INFO" "Started service: $svcName"
     }
+}
+
+# Loki and Alloy readiness checks.
+#
+# Grafana has a wait loop below, but nothing verified Loki or Alloy after they
+# were started. A component whose config fails to load crash-loops under NSSM
+# ("AppExit Default Restart" + AppRestartDelay 5000) while its service still
+# reports Running, so the install used to report success on a dead stack.
+#
+# Both checks settle ~5s first so a restart already in flight is not mistaken
+# for a clean start (NSSM's restart delay is 5s), then re-read the service state
+# -- the Get-Service object from the start loop above is a stale snapshot -- and
+# probe the component's own HTTP endpoint.
+#
+# These are advisory, not fatal: a component that is merely still initialising
+# must not fail an otherwise good install. They run before the Grafana wait so a
+# broken Loki/Alloy is attributed correctly instead of surfacing as a Grafana
+# failure; Grafana takes far longer than these ~10s to come up, so this overlaps
+# its startup rather than extending it.
+$LokiLog  = Join-Path $LokiDir "loki.log"
+$AlloyLog = Join-Path $AlloyDir "alloy.log"
+
+# Loki readiness.
+# loki-config.yml sets server.http_listen_port ($LokiPort) but no
+# server.http_listen_address, so Loki binds all interfaces and is reachable on
+# 127.0.0.1:$LokiPort. Loki answers GET /ready with 200 once ready and 503 while
+# it is still starting.
+if (Get-Service "Loki" -ErrorAction SilentlyContinue) {
+    Start-Sleep -Seconds 5
+    $lokiState = (Get-Service "Loki" -ErrorAction SilentlyContinue).Status
+    $lokiReady = $false
+    $lokiProbe = "no response"
+    try {
+        $lokiResponse = Invoke-WebRequest "http://127.0.0.1:$LokiPort/ready" `
+            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $lokiReady = $true
+        $lokiProbe = "HTTP $([int]$lokiResponse.StatusCode)"
+    } catch {
+        $lokiProbe = if ($_.Exception.Response) {
+            "HTTP $([int]$_.Exception.Response.StatusCode)"
+        } else {
+            $_.Exception.Message
+        }
+    }
+    Write-DebugLog "VAR Loki service=$lokiState ready=$lokiReady probe=$lokiProbe"
+    if ($lokiReady -and $lokiState -eq "Running") {
+        Write-Host "  -> Loki readiness: PASS (service=$lokiState, GET /ready: $lokiProbe)." -ForegroundColor Green
+    } else {
+        Write-Host "  -> Loki readiness: WARN (service=$lokiState, GET /ready: $lokiProbe). Check $LokiLog" -ForegroundColor Yellow
+        Write-DebugLog "WARN" "Loki readiness check failed: service=$lokiState probe=$lokiProbe log=$LokiLog"
+    }
+} else {
+    Write-DebugLog "INFO" "Loki service not present - readiness check skipped"
+}
+
+# Alloy readiness.
+# Alloy exposes no separate readiness API, but `alloy run` -- the command NSSM
+# runs -- registers GET /-/ready on its --server.http.listen-addr
+# ($AlloyListenAddr): 200 when the runtime is ready, 503 while it is still
+# loading the config. A crash-looping Alloy never binds the port at all, so the
+# connection is refused; that is the failure mode this check exists to surface.
+if (Get-Service "Alloy" -ErrorAction SilentlyContinue) {
+    Start-Sleep -Seconds 5
+    $alloyState = (Get-Service "Alloy" -ErrorAction SilentlyContinue).Status
+    $alloyProbe = "no response"
+    try {
+        $alloyResponse = Invoke-WebRequest "http://$AlloyListenAddr/-/ready" `
+            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+        $alloyProbe = "HTTP $([int]$alloyResponse.StatusCode)"
+    } catch {
+        $alloyProbe = if ($_.Exception.Response) {
+            "HTTP $([int]$_.Exception.Response.StatusCode)"
+        } else {
+            $_.Exception.Message
+        }
+    }
+    Write-DebugLog "VAR Alloy service=$alloyState probe=$alloyProbe"
+    if ($alloyState -eq "Running" -and $alloyProbe -eq "HTTP 200") {
+        Write-Host "  -> Alloy readiness: PASS (service=$alloyState, GET /-/ready: $alloyProbe)." -ForegroundColor Green
+    } else {
+        Write-Host "  -> Alloy readiness: WARN (service=$alloyState, GET /-/ready: $alloyProbe). Check $AlloyLog" -ForegroundColor Yellow
+        Write-DebugLog "WARN" "Alloy readiness check failed: service=$alloyState probe=$alloyProbe log=$AlloyLog"
+    }
+} else {
+    Write-DebugLog "INFO" "Alloy service not present - readiness check skipped"
 }
 
 # Wait up to 60s for Grafana API.
