@@ -5,7 +5,54 @@ RULE FOR AI 2: COMMIT ONLY AFTER A FULL UNINSTALL -> DO CHANGES -> FULLY INSTALL
 
 ## Upcoming
 
-### Priority 0 — LLM reverse proxy (bring-your-own LLM)
+### Priority 0 — Open items from the bug audit
+
+A 16-agent parallel audit fixed ~150 defects across 66 files. The items below are the ones those agents **deliberately deferred** (design calls, out-of-scope files, or unverifiable offline), plus the **verification gaps** that follow from the audit host not having most services installed. Ordered by impact.
+
+**Verification gaps — validate these first**
+
+- **The install-tree ACL lockdown has never been exercised through a real install.** `00_service_account.ps1` now closes the inherited `Authenticated Users: Modify` on `InstallDir` (previously any local user could read credential files and *rewrite service executables*). The allow/deny behaviour was proven with a real temporary unprivileged account (16 operations, live), but not through a full install cycle. Watch for anything run **unelevated** that writes inside `InstallDir` — `test-suite.ps1` now requires elevation and says so; `.locks\` is deliberately left locked (a user-writable ledger could suppress a security update) and its denial is handled.
+- **Most fixes rest on source/API-semantics verification, not live runs.** Deluge, Prowlarr, Jellyseerr, FlareSolverr, the Grafana stack and Zurg/rclone were not installed on the audit host, so their fixes were validated against upstream source, vendor docs and mock harnesses. A real install is the next verification step.
+
+**DuckDNS-mode gaps**
+
+- **`/deluge` is broken and cannot be fixed in this repo.** Deluge 2.1.1 registers its base child with a `str` key while Twisted traverses with `bytes`, so `/deluge/…` 404s and the Web UI is unreachable in path mode. Upstream fixed it on `develop` only (PRs #390/#391, opened 6 days after the 2.1.1 release); Chocolatey still ships 2.1.1, so there is no version to bump to. `Test-Deluge`'s `WebUiViaProxy` check will report it. Options: wait for a release, or run Deluge behind its own subdomain-like path alternative.
+- **The `/jellyseerr` legacy alias is rendered unconditionally** → it proxies a dead port (502) when `Apps.Jellyseerr = false`. Should be gated alongside the root-handover block.
+
+**Silent-success / health-check gaps**
+
+- **`update_common.ps1`'s swap-with-rollback health check is service-state only.** With NSSM's `AppExit Default Restart`, a crash-looping app still reports `Running`, so a bad update can be recorded as OK — this affects every app that uses the shared helper.
+- **No readiness probe for Loki (:3100) or Alloy (:12345)** — only Grafana has one. An invalid Alloy/Arc config crash-loops silently (NSSM restarts it) and the install still reports success. Suggested: 5 s settle + service-state re-check, plus one `GET /ready` for Loki.
+- **Installers still write lock + ledger when the service never started** (Sonarr/Radarr/Prowlarr/Bazarr/Deluge family). ffmpeg, Jellyfin, FlareSolverr, Zurg and rclone were hardened in this pass; the rest leave a permanently "Already installed. Skipping." state that no re-run repairs.
+
+**Feature / UX gaps**
+
+- **The dashboard ignores most of what the collector publishes.** `api_ok`, `consecutive_ok`, `port_open`, queue/indexer/wanted counts are emitted but never rendered, and `svcDot()` only reads the Windows service state — so "service Running, API dead" (or `rclone-rd-movies` running with the drive unmounted) still shows a green dot. `test_results.json` and `update_notification.json` are written but have no consumer. One-line start: `if (s.state === 'Running') return s.api_ok === false ? 'dot-yellow' : 'dot-green';`
+- **`templates/login.html.template` is orphaned** — nothing references it and nothing substitutes its placeholders. Its auth is client-side-only (`localStorage`, no server check), so it is security theatre if ever wired up. Either delete it or give it real server-side auth.
+- **No ffmpeg test exists anywhere** — no `Test-Ffmpeg.ps1`, and `ffmpeg`/`Ffmpeg` appears nowhere in `test-suite.ps1` or `tests/`. Neither the install nor its ledger entry is covered.
+- **`tests/test_llm_block.ps1` is not wired into `test-suite.ps1`** — it lacks a `-LayerFilter` parameter and asserts on `01_webserver.ps1`'s internal variable names, so it needs an adapter before it can join the suite.
+
+**Known-incorrect behaviour left as documented trade-offs**
+
+- **Lean library options are only applied at library creation.** `configure_layer2_jellyfin_libraries.ps1` applies them in the create branch only, so an existing `RD Movies` library never receives `DisableVideoExtraction` on a re-run of Layer 2. Fixing it needs a full `LibraryOptions` POST (including `TypeOptions` merging) — too risky to write blind without a live Jellyfin.
+- **`sanity_check.py`'s Deluge download polling is dead code.** `DownloadPollSecs` is read but unused, step 3 no longer polls `core.get_torrents_status`, and `deluge_hashes` is never populated — so `cleanup()` cannot cancel the downloads it created, while the docstring/`--steps` epilog/OVERVIEW §11 promise that it does. Either restore the poll or remove the key and the claims.
+- **GPU family mapping has two soft spots.** AMD's `default` → `amd_rdna1` is the most optimistic mapping in the file (Vega-family cards match no pattern and get profiles promising HEVC encode they lack), and `intel_uhd_10th` is unreachable — no pattern returns it, so 10th-gen Iris Plus falls through to `intel_uhd_8th` (harmless today: the two profile files differ only in `family`/`displayName`).
+- **ffmpeg cannot hardware tone-map HDR.** Chocolatey's `ffmpeg` is gyan.dev's *essentials* build, which omits `opencl` and `libplacebo` while every `profiles/gpu/*.json` sets `EnableTonemapping: true` — so `tonemap_opencl` fails or silently falls back to software. NVENC/AMF/QSV/D3D11VA themselves are present in that build, so encode/decode acceleration is unaffected. Either switch to a full build or drop tone-mapping from the profiles.
+- **`update_blocklists.ps1` exits 0 on partial failure** — a partial list is applied and loudly flagged (and recorded in `blocklist_state.json`), which is arguably correct, but callers cannot distinguish it from full success.
+- **`security_unban.ps1 -Whitelist` refuses to create a missing `Security` block** — it prints the exact JSON to paste instead, because surgical block creation has a far worse failure surface than refusing. Intentional.
+- **A stopped service is left stopped by `update_crowdsec.ps1` / `update_crowdsecbouncer.ps1`** (reported FAILED, no rollback) — consistent with the ~20 sibling `update_*.ps1` scripts, which choco cannot roll back.
+
+**Cleanup / conventions**
+
+- **`master_uninstall.ps1` leftovers:** `%APPDATA%\recyclarr\secrets.yml` (live Sonarr/Radarr API keys), the Machine `PATH` entry the installer adds, and `<repo>\bin` (cached release zips) are never removed. `cert-cache\` is kept deliberately but is not listed in the "Kept intact" footer.
+- **Duplicate firewall rules on reinstall** — `New-NetFirewallRule … -ErrorAction SilentlyContinue` is used everywhere, so rules accumulate across reinstall cycles.
+- **NSSM log rotation is only configured for Zurg and rclone**, so services that log verbosely (e.g. Seerr at `debug`, via `jellyseerr-stdout.log`) grow without bound.
+- **A few ACL helpers still use localized principal names** (`BUILTIN\Administrators`, `NT AUTHORITY\SYSTEM`) where newer code uses well-known SIDs — only breaks on non-English Windows.
+- **`.locks\*.lock` files are written with a UTF-8 BOM** — harmless (all readers are BOM-aware) but inconsistent with the repo's BOM-free convention for generated files.
+
+---
+
+### Priority 0 (implemented) — LLM reverse proxy (bring-your-own LLM)
 
 Expose an externally managed LLM server (Strata, Ollama, LM Studio, any OpenAI-compatible backend) over the internet through the project's Caddy setup — **without the project installing or managing the LLM itself**. The user installs and runs the LLM separately; the project only publishes it.
 
