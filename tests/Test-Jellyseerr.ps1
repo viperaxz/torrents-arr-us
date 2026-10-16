@@ -4,7 +4,9 @@ param([int]$LayerFilter = 0)
 
 $svc  = 'Jellyseerr'
 $port = $Config.Ports.Jellyseerr
-$base = Get-AppUrlBase 'jellyseerr' $Config.General.DomainMode
+# NOTE: Jellyseerr has no basePath/urlBase support, so every direct API call below
+# targets /api/v1/... at the root of the port -- adding the "/jellyseerr" Caddy
+# prefix here would 404. The prefix exists only in the Caddyfile (DuckDNS mode).
 
 if ($Config.Apps.Jellyseerr -ne $true) {
     $Script:Results.Add((New-TestResult $svc 1 'Enabled' 'SKIP' 'Apps.Jellyseerr = false in config'))
@@ -23,7 +25,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     $portOk = Test-TcpPort $port
     $Script:Results.Add((New-TestResult $svc 1 'PortOpen' $(if ($portOk) { 'PASS' } else { 'FAIL' }) "TCP :$port"))
 
-    $status = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/status" -TimeoutSec 8
+    $status = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/status" -TimeoutSec 8
     if ($status.ok) {
         $ver = if ($status.data -and $status.data.version) { $status.data.version } else { 'unknown' }
         $Script:Results.Add((New-TestResult $svc 1 'ApiStatus' 'PASS' "Jellyseerr $ver" $status.latency_ms))
@@ -36,47 +38,77 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
 }
 
 # -- Layer 2: Jellyfin, Sonarr, Radarr healthy; users imported ----------------
-if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
-    $settings = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/settings/main" $hdr -TimeoutSec 8
-    if ($settings.ok) {
-        $jfOk = $settings.data.jellyfinExternalUrl -or $settings.data.jellyfinInternalUrl
-        $Script:Results.Add((New-TestResult $svc 2 'JellyfinConfigured' $(if ($jfOk) { 'PASS' } else { 'FAIL' }) "Jellyfin URL in Jellyseerr settings"))
+if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
+    if (-not $apiKey) {
+        $Script:Results.Add((New-TestResult $svc 2 'JellyfinConfigured' 'SKIP' 'No API key at secrets\jellyseerr_api_key.txt (re-run configure_layer1_jellyseerr.ps1)'))
+        $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' 'SKIP' 'No Jellyseerr API key'))
+        $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' 'SKIP' 'No Jellyseerr API key'))
+        $Script:Results.Add((New-TestResult $svc 2 'UsersImported' 'SKIP' 'No Jellyseerr API key'))
     } else {
-        $Script:Results.Add((New-TestResult $svc 2 'JellyfinConfigured' 'FAIL' $settings.error))
-    }
+        # The Jellyfin connection is not part of /settings/main -- it lives in
+        # /settings/jellyfin (ip/port/urlBase), which is what has to carry the
+        # /jellyfin prefix in DuckDNS mode.
+        $jfSettings = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/jellyfin" $hdr -TimeoutSec 8
+        $expectedBase = if ($Config.General.DomainMode -eq 'duckdns') { '/jellyfin' } else { '' }
+        if ($jfSettings.ok) {
+            $actualBase = [string]$jfSettings.data.urlBase
+            $jfOk = [bool]($jfSettings.data.ip -and $jfSettings.data.port)
+            if ($expectedBase -and $actualBase.TrimEnd('/') -ne $expectedBase) { $jfOk = $false }
+            $detail = "Jellyfin $($jfSettings.data.ip):$($jfSettings.data.port)$actualBase"
+            if (-not $jfOk -and $expectedBase) { $detail = "Jellyfin urlBase expected '$expectedBase', got '$actualBase'" }
+            $Script:Results.Add((New-TestResult $svc 2 'JellyfinConfigured' $(if ($jfOk) { 'PASS' } else { 'FAIL' }) $detail))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'JellyfinConfigured' 'FAIL' $jfSettings.error))
+        }
 
-    $services = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/settings/sonarr" $hdr -TimeoutSec 8
-    if ($services.ok) {
-        $sonarrCount = if ($services.data -is [array]) { $services.data.Count } else { 0 }
-        $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' $(if ($sonarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$sonarrCount Sonarr instance(s) in Jellyseerr"))
-    } else {
-        $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' 'FAIL' $services.error))
-    }
+        $settings = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/main" $hdr -TimeoutSec 8
+        if ($settings.ok) {
+            # DuckDNS serves Jellyseerr from the site root (no basePath support), so the
+            # published applicationUrl has no /jellyseerr prefix.
+            $expectedUrl = if ($Config.General.DomainMode -eq 'duckdns') { "https://$($Config.General.DuckDnsDomain)" } else { "https://jellyseerr.$($Config.General.Domain)" }
+            $actualUrl   = [string]$settings.data.applicationUrl
+            $Script:Results.Add((New-TestResult $svc 2 'ApplicationUrl' $(if ($actualUrl.TrimEnd('/') -eq $expectedUrl) { 'PASS' } else { 'FAIL' }) "applicationUrl='$actualUrl' (expected '$expectedUrl')"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'ApplicationUrl' 'FAIL' $settings.error))
+        }
 
-    $radarrSvc = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/settings/radarr" $hdr -TimeoutSec 8
-    if ($radarrSvc.ok) {
-        $radarrCount = if ($radarrSvc.data -is [array]) { $radarrSvc.data.Count } else { 0 }
-        $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' $(if ($radarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$radarrCount Radarr instance(s) in Jellyseerr"))
-    } else {
-        $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' 'FAIL' $radarrSvc.error))
-    }
+        $services = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/sonarr" $hdr -TimeoutSec 8
+        if ($services.ok) {
+            $sonarrCount = if ($services.data -is [array]) { $services.data.Count } else { 0 }
+            $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' $(if ($sonarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$sonarrCount Sonarr instance(s) in Jellyseerr"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' 'FAIL' $services.error))
+        }
 
-    $users = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/user" $hdr -TimeoutSec 8
-    if ($users.ok) {
-        $total = if ($users.data.results) { $users.data.results.Count } elseif ($users.data -is [array]) { $users.data.Count } else { 0 }
-        $Script:Results.Add((New-TestResult $svc 2 'UsersImported' $(if ($total -gt 0) { 'PASS' } else { 'WARN' }) "$total user(s) in Jellyseerr"))
-    } else {
-        $Script:Results.Add((New-TestResult $svc 2 'UsersImported' 'FAIL' $users.error))
+        $radarrSvc = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/radarr" $hdr -TimeoutSec 8
+        if ($radarrSvc.ok) {
+            $radarrCount = if ($radarrSvc.data -is [array]) { $radarrSvc.data.Count } else { 0 }
+            $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' $(if ($radarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$radarrCount Radarr instance(s) in Jellyseerr"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' 'FAIL' $radarrSvc.error))
+        }
+
+        $users = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/user" $hdr -TimeoutSec 8
+        if ($users.ok) {
+            $total = if ($users.data.results) { $users.data.results.Count } elseif ($users.data -is [array]) { $users.data.Count } else { 0 }
+            $Script:Results.Add((New-TestResult $svc 2 'UsersImported' $(if ($total -gt 0) { 'PASS' } else { 'WARN' }) "$total user(s) in Jellyseerr"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'UsersImported' 'FAIL' $users.error))
+        }
     }
 }
 
 # -- Layer 3: Discovery page browse -------------------------------------------
-if (($LayerFilter -eq 0 -or $LayerFilter -eq 3) -and $apiKey) {
-    $discover = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/discover/movies?page=1" $hdr -TimeoutSec 15
-    if ($discover.ok) {
-        $count = if ($discover.data.results) { $discover.data.results.Count } else { 0 }
-        $Script:Results.Add((New-TestResult $svc 3 'DiscoveryMovies' $(if ($count -gt 0) { 'PASS' } else { 'WARN' }) "$count movie(s) on discover page" $discover.latency_ms))
+if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
+    if (-not $apiKey) {
+        $Script:Results.Add((New-TestResult $svc 3 'DiscoveryMovies' 'SKIP' 'No Jellyseerr API key'))
     } else {
-        $Script:Results.Add((New-TestResult $svc 3 'DiscoveryMovies' 'FAIL' $discover.error $discover.latency_ms))
+        $discover = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/discover/movies?page=1" $hdr -TimeoutSec 15
+        if ($discover.ok) {
+            $count = if ($discover.data.results) { $discover.data.results.Count } else { 0 }
+            $Script:Results.Add((New-TestResult $svc 3 'DiscoveryMovies' $(if ($count -gt 0) { 'PASS' } else { 'WARN' }) "$count movie(s) on discover page" $discover.latency_ms))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 3 'DiscoveryMovies' 'FAIL' $discover.error $discover.latency_ms))
+        }
     }
 }

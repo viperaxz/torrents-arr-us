@@ -32,8 +32,11 @@ $SonarrBase   = if ($DomainMode -eq "duckdns") { "/sonarr"   } else { "" }
 $RadarrBase   = if ($DomainMode -eq "duckdns") { "/radarr"   } else { "" }
 $ApiBase      = "http://127.0.0.1:$AppPort"
 
+# DuckDNS serves Jellyseerr from the site root (it has no basePath support), so the
+# published URL has no /jellyseerr prefix.  Seerr builds deep/email links as
+# "${applicationUrl}/movie/<id>", so this must stay the root URL.
 $PublicUrl = if ($DomainMode -eq "duckdns") {
-    "https://$($Config.General.DuckDnsDomain)/jellyseerr"
+    "https://$($Config.General.DuckDnsDomain)"
 } else {
     "https://jellyseerr.$($Config.General.Domain)"
 }
@@ -80,15 +83,29 @@ while (-not $apiUp -and (Get-Date) -lt $deadline) {
         $apiUp = $true
     } catch { Start-Sleep -Seconds 5; $waited += 5 }
 }
-Write-DebugLog "VAR Jellyseerr API up=$apiUp waited=${waited}s isSetupDone=$($statusData.isSetupDone)"
+Write-DebugLog "VAR Jellyseerr API up=$apiUp waited=${waited}s version=$($statusData.version)"
 if (-not $apiUp) {
     Write-Warning "[$AppName] API not responding after 90s. Skipping."
     Write-DebugLog "ERROR" "Jellyseerr API not responding"
     exit 1
 }
 
-$isSetupDone = $statusData.isSetupDone -eq $true
-Write-DebugLog "VAR isSetupDone=$isSetupDone"
+# /api/v1/status no longer reports isSetupDone. What matters here is whether the
+# media server connection is already registered: POST /api/v1/auth/jellyfin rejects
+# any request that carries `hostname` once settings.jellyfin.ip is set
+# ("Jellyfin hostname already configured"), so a re-run must send credentials only.
+# mediaServerType is exposed by the unauthenticated public settings endpoint.
+$mediaServerType = 0
+try {
+    $publicSettings = Invoke-RestMethod -Uri "$ApiBase/api/v1/settings/public" `
+        -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+    if ($publicSettings.mediaServerType) { $mediaServerType = [int]$publicSettings.mediaServerType }
+} catch {
+    Write-DebugLog "WARN" "Could not read /api/v1/settings/public: $_"
+}
+# MediaServerType: 1=Plex 2=Jellyfin 3=Emby 4=NotConfigured
+$mediaServerConfigured = ($mediaServerType -ge 1 -and $mediaServerType -le 3)
+Write-DebugLog "VAR mediaServerType=$mediaServerType mediaServerConfigured=$mediaServerConfigured"
 
 # -- 3. Initial setup via POST /api/v1/auth/jellyfin --------------------------
 # This endpoint handles both first-run setup AND subsequent logins.
@@ -99,14 +116,18 @@ Write-Host "  -> Authenticating with Jellyfin credentials..." -ForegroundColor G
 $authBody = @{
     username   = $AdminUser
     password   = $AdminPass
-    hostname   = "127.0.0.1"
-    port       = $JfPort
-    urlBase    = $JfUrlBase
-    useSsl     = $false
-    serverType = 2
-} | ConvertTo-Json -Compress
+}
+if (-not $mediaServerConfigured) {
+    # First run: register the Jellyfin server alongside the admin login.
+    $authBody["hostname"]   = "127.0.0.1"
+    $authBody["port"]       = $JfPort
+    $authBody["urlBase"]    = $JfUrlBase
+    $authBody["useSsl"]     = $false
+    $authBody["serverType"] = 2   # MediaServerType.JELLYFIN
+}
+$authBody = $authBody | ConvertTo-Json -Compress
 
-Write-DebugLog "INFO" "POST /api/v1/auth/jellyfin (user=$AdminUser jfPort=$JfPort urlBase=$JfUrlBase)"
+Write-DebugLog "INFO" "POST /api/v1/auth/jellyfin (user=$AdminUser jfPort=$JfPort urlBase=$JfUrlBase configured=$mediaServerConfigured)"
 
 # Jellyseerr is often still connecting to Jellyfin internally when it first starts.
 # A single-shot auth attempt can fail on a fresh install even though the status
@@ -137,6 +158,15 @@ while (-not $authUp -and (Get-Date) -lt $deadline) {
                 $stream = $_.Exception.Response.GetResponseStream()
                 $authErr = (New-Object System.IO.StreamReader($stream)).ReadToEnd()
             } catch {}
+        }
+        # /api/v1/auth/jellyfin returns 500 "Jellyfin hostname already configured" when
+        # settings.jellyfin.ip is set.  That happens when the public-settings probe above
+        # could not answer (or the server was configured in the meantime), so fall back to
+        # a credentials-only login instead of failing the whole run.
+        if ($authErr -match 'hostname already configured' -and $authBody -match '"hostname"') {
+            $authBody = @{ username = $AdminUser; password = $AdminPass } | ConvertTo-Json -Compress
+            Write-DebugLog "INFO" "Jellyfin hostname already configured -- retrying with credentials only"
+            $authErr = ""
         }
         Write-DebugLog "VAR Jellyseerr auth attempt failed (${authWaited}s): $authErr"
         Start-Sleep -Seconds 3; $authWaited += 3
@@ -380,6 +410,36 @@ try {
 } catch {
     Write-Warning "[$AppName] Could not set default permissions: $_"
     Write-DebugLog "WARN" "Failed to set defaultPermissions: $_"
+}
+
+# -- 9. Persist the API key ----------------------------------------------------
+# tests/Test-Jellyseerr.ps1 and any external integration read the key from
+# secrets\jellyseerr_api_key.txt; nothing else creates it, so without this the
+# Layer 2/3 API checks are skipped silently.  Mirrors the Jellyfin convention
+# (secrets\jellyfin_api_key.txt) and is refreshed on every run because the key can
+# be regenerated from the Jellyseerr UI.
+$SecretsDir = Join-Path $Config.General.InstallDir "secrets"
+$ApiKeyFile = Join-Path $SecretsDir "jellyseerr_api_key.txt"
+Write-DebugLog "VAR SecretsDir=$SecretsDir ApiKeyFile=$ApiKeyFile"
+if (-not (Test-Path $SecretsDir)) {
+    Write-Warning "[$AppName] Secrets directory not found at '$SecretsDir'. API key not stored."
+    Write-DebugLog "WARN" "Secrets directory not found at $SecretsDir"
+} else {
+    try {
+        $mainSettings = Invoke-JellyseerrApi -Path "/api/v1/settings/main" -Method Get
+        $jsApiKey     = $mainSettings.apiKey
+        if ($jsApiKey) {
+            [System.IO.File]::WriteAllText($ApiKeyFile, $jsApiKey, [System.Text.Encoding]::UTF8)
+            Write-Host "  -> API key stored in $ApiKeyFile." -ForegroundColor Green
+            Write-DebugLog "INFO" "Jellyseerr API key written to $ApiKeyFile"
+        } else {
+            Write-Warning "[$AppName] Jellyseerr returned no API key. Test suite will skip API checks."
+            Write-DebugLog "WARN" "settings/main returned no apiKey"
+        }
+    } catch {
+        Write-Warning "[$AppName] Could not read the Jellyseerr API key: $_"
+        Write-DebugLog "WARN" "Failed to read settings/main apiKey: $_"
+    }
 }
 
 Write-Host ""

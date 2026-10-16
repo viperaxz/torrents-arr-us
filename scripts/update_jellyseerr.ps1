@@ -67,7 +67,28 @@ try {
 
     $npmrcFile = Join-Path $NewSrcDir ".npmrc"
     try {
-        [System.IO.File]::WriteAllText($npmrcFile, "onlyBuiltDependencies[]=unrs-resolver", [System.Text.Encoding]::ASCII)
+        # Merge instead of overwrite: the source archive ships .npmrc with
+        # engine-strict=true and its allow-list in package.json#pnpm.onlyBuiltDependencies.
+        # pnpm 10 blocks dependency build scripts unless allow-listed, so both lists
+        # are combined (a bare overwrite would drop the upstream settings).
+        $npmrcLines = @()
+        if (Test-Path $npmrcFile) {
+            $npmrcLines = @(Get-Content -Path $npmrcFile -ErrorAction Stop |
+                Where-Object { $_ -notmatch '^\s*onlyBuiltDependencies(\[\])?\s*=' })
+        }
+        $buildDeps = @("unrs-resolver")
+        $pkgJson = Join-Path $NewSrcDir "package.json"
+        if (Test-Path $pkgJson) {
+            try {
+                $pkg = Get-Content -Raw -Path $pkgJson | ConvertFrom-Json
+                if ($pkg.pnpm -and $pkg.pnpm.PSObject.Properties["onlyBuiltDependencies"] -and $pkg.pnpm.onlyBuiltDependencies) {
+                    $buildDeps += @($pkg.pnpm.onlyBuiltDependencies | ForEach-Object { [string]$_ })
+                }
+            } catch {}
+        }
+        $buildDeps = @($buildDeps | Where-Object { $_ } | Select-Object -Unique)
+        $npmrcLines += @($buildDeps | ForEach-Object { "onlyBuiltDependencies[]=$_" })
+        [System.IO.File]::WriteAllLines($npmrcFile, $npmrcLines, [System.Text.Encoding]::ASCII)
     } catch {}
 
     Write-Host "  -> Building Jellyseerr (5-10 min, please wait)..." -ForegroundColor Gray
@@ -116,7 +137,29 @@ try {
     Rename-Item -Path $NewSrcDir -NewName "app" -Force
 
     Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 20
+
+    # A running NSSM service proves nothing for Jellyseerr: the new bundle runs
+    # database migrations on its first boot and can crash-loop afterwards. Poll the
+    # API (this is the same endpoint the installer waits on) and let a timeout fall
+    # through to the rollback below.
+    $apiPort = if ($Config -and $Config.Ports -and $Config.Ports.PSObject.Properties["Jellyseerr"]) {
+        $Config.Ports.Jellyseerr
+    } else {
+        5055
+    }
+    $deadline = (Get-Date).AddSeconds(180)
+    $apiUp = $false
+    while (-not $apiUp -and (Get-Date) -lt $deadline) {
+        try {
+            $status = Invoke-RestMethod -Uri "http://127.0.0.1:$apiPort/api/v1/status" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($status.version) { $apiUp = $true } else { Start-Sleep -Seconds 5 }
+        } catch {
+            Start-Sleep -Seconds 5
+        }
+    }
+    if (-not $apiUp) { throw "Jellyseerr API not responding on port $apiPort after swap" }
+
     $svcAfter = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "Jellyseerr service not Running after swap" }
 

@@ -177,9 +177,16 @@ foreach ($u in $users) {
     } | Select-Object -First 1
 
     if ($match) {
-        $jfId = if ($match.jellyfinUserId) { $match.jellyfinUserId } else { $match.Id }
-        $importIds += $jfId
-        Write-DebugLog "VAR User '$name' -> jellyfinUserId=$jfId"
+        # /api/v1/settings/jellyfin/users returns { username, id, thumb, email } while
+        # the direct-Jellyfin fallback above normalises to jellyfinUserId -- accept both.
+        $jfId = if ($match.jellyfinUserId) { $match.jellyfinUserId } elseif ($match.id) { $match.id } else { $null }
+        if ($jfId) {
+            $importIds += $jfId
+            Write-DebugLog "VAR User '$name' -> jellyfinUserId=$jfId"
+        } else {
+            Write-Warning "  -> User '$name' matched '$($match.username)' but carries no Jellyfin user id -- skipping."
+            Write-DebugLog "WARN" "User '$name' matched without an id field"
+        }
     } else {
         Write-Warning "  -> User '$name' not found in Jellyfin  --  skipping (create them in Jellyfin first)."
         Write-DebugLog "WARN" "User '$name' not found in Jellyfin user list"

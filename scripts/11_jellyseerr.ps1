@@ -74,6 +74,13 @@ if (-not (Test-Path $NodeExe)) {
     try {
         $nodeIndex = Invoke-RestMethod "https://nodejs.org/dist/index.json" -UseBasicParsing
         $node22    = $nodeIndex | Where-Object { $_.version -like "v22.*" -and $_.lts } | Select-Object -First 1
+        if (-not $node22 -or -not $node22.version) {
+            # Node 22 is required by the source (package.json engines ^22.19.0). Without
+            # this guard the download URL degenerates into node--win-x64.zip.
+            Write-Error "[$AppName] No Node.js 22 LTS release found in the Node.js index. Cannot build from source."
+            Write-DebugLog "ERROR" "Node.js index contained no v22.x LTS entry"
+            exit 1
+        }
         $NodeVer   = $node22.version
         Write-DebugLog "VAR NodeVer=$NodeVer"
     } catch {
@@ -160,17 +167,38 @@ $logsDir = Join-Path $InstallDir "logs"
 if (-not (Test-Path $logsDir)) { New-Item $logsDir -ItemType Directory -Force | Out-Null }
 $BuildLogFile = Join-Path $logsDir "jellyseerr_build.log"
 
-# Allow unrs-resolver (Rust DNS resolver) to run its native build script.
-# pnpm 10+ blocks build scripts by default for security; this package needs it.
-# Instead of fragile JSON manipulation on package.json (which varies between
-# Jellyseerr releases), write a local .npmrc that tells pnpm to trust it.
+# pnpm 10+ blocks dependency build scripts unless they are allow-listed, which
+# leaves sqlite3/sharp/bcrypt/@swc/core unbuilt and produces an unusable bundle.
+# The source archive ships its own allow-list in package.json#pnpm.onlyBuiltDependencies
+# plus an .npmrc (engine-strict=true), so the file is merged -- never replaced, as
+# an overwrite silently drops the upstream settings.
 $NpmrcFile = Join-Path $AppSrcDir ".npmrc"
 try {
-    $npmrcContent = "onlyBuiltDependencies[]=unrs-resolver"
-    [System.IO.File]::WriteAllText($NpmrcFile, $npmrcContent, [System.Text.Encoding]::ASCII)
-    Write-DebugLog "INFO" "Wrote .npmrc to approve unrs-resolver build scripts"
+    $npmrcLines = @()
+    if (Test-Path $NpmrcFile) {
+        $npmrcLines = @(Get-Content -Path $NpmrcFile -ErrorAction Stop |
+            Where-Object { $_ -notmatch '^\s*onlyBuiltDependencies(\[\])?\s*=' })
+    }
+
+    $buildDeps = @("unrs-resolver")
+    $pkgJson = Join-Path $AppSrcDir "package.json"
+    if (Test-Path $pkgJson) {
+        try {
+            $pkg = Get-Content -Raw -Path $pkgJson | ConvertFrom-Json
+            if ($pkg.pnpm -and $pkg.pnpm.PSObject.Properties["onlyBuiltDependencies"] -and $pkg.pnpm.onlyBuiltDependencies) {
+                $buildDeps += @($pkg.pnpm.onlyBuiltDependencies | ForEach-Object { [string]$_ })
+            }
+        } catch {
+            Write-DebugLog "WARN" "Could not read pnpm.onlyBuiltDependencies from package.json: $_"
+        }
+    }
+    $buildDeps = @($buildDeps | Where-Object { $_ } | Select-Object -Unique)
+
+    $npmrcLines += @($buildDeps | ForEach-Object { "onlyBuiltDependencies[]=$_" })
+    [System.IO.File]::WriteAllLines($NpmrcFile, $npmrcLines, [System.Text.Encoding]::ASCII)
+    Write-DebugLog "INFO" "Wrote .npmrc build-script allow-list: $($buildDeps -join ', ')"
 } catch {
-    Write-DebugLog "WARN" "Could not write .npmrc for unrs-resolver: $_"
+    Write-DebugLog "WARN" "Could not update .npmrc build-script allow-list: $_"
 }
 
 Write-Host "  -> Installing dependencies (several minutes)..." -ForegroundColor Gray
@@ -282,7 +310,7 @@ while (-not $started -and (Get-Date) -lt $deadline) {
         $statusResp = Invoke-RestMethod -Uri "http://127.0.0.1:$AppPort/api/v1/status" `
             -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
         $started = $true
-        Write-DebugLog "VAR status: version=$($statusResp.version) isSetupDone=$($statusResp.isSetupDone)"
+        Write-DebugLog "VAR status: version=$($statusResp.version) commitTag=$($statusResp.commitTag)"
     } catch { Start-Sleep -Seconds 5; $waited += 5 }
 }
 Write-DebugLog "VAR Jellyseerr API responded=$started waited=${waited}s"
