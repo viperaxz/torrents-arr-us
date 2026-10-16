@@ -36,3 +36,16 @@ reads this file. Enable it once per clone:
 ```sh
 git config core.hooksPath scripts/git-hooks
 ```
+
+## Project workflow rules (mirrored from ROADMAP.md)
+
+These two rules sit at the top of [ROADMAP.md](../ROADMAP.md) and are repeated
+here because an agent reliably loads this file and may never open the roadmap. If
+the two ever disagree, the roadmap is the source of truth.
+
+1. **All features are implemented on their own branch.** Do not develop a feature
+   directly on `main`.
+2. **Commit only after a full cycle.** The cycle is: full uninstall → make the
+   change → full install → uninstall. Run as many cycles as you need, but do not
+   commit unless you have completed a flawless cycle. **You, the agent, run the
+   scripts** — do not hand the steps back to the user.
