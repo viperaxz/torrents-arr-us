@@ -98,7 +98,11 @@ if (Test-Path $StatePath) {
 }
 
 function GetState { param([string]$n)
-    if (-not $hs.ContainsKey($n)) { $hs[$n] = [PSCustomObject]@{ consecutive_ok=0; last_ok=$null; last_fail=$null } }
+    # A hand-edited or partially written health_state.json can carry a null entry;
+    # treat that like a missing one instead of returning $null to SetState.
+    if (-not $hs.ContainsKey($n) -or $null -eq $hs[$n]) {
+        $hs[$n] = [PSCustomObject]@{ consecutive_ok=0; last_ok=$null; last_fail=$null }
+    }
     return $hs[$n]
 }
 
@@ -165,8 +169,13 @@ $svcs.Add([ordered]@{
 })
 
 # Jellyfin
+# DuckDNS mode runs Jellyfin with BaseUrl=/jellyfin in network.xml, so every API
+# path lives under that prefix -- probe the prefixed path like every other app
+# (UBase).  Without it Jellyfin answers with a 302 to the web client, which
+# Invoke-RestMethod follows happily: the health check then reports a false "up".
 $jPort  = TcpOpen $jellyfinPort
-$jCheck = QuickGet "http://127.0.0.1:$jellyfinPort/System/Info/Public"
+$jBase  = UBase 'jellyfin'
+$jCheck = QuickGet "http://127.0.0.1:$jellyfinPort${jBase}/System/Info/Public"
 $svcs.Add((SvcEntry 'JellyfinServer' 'Jellyfin' $jPort $jCheck.ok $jCheck.ms))
 
 # Sonarr
@@ -303,9 +312,13 @@ if ($Config.Apps.Flaresolverr -eq $true) {
 
 # Jellyseerr
 if ($Config.Apps.Jellyseerr -eq $true) {
+    # Jellyseerr has no basePath/urlBase support: the Caddyfile routes
+    # /jellyseerr* with handle_path, which STRIPS the prefix before proxying, and
+    # the browser asks for /api* and /_next* at the domain root.  A direct probe
+    # therefore must NOT carry the DuckDNS prefix -- /jellyseerr/api/v1/status
+    # 404s and the dashboard would report Jellyseerr as down in DuckDNS mode.
     $jseOpen  = TcpOpen $jsePort
-    $jseBase  = UBase 'jellyseerr'
-    $jseCheck = QuickGet "http://127.0.0.1:$jsePort${jseBase}/api/v1/status"
+    $jseCheck = QuickGet "http://127.0.0.1:$jsePort/api/v1/status"
     $svcs.Add((SvcEntry 'Jellyseerr' 'Jellyseerr' $jseOpen $jseCheck.ok $jseCheck.ms))
 }
 
@@ -400,14 +413,28 @@ $status.drives = $drives.ToArray()
 # collector reads it from Jellyseerr's settings instead of logging in every run.
 $status.media.jellyfin = $null
 try {
+    # Key source 1: Jellyseerr stores the Jellyfin API key it generated in its own
+    # settings.json (jellyfin.apiKey).  Key source 2: the Seedbox-Integration key
+    # the installer writes to secrets\jellyfin_api_key.txt (the file the test
+    # modules read too) -- used when Jellyseerr is disabled or not yet wired up.
+    $jfKey      = $null
     $jfSettings = 'C:\ProgramData\Jellyseerr\settings.json'
-    $jfKey = $null
     if (Test-Path $jfSettings) {
         $js = Get-Content $jfSettings -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = [string]$js.jellyfin.apiKey }
+        if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = ([string]$js.jellyfin.apiKey).Trim() }
+    }
+    if (-not $jfKey) {
+        $jfKeyFile = Join-Path $InstallDir 'secrets\jellyfin_api_key.txt'
+        if (Test-Path $jfKeyFile) {
+            $jfKey = ([System.IO.File]::ReadAllText($jfKeyFile, [System.Text.Encoding]::UTF8)).TrimStart([char]0xFEFF).Trim()
+        }
     }
     if ($jfKey) {
-        $jfCounts = Invoke-RestMethod "http://127.0.0.1:$jellyfinPort/Items/Counts" `
+        # Same BaseUrl prefix as the health probe above -- without it Jellyfin
+        # 302s to the web client, the body comes back as HTML and the library
+        # card reads 0 movies / 0 series / 0 episodes.
+        $jfBase   = UBase 'jellyfin'
+        $jfCounts = Invoke-RestMethod "http://127.0.0.1:$jellyfinPort${jfBase}/Items/Counts" `
                         -Headers @{'X-MediaBrowser-Token'=$jfKey} -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         $status.media.jellyfin = [ordered]@{
             movies   = [int]$jfCounts.MovieCount
@@ -563,7 +590,13 @@ if ($Config.Apps.Grafana -eq $true) {
 }
 
 # -- Persist health state -------------------------------------------------------
+# WriteAllText does not create the parent directory, so make sure .locks exists
+# (the very first run can happen before -- or without -- the installer's
+# .locks dir); otherwise the state file is never written and consecutive_ok /
+# last_ok / last_fail stay empty forever.
 try {
+    $stateDir = Split-Path $StatePath -Parent
+    if (-not (Test-Path $stateDir)) { New-Item $stateDir -ItemType Directory -Force | Out-Null }
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($StatePath, ($hs | ConvertTo-Json -Depth 4), $utf8NoBom)
 } catch {}
