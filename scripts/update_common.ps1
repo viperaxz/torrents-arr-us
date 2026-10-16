@@ -418,7 +418,12 @@ function Swap-AppDirectoryWithRollback {
         [Parameter(Mandatory = $true)][string]$InstallDir,
         [Parameter(Mandatory = $true)][string]$ZipPath,
         [string[]]$ServiceNames,
-        [int]$HealthSeconds = 10
+        [int]$HealthSeconds = 10,
+        # Optional readiness probe.  Without one the helper can only observe the
+        # service, which is not proof the app answers requests (see the health
+        # gate below).  Callers that know their endpoint should pass it.
+        [string]$HealthUrl = "",
+        [int]$HealthPort = 0
     )
     $appBinDir = Join-Path $InstallDir $AppName
     $appBinBak = "$appBinDir.bak"
@@ -457,14 +462,91 @@ function Swap-AppDirectoryWithRollback {
         foreach ($svcName in $ServiceNames) {
             Start-Service -Name $svcName -ErrorAction SilentlyContinue
         }
-        Start-Sleep -Seconds $HealthSeconds
 
-        $healthy = $true
-        foreach ($svcName in $ServiceNames) {
-            $svcAfter = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if (-not $svcAfter -or $svcAfter.Status -ne "Running") { $healthy = $false }
+        # -- Health gate -------------------------------------------------------
+        # A service-state check alone is NOT a health check.  Every NSSM service
+        # here is installed with "AppExit Default Restart", so a build that
+        # crashes on startup is restarted immediately and the service keeps
+        # reporting Running -- the crash loop was previously recorded as a
+        # successful update.  Preference order:
+        #   1. an explicit -HealthUrl polled for a 2xx/3xx,
+        #   2. a -HealthPort TCP connect poll,
+        #   3. a restart-detection fallback for callers that pass neither:
+        #      sample the service's process id twice and treat a change as a
+        #      restart, i.e. a crash loop.
+        # $HealthSeconds is the overall budget for whichever gate applies.
+        $healthOk    = $false
+        $healthNote  = ""
+        $deadline    = (Get-Date).AddSeconds($HealthSeconds)
+
+        if ($HealthUrl) {
+            Write-UcLog "INFO" "Health gate: GET $HealthUrl (budget ${HealthSeconds}s)"
+            while (-not $healthOk -and (Get-Date) -lt $deadline) {
+                try {
+                    $resp = Invoke-WebRequest -Uri $HealthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                    if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) { $healthOk = $true }
+                    else { $healthNote = "HTTP $($resp.StatusCode) from $HealthUrl"; Start-Sleep -Seconds 2 }
+                } catch {
+                    $healthNote = "no response from $HealthUrl ($($_.Exception.Message))"
+                    Start-Sleep -Seconds 2
+                }
+            }
+        } elseif ($HealthPort -gt 0) {
+            Write-UcLog "INFO" "Health gate: TCP 127.0.0.1:$HealthPort (budget ${HealthSeconds}s)"
+            while (-not $healthOk -and (Get-Date) -lt $deadline) {
+                try {
+                    $client = New-Object System.Net.Sockets.TcpClient
+                    $async  = $client.BeginConnect("127.0.0.1", $HealthPort, $null, $null)
+                    if ($async.AsyncWaitHandle.WaitOne(1500) -and $client.Connected) {
+                        $client.EndConnect($async); $client.Close(); $healthOk = $true
+                    } else {
+                        $client.Close(); $healthNote = "port $HealthPort not accepting connections"
+                        Start-Sleep -Seconds 2
+                    }
+                } catch {
+                    $healthNote = "port $HealthPort not accepting connections ($($_.Exception.Message))"
+                    Start-Sleep -Seconds 2
+                }
+            }
+        } else {
+            # No endpoint supplied: prove the processes are still the same ones.
+            # NOTE: $pid is a PowerShell automatic variable -- never use it here.
+            $settleSeconds = [Math]::Max(1, [Math]::Min(5, [int]($HealthSeconds / 2)))
+            Start-Sleep -Seconds $settleSeconds
+            $firstProcId = @{}
+            foreach ($svcName in $ServiceNames) {
+                $svcAfter = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                if (-not $svcAfter -or $svcAfter.Status -ne "Running") {
+                    $healthNote = "$svcName is not Running"
+                    continue
+                }
+                $firstProcId[$svcName] = (Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue).ProcessId
+            }
+            if (-not $healthNote) {
+                Start-Sleep -Seconds $settleSeconds
+                foreach ($svcName in $ServiceNames) {
+                    $svcAfter = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+                    if (-not $svcAfter -or $svcAfter.Status -ne "Running") {
+                        $healthNote = "$svcName is not Running"
+                        continue
+                    }
+                    $nowProcId = (Get-CimInstance Win32_Service -Filter "Name='$svcName'" -ErrorAction SilentlyContinue).ProcessId
+                    if ($firstProcId[$svcName] -and $nowProcId -and $firstProcId[$svcName] -ne $nowProcId) {
+                        $healthNote = "$svcName restarted during the health window (process id changed $($firstProcId[$svcName]) -> $nowProcId): the new build is likely crash-looping"
+                    }
+                }
+                if (-not $healthNote) {
+                    if ($firstProcId.Count -eq 0) {
+                        # Could not read process ids (older WMI/permissions): fall
+                        # back to the service state, which is all we have.
+                        $healthNote = ""
+                    }
+                    $healthOk = $true
+                }
+            }
         }
-        if (-not $healthy) { throw "health check failed: one or more services not Running" }
+
+        if (-not $healthOk) { throw "health check failed: $healthNote" }
 
         if ($hadExisting -and (Test-Path $appBinBak)) { Remove-Item $appBinBak -Recurse -Force }
         $result.Detail = "binary swap complete"
