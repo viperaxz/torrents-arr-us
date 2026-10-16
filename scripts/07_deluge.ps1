@@ -60,15 +60,46 @@ Write-DebugLog "INFO" "=== Installing $AppName ==="
 
 # -- 1. Install Deluge via Chocolatey (version-pinned when versions.json present) -
 $PinnedVersion = if ($Config._Versions -and $Config._Versions.Apps.Deluge) { $Config._Versions.Apps.Deluge.version } else { $null }
+# "latest"/"unknown" are manifest sentinels, not package versions: choco rejects
+# them, so install the current release instead of failing the step.
+if ($PinnedVersion -and ($PinnedVersion -ieq "latest" -or $PinnedVersion -ieq "unknown")) {
+    Write-DebugLog "WARN" "Ignoring non-version manifest pin for Deluge: '$PinnedVersion'"
+    $PinnedVersion = $null
+}
+
+function Get-InstalledChocoVersion {
+    # Reads what Chocolatey reports for a package.
+    # Returns: "<version>" | "unknown" (listed but unparseable) | $null (absent)
+    param([Parameter(Mandatory=$true)][string]$Package)
+    $savedEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $listOutput = choco list --exact $Package -r 2>$null
+    } finally {
+        $ErrorActionPreference = $savedEAP
+    }
+    Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
+    if ([string]::IsNullOrWhiteSpace($listOutput)) { return $null }
+    $parts = ([string]($listOutput | Select-Object -First 1)) -split '\|'
+    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
+    return "unknown"
+}
+
 Write-DebugLog "VAR PinnedVersion=$PinnedVersion"
 
-$installed = choco list --exact deluge -r 2>$null
-Write-DebugLog "VAR choco deluge output=$installed"
-if ([string]::IsNullOrWhiteSpace($installed)) {
+if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+    Write-Warning "[$AppName] Chocolatey is not available (00_prerequisites.ps1 installs it). Cannot install Deluge."
+    Write-DebugLog "ERROR" "choco not found in PATH; aborting Deluge install"
+    exit 1
+}
+
+$installedVersion = Get-InstalledChocoVersion -Package "deluge"
+if (-not $installedVersion) {
     $displayVer = if ($PinnedVersion) { " $PinnedVersion" } else { "" }
     Write-Host "  -> Installing Deluge$displayVer via Chocolatey..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Installing Deluge via choco..."
     $savedEAP = $ErrorActionPreference
+    $global:LASTEXITCODE = 0
     try {
         $ErrorActionPreference = "Continue"
         if ($PinnedVersion) {
@@ -76,19 +107,36 @@ if ([string]::IsNullOrWhiteSpace($installed)) {
         } else {
             choco install deluge -y --no-progress | Out-Null
         }
+    } catch {
+        Write-DebugLog "WARN" "choco install deluge could not run: $_"
     } finally {
         $ErrorActionPreference = $savedEAP
     }
     Write-DebugLog "INFO" "choco install deluge exit=$LASTEXITCODE"
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[$AppName] choco install deluge returned exit code $LASTEXITCODE. Attempting to continue..."
+        Write-Warning "[$AppName] choco install deluge returned exit code $LASTEXITCODE. Checking whether the package landed anyway..."
         Write-DebugLog "WARN" "choco install deluge non-zero exit: $LASTEXITCODE"
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     Write-DebugLog "INFO" "PATH refreshed after deluge install"
+    # The exit code alone is not authoritative (choco returns non-zero for warnings
+    # such as a pending reboot): ask Chocolatey what is installed now.
+    $installedVersion = Get-InstalledChocoVersion -Package "deluge"
 } else {
-    Write-Host "  -> Deluge already installed via Chocolatey." -ForegroundColor Green
-    Write-DebugLog "INFO" "Deluge already installed: $installed"
+    Write-Host "  -> Deluge already installed via Chocolatey (version $installedVersion)." -ForegroundColor Green
+    Write-DebugLog "INFO" "Deluge already installed: $installedVersion"
+}
+
+if (-not $installedVersion) {
+    # Writing the lock file and the ledger entry after a failed install would make every
+    # later run report "Already installed. Skipping." (a stale deluge.exe on the box makes
+    # this reachable even when the package is gone) and would tell the updater that the
+    # manifest pin is installed, so a transient choco/network failure could never be
+    # retried. Leave both untouched and fail the step so master_install.ps1 logs Deluge as
+    # failed and a re-run installs it.
+    Write-Warning "[$AppName] No Deluge Chocolatey package is present after the install attempt. Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "deluge package absent after install attempt; lock file not written"
+    exit 1
 }
 
 # Find deluged.exe and deluge-web.exe
@@ -129,6 +177,16 @@ if (-not (Test-Path $DataDir)) {
     Write-DebugLog "INFO" "Created $DataDir"
 }
 Grant-SeedboxDirAccess -Path $DataDir -Username $SvcUser
+
+# The daemon runs as $SvcUser and writes every download into Paths.Downloads, but
+# master_install only creates that directory -- it never grants the service account
+# access, so this relies on the drive's inherited ACL.  Grant it explicitly.
+if ($dlPath) {
+    Grant-SeedboxDirAccess -Path $dlPath -Username $SvcUser
+} else {
+    Write-Warning "[$AppName] Paths.Downloads is not set in config.json -- download location ACL not configured."
+    Write-DebugLog "WARN" "Paths.Downloads empty -- skipped ACL grant for download location"
+}
 
 # -- 2b. Restore Deluge state from previous install ---------------------------
 $DelugeBackupDir = Join-Path $env:LOCALAPPDATA "win-seedbox\deluge-state-backup"
@@ -257,10 +315,15 @@ if (-not (Test-Path $WebConf)) {
     $webHash = [System.BitConverter]::ToString($sha1.ComputeHash($hashInput)) -replace '-', ''
     $webHash = $webHash.ToLower()
 
+    # "interface" is pinned to loopback on purpose: Deluge's own default is 0.0.0.0,
+    # which would expose the Web UI (plain HTTP, direct JSON-RPC, no Caddy basicauth
+    # in front of it) to the whole LAN.  Caddy, Sonarr and Radarr all talk to it
+    # over 127.0.0.1.
     $webJson = @"
 {"file": 1, "format": 1}
 {
     "port": $WebPort,
+    "interface": "127.0.0.1",
     "enabled": true,
     "allow_remote": false,
     "first_login": false,
@@ -271,8 +334,8 @@ if (-not (Test-Path $WebConf)) {
 }
 "@
     [System.IO.File]::WriteAllText($WebConf, $webJson, (New-Object System.Text.UTF8Encoding($false)))
-    Write-Host "  -> web.conf written (Web UI password pre-configured)" -ForegroundColor Green
-    Write-DebugLog "INFO" "web.conf written. port=$WebPort, first_login=false, password pre-set"
+    Write-Host "  -> web.conf written (Web UI password pre-configured, loopback-only)" -ForegroundColor Green
+    Write-DebugLog "INFO" "web.conf written. port=$WebPort interface=127.0.0.1, first_login=false, password pre-set"
 } else {
     Write-DebugLog "INFO" "web.conf already exists at $WebConf -- not overwritten"
 }
@@ -336,12 +399,30 @@ Write-Host "   -> IMPORTANT: Forward TCP+UDP port $BTPort on your router for opt
 
 # -- Fix Web UI: Chocolatey Deluge package only ships deluge-all-debug.js,
 #    causing the Web UI to start in debug mode and fail to display torrents.
-$webJsDir = Join-Path (Split-Path $delugeWebPath) "deluge\ui\web\js"
-$debugJs  = Join-Path $webJsDir "deluge-all-debug.js"
-$normalJs = Join-Path $webJsDir "deluge-all.js"
-if ((Test-Path $debugJs) -and -not (Test-Path $normalJs)) {
-    Copy-Item $debugJs $normalJs -Force
-    Write-DebugLog "INFO" "Deluge Web UI: copied deluge-all-debug.js -> deluge-all.js to fix debug mode"
+if ($delugeWebPath) {
+    $webJsDir = Join-Path (Split-Path $delugeWebPath) "deluge\ui\web\js"
+    # A Chocolatey shim is resolved from chocolatey\bin, where no js tree exists --
+    # fall back to the real Deluge install directory in that case.
+    if (-not (Test-Path (Join-Path $webJsDir "deluge-all-debug.js"))) {
+        $delugeInstallRoot = Get-ChildItem "C:\Program Files" -Directory -Filter "Deluge*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($delugeInstallRoot) {
+            $foundJs = Get-ChildItem $delugeInstallRoot.FullName -Filter "deluge-all-debug.js" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($foundJs) {
+                $webJsDir = $foundJs.DirectoryName
+                Write-DebugLog "INFO" "Deluge Web UI js directory resolved to $webJsDir"
+            }
+        }
+    }
+    $debugJs  = Join-Path $webJsDir "deluge-all-debug.js"
+    $normalJs = Join-Path $webJsDir "deluge-all.js"
+    if ((Test-Path $debugJs) -and -not (Test-Path $normalJs)) {
+        Copy-Item $debugJs $normalJs -Force
+        Write-DebugLog "INFO" "Deluge Web UI: copied deluge-all-debug.js -> deluge-all.js to fix debug mode"
+    } elseif (-not (Test-Path $debugJs)) {
+        Write-DebugLog "WARN" "Deluge Web UI js directory not found (looked in $webJsDir) -- debug-mode fix not applied"
+    }
+} else {
+    Write-DebugLog "WARN" "deluge-web.exe path unknown -- skipping Web UI debug-mode fix"
 }
 
 # -- 7. Start + verify Daemon --------------------------------------------------
@@ -376,7 +457,10 @@ if ($delugeWebPath) {
     }
 }
 
-$LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
+# Record what Chocolatey reports as installed, not the manifest pin: a machine that
+# already carried a different Deluge build must show up as "update available" in the
+# updater instead of being compared pin-vs-pin and reported as current.
+$LockVersion = $installedVersion
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 

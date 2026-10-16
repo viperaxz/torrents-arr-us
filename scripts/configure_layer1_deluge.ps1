@@ -125,7 +125,10 @@ if ($webSvc) {
     if ($webUp) {
         Write-Host "  -> Web UI OK" -ForegroundColor Green
 
-        # Set default_daemon so the Web UI auto-connects without showing Connection Manager.
+        # Set default_daemon so the Web UI auto-connects without showing the Connection Manager.
+        # Deluge only reads this key when deluge-web starts, so the service is restarted
+        # below whenever the value changes -- a running instance would otherwise ignore the
+        # edit and could even overwrite it (it keeps web.conf in memory and re-saves it).
         $HostlistConf = Join-Path $InstallDir "Deluge-data\hostlist.conf"
         $WebConf      = Join-Path $InstallDir "Deluge-data\web.conf"
         Write-DebugLog "VAR HostlistConf=$HostlistConf (exists=$(Test-Path $HostlistConf))"
@@ -144,17 +147,77 @@ if ($webSvc) {
                         $hostId = $hl.hosts[0][0]
                         Write-DebugLog "VAR hostId=$hostId"
                         if ($hostId) {
-                            $wc = Get-Content $WebConf -Raw -Encoding UTF8
-                            $wc = $wc -replace '"default_daemon":\s*"[^"]*"', ('"default_daemon": "' + $hostId + '"')
-                            [System.IO.File]::WriteAllText($WebConf, $wc, (New-Object System.Text.UTF8Encoding($false)))
-                            Write-Host "  -> Auto-connect to daemon configured (hostId=$hostId)" -ForegroundColor Green
-                            Write-DebugLog "INFO" "default_daemon set to $hostId in $WebConf"
+                            $wcRaw = [System.IO.File]::ReadAllText($WebConf, [System.Text.Encoding]::UTF8).TrimStart([char]0xFEFF)
+                            # Layout is '<header json><body json>'. Deluge writes both objects with
+                            # no separator; 07_deluge.ps1 writes a newline between them. Split after
+                            # the header's closing brace, which is the first '}' in the file.
+                            $wcSplit = $wcRaw.IndexOf('}')
+                            $wcBodyText = if ($wcSplit -ge 0) { $wcRaw.Substring($wcSplit + 1).Trim() } else { '' }
+                            if (-not $wcBodyText -or -not $wcBodyText.StartsWith('{')) {
+                                Write-Warning "[$AppName] Unexpected web.conf layout -- default_daemon not written."
+                                Write-DebugLog "WARN" "web.conf header/body split failed (len=$($wcRaw.Length))"
+                            } else {
+                                $wcHeader = $wcRaw.Substring(0, $wcSplit + 1)
+                                $wcBody   = $wcBodyText | ConvertFrom-Json
+                                $webConfChanged = $false
+
+                                # Keep the Web UI loopback-only: Deluge's own default interface is
+                                # 0.0.0.0, which would expose it to the whole LAN.
+                                if (-not $wcBody.PSObject.Properties['interface'] -or [string]$wcBody.interface -ne '127.0.0.1') {
+                                    if ($wcBody.PSObject.Properties['interface']) {
+                                        $wcBody.interface = '127.0.0.1'
+                                    } else {
+                                        $wcBody | Add-Member -MemberType NoteProperty -Name 'interface' -Value '127.0.0.1'
+                                    }
+                                    $webConfChanged = $true
+                                    Write-Host "  -> Web UI bound to loopback only (interface=127.0.0.1)" -ForegroundColor Green
+                                    Write-DebugLog "INFO" "web.conf interface set to 127.0.0.1"
+                                }
+
+                                # default_daemon lets the Web UI connect without the Connection Manager.
+                                $currentDaemon = if ($wcBody.PSObject.Properties['default_daemon']) { [string]$wcBody.default_daemon } else { '' }
+                                if ($currentDaemon -ne $hostId) {
+                                    if ($wcBody.PSObject.Properties['default_daemon']) {
+                                        $wcBody.default_daemon = $hostId
+                                    } else {
+                                        $wcBody | Add-Member -MemberType NoteProperty -Name 'default_daemon' -Value $hostId
+                                    }
+                                    $webConfChanged = $true
+                                    Write-Host "  -> Auto-connect to daemon configured (hostId=$hostId)" -ForegroundColor Green
+                                    Write-DebugLog "INFO" "default_daemon set to $hostId in $WebConf"
+                                }
+
+                                if (-not $webConfChanged) {
+                                    Write-Host "  -> Web UI config already up to date" -ForegroundColor Green
+                                    Write-DebugLog "INFO" "web.conf already loopback-only with default_daemon=$hostId"
+                                } else {
+                                    [System.IO.File]::WriteAllText($WebConf, ($wcHeader + ($wcBody | ConvertTo-Json -Depth 10)), (New-Object System.Text.UTF8Encoding($false)))
+                                    Write-DebugLog "INFO" "web.conf updated -- restarting DelugeWeb so Deluge re-reads it"
+
+                                    Restart-Service -Name "DelugeWeb" -Force -ErrorAction SilentlyContinue
+                                    $webBack = $false
+                                    $deadline = (Get-Date).AddSeconds(20)
+                                    while (-not $webBack -and (Get-Date) -lt $deadline) {
+                                        try {
+                                            $probe = Invoke-WebRequest -Uri $webUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                                            if ($probe.StatusCode -eq 200) { $webBack = $true }
+                                        } catch { }
+                                        if (-not $webBack) { Start-Sleep -Seconds 2 }
+                                    }
+                                    Write-DebugLog "VAR DelugeWeb restarted for web.conf change; web UI back=$webBack"
+                                    if (-not $webBack) {
+                                        Write-Warning "[$AppName] Web UI did not come back within 20s after restarting DelugeWeb."
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             } catch {
-                Write-DebugLog "WARN" "Could not set default_daemon: $_"
+                Write-DebugLog "WARN" "Could not update Deluge Web UI config: $_"
             }
+        } else {
+            Write-DebugLog "WARN" "hostlist.conf not found yet ($HostlistConf) -- auto-connect not configured"
         }
     } else {
         Write-Warning "[$AppName] Web UI not responding after 15s."
@@ -168,10 +231,12 @@ Write-Host "  [$AppName] Sonarr / Radarr download client settings:" -ForegroundC
 Write-Host "    Name     : Deluge"                                   -ForegroundColor Cyan
 Write-Host "    Type     : Deluge"                                   -ForegroundColor Cyan
 Write-Host "    Host     : 127.0.0.1"                               -ForegroundColor Cyan
-Write-Host "    Port     : $DaemonPort"                              -ForegroundColor Cyan
+# Sonarr/Radarr drive Deluge through its Web UI JSON-RPC endpoint (POST /json on the
+# web port) -- the daemon port speaks RenCode, which *arr cannot speak.
+Write-Host "    Port     : $WebPort"                                 -ForegroundColor Cyan
 Write-Host "    Password : (from secrets\deluge_auth.txt)"           -ForegroundColor Cyan
 Write-Host ""
-Write-DebugLog "INFO" "Deluge download client info: host=127.0.0.1 port=$DaemonPort password=[REDACTED]"
+Write-DebugLog "INFO" "Deluge download client info: host=127.0.0.1 port=$WebPort webUI-JSON-RPC password=[REDACTED]"
 
 # -- 5. Print Web UI URL -------------------------------------------------------
 if ($DomainMode -eq "cloudflare") {
