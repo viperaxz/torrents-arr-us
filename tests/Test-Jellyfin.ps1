@@ -5,7 +5,17 @@ param([int]$LayerFilter = 0)
 $svc  = 'Jellyfin'
 $port = $Config.Ports.Jellyfin
 $base = Get-AppUrlBase 'jellyfin' $Config.General.DomainMode
-$log  = 'C:\ProgramData\Jellyfin\Server\logs\jellyfin.log'
+# Jellyfin's log directory is <Server>\log (singular). Its default Serilog file sink is
+# date-rolled (log_YYYYMMDD.log); the Alloy/Grafana override switches it to a fixed
+# jellyfin.log. Resolve whichever exists, newest first.
+$logDir = 'C:\ProgramData\Jellyfin\Server\log'
+$log    = $null
+foreach ($logPattern in @('jellyfin.log', 'log_*.log')) {
+    $candidate = Get-ChildItem -Path $logDir -Filter $logPattern -File -ErrorAction SilentlyContinue |
+                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($candidate) { $log = $candidate.FullName; break }
+}
+if (-not $log) { $log = Join-Path $logDir 'jellyfin.log' }
 
 # -- Layer 1: Health -----------------------------------------------------------
 if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
@@ -15,17 +25,22 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     $portOk = Test-TcpPort $port
     $Script:Results.Add((New-TestResult $svc 1 'PortOpen' $(if ($portOk) { 'PASS' } else { 'FAIL' }) "TCP :$port"))
 
-    $info = Invoke-ApiCheck "http://127.0.0.1:$port/System/Info/Public" -TimeoutSec 8
+    $info = Invoke-ApiCheck "http://127.0.0.1:$port${base}/System/Info/Public" -TimeoutSec 8
     $Script:Results.Add((New-TestResult $svc 1 'InfoPublic' $(if ($info.ok) { 'PASS' } else { 'FAIL' }) $info.error $info.latency_ms))
 
     if ($info.ok) {
         $Script:Results.Add((New-TestResult $svc 1 'ServerName' 'PASS' "ProductName=$($info.data.ProductName) Version=$($info.data.Version)"))
     }
 
-    $nssm = Get-Service 'JellyfinServer' -ErrorAction SilentlyContinue
-    $Script:Results.Add((New-TestResult $svc 1 'ServiceRunning' $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) 'NSSM service state'))
+    # Chocolatey may register the service as JellyfinServer, jellyfin or Jellyfin
+    $nssm = $null
+    foreach ($candidate in @('JellyfinServer', 'jellyfin', 'Jellyfin')) {
+        $nssm = Get-Service $candidate -ErrorAction SilentlyContinue
+        if ($nssm) { break }
+    }
+    $Script:Results.Add((New-TestResult $svc 1 'ServiceRunning' $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) 'Service state'))
 
-    Get-LogValidationResult $svc 1 $log $pos '' $t0 $Script:LokiEnabled
+    Get-LogValidationResult $svc 1 $log $pos 'jellyfin' $t0 $Script:LokiEnabled
 }
 
 # -- Layer 2: Libraries and users match config ----------------------------------

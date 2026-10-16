@@ -214,7 +214,10 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
             if ($disableVideo) {
                 $libOptions['EnableChapterImageExtraction']          = $false
                 $libOptions['ExtractChapterImagesDuringLibraryScan'] = $false
-                $libOptions['EnableTrickplay']                       = $false
+                # Jellyfin 10.9+ exposes trickplay per library; 'EnableTrickplay' is not a
+                # LibraryOptions property and is silently dropped by the JSON binder.
+                $libOptions['EnableTrickplayImageExtraction']        = $false
+                $libOptions['ExtractTrickplayImagesDuringLibraryScan'] = $false
             }
 
             # Build TypeOptions only when metadata or image fetchers need disabling
@@ -536,8 +539,14 @@ if ($OsUser -and $OsPass) {
             Write-Warning "     OpenSubtitles plugin not found in loaded plugins list  --  may need a manual Jellyfin restart."
             Write-DebugLog "WARN" "OpenSubtitles plugin not in loaded plugins list"
         } else {
-            $rawId   = $osPlugin.Id
-            $pluginGuid = "$($rawId.Substring(0,8))-$($rawId.Substring(8,4))-$($rawId.Substring(12,4))-$($rawId.Substring(16,4))-$($rawId.Substring(20,12))"
+            # Jellyfin returns the plugin id as a 32-char hex string on some builds and
+            # as a dashed Guid on others -- normalise before re-inserting the dashes.
+            $rawId = "$($osPlugin.Id)".Replace("-", "")
+            $pluginGuid = if ($rawId.Length -eq 32) {
+                "$($rawId.Substring(0,8))-$($rawId.Substring(8,4))-$($rawId.Substring(12,4))-$($rawId.Substring(16,4))-$($rawId.Substring(20,12))"
+            } else {
+                "$($osPlugin.Id)"
+            }
             Write-DebugLog "VAR pluginGuid=$pluginGuid"
 
             # GET current config; if the plugin hasn't written its config file yet (404), start empty

@@ -155,12 +155,14 @@ $UserAuth = @{"X-MediaBrowser-Token" = $authResp.AccessToken; "Authorization" = 
 Write-Host "  -> Applying transcoding profile '$GPU'..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Fetching current encoding config from Jellyfin..."
 $encodingPayload = @{}
+$configFetched = $true
 try {
     $current = Invoke-RestMethod -Uri "$ApiBase/System/Configuration/encoding" `
         -Headers $UserAuth -UseBasicParsing -ErrorAction Stop
     $current.PSObject.Properties | ForEach-Object { $encodingPayload[$_.Name] = $_.Value }
     Write-DebugLog "VAR current encoding config keys=$($encodingPayload.Keys.Count) HardwareAccelerationType=$($encodingPayload['HardwareAccelerationType'])"
 } catch {
+    $configFetched = $false
     Write-Warning "     Could not fetch current encoding config; applying profile on blank base: $_"
     Write-DebugLog "WARN" "Could not fetch current encoding config: $_"
 }
@@ -168,7 +170,10 @@ try {
 $mergedKeys = @()
 foreach ($prop in $gpuProfile.PSObject.Properties) {
     if ($prop.Name -in $metadataFields) { continue }
-    if ($encodingPayload.ContainsKey($prop.Name)) {
+    # Normally only keys the running Jellyfin build reports are merged, so an
+    # unknown/renamed field is never invented. If the fetch failed the profile is
+    # the only source of truth left, so every profile key is applied to the blank base.
+    if (-not $configFetched -or $encodingPayload.ContainsKey($prop.Name)) {
         $before = $encodingPayload[$prop.Name]
         $encodingPayload[$prop.Name] = $prop.Value
         $mergedKeys += $prop.Name

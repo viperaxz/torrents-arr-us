@@ -40,16 +40,41 @@ Write-DebugLog "INFO" "=== Installing Jellyfin ==="
 
 # 1. Install via Chocolatey (version-pinned when versions.json is present)
 $PinnedVersion = if ($Config._Versions -and $Config._Versions.Apps.Jellyfin) { $Config._Versions.Apps.Jellyfin.version } else { $null }
+# "latest"/"unknown" are manifest sentinels, not package versions: choco rejects
+# them, so install the current release instead of failing the step.
+if ($PinnedVersion -and ($PinnedVersion -ieq "latest" -or $PinnedVersion -ieq "unknown")) {
+    Write-DebugLog "WARN" "Ignoring non-version manifest pin for Jellyfin: '$PinnedVersion'"
+    $PinnedVersion = $null
+}
+
+function Get-InstalledChocoVersion {
+    # Reads what Chocolatey reports for a package.
+    # Returns: "<version>" | "unknown" (listed but unparseable) | $null (absent)
+    param([Parameter(Mandatory=$true)][string]$Package)
+    $savedEAP = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $listOutput = choco list --exact $Package -r 2>$null
+    } finally {
+        $ErrorActionPreference = $savedEAP
+    }
+    Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
+    if ([string]::IsNullOrWhiteSpace($listOutput)) { return $null }
+    $parts = ([string]($listOutput | Select-Object -First 1)) -split '\|'
+    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
+    return "unknown"
+}
+
 Write-DebugLog "VAR PinnedVersion=$PinnedVersion"
 Write-Host "  -> Installing Jellyfin via Chocolatey$(if ($PinnedVersion) { " $PinnedVersion" })..." -ForegroundColor Yellow
-$installed = choco list --exact jellyfin -r 2>$null
-Write-DebugLog "VAR choco jellyfin output=$installed"
-if ([string]::IsNullOrWhiteSpace($installed)) {
+$installedVersion = Get-InstalledChocoVersion -Package "jellyfin"
+if (-not $installedVersion) {
     Write-DebugLog "INFO" "Jellyfin not installed. Running choco install..."
     # EAP is "Stop" here (inherited from master_install.ps1) and choco writes
     # warnings (pending reboot, deprecation notices) to stderr on otherwise
     # successful installs -- which would abort this FATAL script.
     $savedEAP = $ErrorActionPreference
+    $global:LASTEXITCODE = 0
     try {
         $ErrorActionPreference = "Continue"
         if ($PinnedVersion) {
@@ -57,17 +82,22 @@ if ([string]::IsNullOrWhiteSpace($installed)) {
         } else {
             choco install jellyfin -y --no-progress | Out-Null
         }
+    } catch {
+        Write-DebugLog "WARN" "choco install jellyfin could not run: $_"
     } finally {
         $ErrorActionPreference = $savedEAP
     }
     Write-DebugLog "INFO" "choco install jellyfin exit=$LASTEXITCODE"
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[Jellyfin] choco install jellyfin returned exit code $LASTEXITCODE. Attempting to continue..."
+        Write-Warning "[Jellyfin] choco install jellyfin returned exit code $LASTEXITCODE. Checking whether the package landed anyway..."
         Write-DebugLog "WARN" "choco install jellyfin non-zero exit: $LASTEXITCODE"
     }
+    # The exit code alone is not authoritative (choco returns non-zero for warnings
+    # such as a pending reboot): ask Chocolatey what is installed now.
+    $installedVersion = Get-InstalledChocoVersion -Package "jellyfin"
 } else {
-    Write-Host "  -> Jellyfin already installed via Chocolatey." -ForegroundColor Green
-    Write-DebugLog "INFO" "Jellyfin already installed: $installed"
+    Write-Host "  -> Jellyfin already installed via Chocolatey (version $installedVersion)." -ForegroundColor Green
+    Write-DebugLog "INFO" "Jellyfin already installed: $installedVersion"
     # Service may have been deleted without uninstalling the package; force reinstall to re-register it
     $hasService = $false
     foreach ($c in @("JellyfinServer","jellyfin","Jellyfin")) {
@@ -79,6 +109,7 @@ if ([string]::IsNullOrWhiteSpace($installed)) {
         Write-DebugLog "WARN" "Jellyfin service not found after install. Force-reinstalling..."
         # EAP is "Stop" here; choco stderr warnings must not abort this.
         $savedEAP = $ErrorActionPreference
+        $global:LASTEXITCODE = 0
         try {
             $ErrorActionPreference = "Continue"
             if ($PinnedVersion) {
@@ -86,6 +117,8 @@ if ([string]::IsNullOrWhiteSpace($installed)) {
             } else {
                 choco install jellyfin -y --no-progress --force | Out-Null
             }
+        } catch {
+            Write-DebugLog "WARN" "choco force reinstall jellyfin could not run: $_"
         } finally {
             $ErrorActionPreference = $savedEAP
         }
@@ -94,7 +127,21 @@ if ([string]::IsNullOrWhiteSpace($installed)) {
             Write-Warning "[Jellyfin] choco force reinstall jellyfin returned exit code $LASTEXITCODE."
             Write-DebugLog "WARN" "choco force reinstall jellyfin non-zero exit: $LASTEXITCODE"
         }
+        # A force reinstall can register a different build (e.g. the pin is on the
+        # feed now), so re-read what landed.
+        $installedVersion = Get-InstalledChocoVersion -Package "jellyfin"
     }
+}
+
+if (-not $installedVersion) {
+    # Writing the lock file and the ledger entry after a failed install would make
+    # every later run report "Already installed. Skipping." and would tell the
+    # updater that the manifest pin is installed, so a transient choco/network
+    # failure could never be retried. Leave both untouched and fail the step so
+    # master_install.ps1 records Jellyfin as failed and a re-run installs it.
+    Write-Warning "[Jellyfin] No Jellyfin Chocolatey package is present after the install attempt (choco unavailable or the install failed). Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "Jellyfin package absent after install attempt; lock file and ledger entry not written"
+    exit 1
 }
 
 # 2. Find service  --  Chocolatey may register it as "JellyfinServer" or "jellyfin"
@@ -201,9 +248,37 @@ if (Test-Path $NetworkConfig) {
             $xml.NetworkConfiguration.AppendChild($node) | Out-Null
         }
 
-        $xml.Save($NetworkConfig)
-        Write-Host "  -> BaseUrl='$targetBase', RequireHttps=false set." -ForegroundColor Green
-        Write-DebugLog "INFO" "network.xml updated. BaseUrl='$targetBase' RequireHttps=false"
+        # Port  --  network.xml may predate this install: Chocolatey starts the service
+        # once, so Jellyfin creates the file with its default port before this script
+        # runs. Caddy, the firewall rule and every API call use Config.Ports.Jellyfin,
+        # so a stale port here silently breaks the whole reverse-proxy path.
+        $targetPort = "$($Config.Ports.Jellyfin)"
+        $beforePort = "$($xml.NetworkConfiguration.InternalHttpPort)"
+        if ($null -ne $xml.NetworkConfiguration.InternalHttpPort) {
+            if ($beforePort -ne $targetPort) {
+                $xml.NetworkConfiguration.InternalHttpPort = $targetPort
+                Write-DebugLog "INFO" "network.xml InternalHttpPort '$beforePort' -> '$targetPort'"
+            }
+        } else {
+            $portNode = $xml.CreateElement("InternalHttpPort")
+            $portNode.InnerText = $targetPort
+            $xml.NetworkConfiguration.AppendChild($portNode) | Out-Null
+            Write-DebugLog "INFO" "network.xml InternalHttpPort added ($targetPort)"
+        }
+
+        # BOM-free: XmlDocument.Save() always emits EF BB BF, and the project
+        # convention is to never write a BOM from installer-generated files.
+        $xmlWriterSettings = New-Object System.Xml.XmlWriterSettings
+        $xmlWriterSettings.Indent = $true
+        $xmlWriterSettings.Encoding = New-Object System.Text.UTF8Encoding($false)
+        $xmlWriter = [System.Xml.XmlWriter]::Create($NetworkConfig, $xmlWriterSettings)
+        try {
+            $xml.Save($xmlWriter)
+        } finally {
+            $xmlWriter.Dispose()
+        }
+        Write-Host "  -> BaseUrl='$targetBase', port=$targetPort, RequireHttps=false set." -ForegroundColor Green
+        Write-DebugLog "INFO" "network.xml updated. BaseUrl='$targetBase' InternalHttpPort=$targetPort RequireHttps=false"
     } catch {
         Write-Warning "  -> Could not edit network.xml: $_"
         Write-DebugLog "ERROR" "network.xml edit failed: $_"
@@ -235,7 +310,11 @@ if ($svc.Status -eq "Running") {
     Write-DebugLog "WARN" "Jellyfin status=$($svc.Status)  --  may not have started"
 }
 
-$LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
+# Record what Chocolatey reports as installed, not the manifest pin: a machine that
+# already carried a different build must show up as "update available" in the
+# updater instead of being reported as current. The pin is only used above to decide
+# what to request from choco.
+$LockVersion = $installedVersion
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 
