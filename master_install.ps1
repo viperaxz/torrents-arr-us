@@ -488,4 +488,35 @@ if ($installFailed.Count -gt 0 -or $configFailed.Count -gt 0) {
     Write-Host "=============================================" -ForegroundColor Yellow
 }
 
+# -- Recovery-tool readiness ---------------------------------------------------
+# scripts/security_unban.ps1 is the tool you reach for when you have locked
+# yourself out. Its -Whitelist switch permanently whitelists an address, but it
+# deliberately REFUSES to invent a missing "Security" block (creating one
+# surgically has a far worse failure surface than refusing). An operator would
+# otherwise discover that gap at the worst possible moment, so say it here, at
+# the very end of the install. Detection, enforcement and the blocklists do not
+# depend on this block -- only the -Whitelist path does.
+if (-not $Config.PSObject.Properties['Security']) {
+    Write-Host ""
+    Write-Host "=============================================" -ForegroundColor Yellow
+    Write-Host "  ACTION REQUIRED: config.json has no `"Security`" block" -ForegroundColor Yellow
+    Write-Host "=============================================" -ForegroundColor Yellow
+    Write-Host "  security_unban.ps1 -Whitelist will refuse to run until this exists, so" -ForegroundColor Yellow
+    Write-Host "  you could not permanently whitelist an address that keeps getting banned." -ForegroundColor Yellow
+    Write-Host "  (CrowdSec detection, the firewall bouncer and the abuse blocklists are" -ForegroundColor Yellow
+    Write-Host "  unaffected -- they are running now.)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Add this to config.json:" -ForegroundColor Cyan
+    Write-Host '    "Security": {' -ForegroundColor Cyan
+    Write-Host '      "CrowdSecEnrollKey": "",' -ForegroundColor Cyan
+    Write-Host '      "BanDurationHours": 4,' -ForegroundColor Cyan
+    Write-Host '      "ExtraWhitelistIps": [],' -ForegroundColor Cyan
+    Write-Host '      "AbuseBlocklists": true' -ForegroundColor Cyan
+    Write-Host '    },' -ForegroundColor Cyan
+    Write-Host "  then re-run master_install.ps1 so the whitelist parser is rewritten." -ForegroundColor DarkGray
+    Write-Host "=============================================" -ForegroundColor Yellow
+    Write-DebugLog "WARN" "config.json has no Security block: security_unban.ps1 -Whitelist will refuse to run"
+    Write-Warning "config.json has no Security block -- security_unban.ps1 -Whitelist cannot store a whitelist entry."
+}
+
 Write-DebugLog "INFO" "master_install.ps1 finished. installFailed=$($installFailed.Count) configFailed=$($configFailed.Count)"
