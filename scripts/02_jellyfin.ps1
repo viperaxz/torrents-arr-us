@@ -6,6 +6,8 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "02_jellyfin.ps1 started"
 
 $DomainMode = $Config.General.DomainMode
@@ -51,18 +53,9 @@ function Get-InstalledChocoVersion {
     # Reads what Chocolatey reports for a package.
     # Returns: "<version>" | "unknown" (listed but unparseable) | $null (absent)
     param([Parameter(Mandatory=$true)][string]$Package)
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $listOutput = choco list --exact $Package -r 2>$null
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
+    $listOutput = Get-ChocoInstalledVersion -Package $Package
     Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
-    if ([string]::IsNullOrWhiteSpace($listOutput)) { return $null }
-    $parts = ([string]($listOutput | Select-Object -First 1)) -split '\|'
-    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
-    return "unknown"
+    return $listOutput
 }
 
 Write-DebugLog "VAR PinnedVersion=$PinnedVersion"
@@ -70,27 +63,21 @@ Write-Host "  -> Installing Jellyfin via Chocolatey$(if ($PinnedVersion) { " $Pi
 $installedVersion = Get-InstalledChocoVersion -Package "jellyfin"
 if (-not $installedVersion) {
     Write-DebugLog "INFO" "Jellyfin not installed. Running choco install..."
-    # EAP is "Stop" here (inherited from master_install.ps1) and choco writes
-    # warnings (pending reboot, deprecation notices) to stderr on otherwise
-    # successful installs -- which would abort this FATAL script.
-    $savedEAP = $ErrorActionPreference
-    $global:LASTEXITCODE = 0
-    try {
-        $ErrorActionPreference = "Continue"
-        if ($PinnedVersion) {
-            choco install jellyfin --version $PinnedVersion -y --no-progress | Out-Null
-        } else {
-            choco install jellyfin -y --no-progress | Out-Null
-        }
-    } catch {
-        Write-DebugLog "WARN" "choco install jellyfin could not run: $_"
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
-    Write-DebugLog "INFO" "choco install jellyfin exit=$LASTEXITCODE"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[Jellyfin] choco install jellyfin returned exit code $LASTEXITCODE. Checking whether the package landed anyway..."
-        Write-DebugLog "WARN" "choco install jellyfin non-zero exit: $LASTEXITCODE"
+    # Invoke-Choco never throws and keeps choco's stderr chatter (pending-reboot
+    # and deprecation warnings) from aborting this FATAL script under EAP="Stop".
+    # It also retries the transient feed failures that used to abort the install.
+    $jellyfinArgs = @('install', 'jellyfin')
+    if ($PinnedVersion) { $jellyfinArgs += @('--version', $PinnedVersion) }
+    $jellyfinArgs += @('-y', '--no-progress')
+    $jellyfinInstall = Invoke-Choco -Arguments $jellyfinArgs
+    $jellyfinTail = $jellyfinInstall.Output
+    if ($jellyfinTail -and $jellyfinTail.Length -gt 800) { $jellyfinTail = $jellyfinTail.Substring($jellyfinTail.Length - 800) }
+    Write-DebugLog "INFO" "choco install jellyfin exit=$($jellyfinInstall.ExitCode) attempts=$($jellyfinInstall.Attempts)"
+    if (-not $jellyfinInstall.Ran) {
+        Write-DebugLog "ERROR" "choco install jellyfin: choco.exe not found: $jellyfinTail"
+    } elseif ($jellyfinInstall.ExitCode -ne 0 -or $jellyfinInstall.Transient) {
+        Write-Warning "[Jellyfin] choco install jellyfin returned exit code $($jellyfinInstall.ExitCode). Checking whether the package landed anyway..."
+        Write-DebugLog "WARN" "choco install jellyfin non-zero exit (exit $($jellyfinInstall.ExitCode), transient=$($jellyfinInstall.Transient), attempts=$($jellyfinInstall.Attempts)): $jellyfinTail"
     }
     # The exit code alone is not authoritative (choco returns non-zero for warnings
     # such as a pending reboot): ask Chocolatey what is installed now.
@@ -107,25 +94,19 @@ if (-not $installedVersion) {
     if (-not $hasService) {
         Write-Host "  -> Service not registered; forcing reinstall to re-register..." -ForegroundColor Yellow
         Write-DebugLog "WARN" "Jellyfin service not found after install. Force-reinstalling..."
-        # EAP is "Stop" here; choco stderr warnings must not abort this.
-        $savedEAP = $ErrorActionPreference
-        $global:LASTEXITCODE = 0
-        try {
-            $ErrorActionPreference = "Continue"
-            if ($PinnedVersion) {
-                choco install jellyfin --version $PinnedVersion -y --no-progress --force | Out-Null
-            } else {
-                choco install jellyfin -y --no-progress --force | Out-Null
-            }
-        } catch {
-            Write-DebugLog "WARN" "choco force reinstall jellyfin could not run: $_"
-        } finally {
-            $ErrorActionPreference = $savedEAP
-        }
-        Write-DebugLog "INFO" "choco force reinstall jellyfin exit=$LASTEXITCODE"
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "[Jellyfin] choco force reinstall jellyfin returned exit code $LASTEXITCODE."
-            Write-DebugLog "WARN" "choco force reinstall jellyfin non-zero exit: $LASTEXITCODE"
+        # Invoke-Choco keeps choco stderr warnings from aborting this script.
+        $forceArgs = @('install', 'jellyfin')
+        if ($PinnedVersion) { $forceArgs += @('--version', $PinnedVersion) }
+        $forceArgs += @('-y', '--no-progress', '--force')
+        $jellyfinForce = Invoke-Choco -Arguments $forceArgs
+        $jellyfinForceTail = $jellyfinForce.Output
+        if ($jellyfinForceTail -and $jellyfinForceTail.Length -gt 800) { $jellyfinForceTail = $jellyfinForceTail.Substring($jellyfinForceTail.Length - 800) }
+        Write-DebugLog "INFO" "choco force reinstall jellyfin exit=$($jellyfinForce.ExitCode) attempts=$($jellyfinForce.Attempts)"
+        if (-not $jellyfinForce.Ran) {
+            Write-DebugLog "ERROR" "choco force reinstall jellyfin: choco.exe not found"
+        } elseif ($jellyfinForce.ExitCode -ne 0 -or $jellyfinForce.Transient) {
+            Write-Warning "[Jellyfin] choco force reinstall jellyfin returned exit code $($jellyfinForce.ExitCode)."
+            Write-DebugLog "WARN" "choco force reinstall jellyfin non-zero exit (exit $($jellyfinForce.ExitCode), transient=$($jellyfinForce.Transient), attempts=$($jellyfinForce.Attempts)): $jellyfinForceTail"
         }
         # A force reinstall can register a different build (e.g. the pin is on the
         # feed now), so re-read what landed.

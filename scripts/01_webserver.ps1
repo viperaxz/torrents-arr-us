@@ -6,6 +6,8 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "01_webserver.ps1 started"
 
 $DomainMode    = $Config.General.DomainMode
@@ -202,28 +204,28 @@ $CaddyPinnedVersion = if ($Config._Versions -and $Config._Versions.Apps.Caddy) {
 Write-DebugLog "VAR CaddyPinnedVersion=$CaddyPinnedVersion"
 Write-Host "[WebServer] Installing Caddy$(if ($CaddyPinnedVersion) { " $CaddyPinnedVersion" })..." -ForegroundColor Yellow
 Write-DebugLog "INFO" "=== Checking Caddy installation ==="
-$caddyInstalled = choco list --exact caddy -r 2>$null
+$caddyInstalled = Get-ChocoInstalledVersion -Package "caddy"
 Write-DebugLog "VAR choco caddy output=$caddyInstalled"
 if ([string]::IsNullOrWhiteSpace($caddyInstalled)) {
     Write-DebugLog "INFO" "Caddy not installed. Installing via choco..."
-    # EAP is "Stop" here (inherited from master_install.ps1) and choco writes
-    # warnings (pending reboot, deprecation notices) to stderr on otherwise
-    # successful installs -- which would abort this FATAL script.
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        if ($CaddyPinnedVersion) {
-            choco install caddy --version $CaddyPinnedVersion -y --no-progress | Out-Null
-        } else {
-            choco install caddy -y --no-progress | Out-Null
-        }
-    } finally {
-        $ErrorActionPreference = $savedEAP
+    # Invoke-Choco retries the transient feed failures (503/504/gateway timeout)
+    # that otherwise abort this FATAL script at the most expensive point of the
+    # run, and captures the output so the real reason reaches the debug log.
+    $caddyArgs = @('install', 'caddy')
+    if ($CaddyPinnedVersion) { $caddyArgs += @('--version', $CaddyPinnedVersion) }
+    $caddyArgs += @('-y', '--no-progress')
+    $caddyInstall = Invoke-Choco -Arguments $caddyArgs
+    $caddyTail = $caddyInstall.Output
+    if ($caddyTail -and $caddyTail.Length -gt 800) { $caddyTail = $caddyTail.Substring($caddyTail.Length - 800) }
+    Write-DebugLog "INFO" "choco install caddy complete. Exit code=$($caddyInstall.ExitCode) attempts=$($caddyInstall.Attempts)"
+    if (-not $caddyInstall.Ran) {
+        Write-Error "[WebServer] choco.exe could not be located; caddy was not installed."
+        Write-DebugLog "ERROR" "choco install caddy: choco.exe not found"
+        exit 1
     }
-    Write-DebugLog "INFO" "choco install caddy complete. Exit code=$LASTEXITCODE"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "[WebServer] choco install caddy failed (exit $LASTEXITCODE)."
-        Write-DebugLog "ERROR" "choco install caddy returned non-zero exit code: $LASTEXITCODE"
+    if ($caddyInstall.ExitCode -ne 0 -or $caddyInstall.Transient) {
+        Write-Error "[WebServer] choco install caddy failed (exit $($caddyInstall.ExitCode))."
+        Write-DebugLog "ERROR" "choco install caddy returned non-zero exit code (exit $($caddyInstall.ExitCode), transient=$($caddyInstall.Transient), attempts=$($caddyInstall.Attempts)): $caddyTail"
         exit 1
     }
 } else {

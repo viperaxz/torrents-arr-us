@@ -6,6 +6,8 @@
 # -- Debug logging ---------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "16_rclone.ps1 started"
 
 $AppName    = "rclone-rd"
@@ -68,23 +70,20 @@ Write-DebugLog "VAR WinFsp present=$winfspPresent"
 if (-not $winfspPresent) {
     Write-Host "  -> Installing WinFsp via Chocolatey..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Installing WinFsp via choco..."
-    # choco writes warnings to stderr on successful installs; EAP="Stop" is inherited.
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        choco install winfsp -y --no-progress 2>&1 | Out-Null
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
+    # Invoke-Choco captures choco's stderr chatter instead of letting it abort
+    # this script under EAP="Stop", and retries transient feed failures.
+    $winfspInstall = Invoke-Choco -Arguments @('install', 'winfsp', '-y', '--no-progress')
+    $winfspTail = $winfspInstall.Output
+    if ($winfspTail -and $winfspTail.Length -gt 800) { $winfspTail = $winfspTail.Substring($winfspTail.Length - 800) }
     # Trust the installed files, not the exit code: an MSI that needs a reboot
     # reports 3010, which is a success for our purposes.
     $winfspPresent = Test-Path $winfspDir
     if ($winfspPresent) {
         Write-Host "     OK WinFsp installed." -ForegroundColor Green
-        Write-DebugLog "INFO" "WinFsp installed successfully (choco exit=$LASTEXITCODE)"
+        Write-DebugLog "INFO" "WinFsp installed successfully (choco exit=$($winfspInstall.ExitCode), attempts=$($winfspInstall.Attempts))"
     } else {
-        Write-DebugLog "ERROR" "WinFsp missing after choco install (exit=$LASTEXITCODE)"
-        Write-Warning "     WinFsp install failed (exit $LASTEXITCODE). Not writing the lock file so a re-run retries."
+        Write-DebugLog "ERROR" "WinFsp missing after choco install (exit $($winfspInstall.ExitCode), ran=$($winfspInstall.Ran), transient=$($winfspInstall.Transient)): $winfspTail"
+        Write-Warning "     WinFsp install failed (exit $($winfspInstall.ExitCode)). Not writing the lock file so a re-run retries."
         Write-Error "[$AppName] WinFsp is required for the rclone mount and is not installed."
         exit 1
     }

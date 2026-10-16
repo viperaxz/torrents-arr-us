@@ -6,6 +6,9 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+# Invoke-Native below still serves cscli; choco calls go through Invoke-Choco.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "12_security.ps1 started"
 
 $AppName    = "Security"
@@ -190,9 +193,17 @@ try {
         # Preferred path: chocolatey (already bootstrapped by 00_prerequisites.ps1)
         try {
             Write-DebugLog "INFO" "Installing CrowdSec via chocolatey..."
-            $choco = Invoke-Native -Exe "choco" -NativeArgs @("install", "crowdsec", "-y", "--no-progress", "--limit-output")
-            Write-DebugLog "VAR choco crowdsec exit=$($choco.ExitCode)"
-            Write-DebugLog "VAR choco output=$($choco.Output.Trim())"
+            # Routed through Invoke-Choco rather than Invoke-Native: it retries the
+            # transient feed failures that used to abort this step, and it returns
+            # the same ExitCode/Output shape the checks below already use.
+            $choco = Invoke-Choco -Arguments @("install", "crowdsec", "-y", "--no-progress", "--limit-output")
+            Write-DebugLog "VAR choco crowdsec exit=$($choco.ExitCode) attempts=$($choco.Attempts) ran=$($choco.Ran)"
+            $chocoTail = $choco.Output
+            if ($chocoTail -and $chocoTail.Length -gt 800) { $chocoTail = $chocoTail.Substring($chocoTail.Length - 800) }
+            Write-DebugLog "VAR choco output=$($chocoTail.Trim())"
+            if (-not $choco.Ran -or $choco.ExitCode -ne 0 -or $choco.Transient) {
+                Write-DebugLog "WARN" "chocolatey install of crowdsec did not report success (exit $($choco.ExitCode), ran=$($choco.Ran), transient=$($choco.Transient))"
+            }
             if (Test-Path $CsCli) { $installed = $true }
         } catch {
             Write-DebugLog "WARN" "chocolatey install of crowdsec failed: $_"
@@ -562,8 +573,12 @@ if ($crowdsecOk) {
             $installed = $false
             try {
                 Write-DebugLog "INFO" "Installing bouncer via chocolatey..."
-                $choco = Invoke-Native -Exe "choco" -NativeArgs @("install", "crowdsec-windows-firewall-bouncer", "-y", "--no-progress", "--limit-output")
-                Write-DebugLog "VAR choco bouncer exit=$($choco.ExitCode) output=$($choco.Output.Trim())"
+                # Invoke-Choco, not Invoke-Native: transient feed failures retry
+                # and the real error is captured. Same ExitCode/Output shape.
+                $choco = Invoke-Choco -Arguments @("install", "crowdsec-windows-firewall-bouncer", "-y", "--no-progress", "--limit-output")
+                $chocoTail = $choco.Output
+                if ($chocoTail -and $chocoTail.Length -gt 800) { $chocoTail = $chocoTail.Substring($chocoTail.Length - 800) }
+                Write-DebugLog "VAR choco bouncer exit=$($choco.ExitCode) attempts=$($choco.Attempts) ran=$($choco.Ran) output=$($chocoTail.Trim())"
                 # Check 3 ways: config dir exists, service exists, or choco reported success.
                 $chocoSvc = Get-Service -Name "cs-windows-firewall-bouncer" -ErrorAction SilentlyContinue
                 $chocoOk  = (Test-Path $BouncerDir) -or ($null -ne $chocoSvc) -or

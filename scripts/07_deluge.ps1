@@ -6,6 +6,8 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "07_deluge.ps1 started"
 
 $AppName       = "Deluge"
@@ -446,19 +448,21 @@ function Install-DelugeRelease {
 }
 
 function Get-ChocoAvailableVersion {
-    # Version Chocolatey would install for a package (repository metadata).
+    # Version Chocolatey would install for a package (repository metadata).  This
+    # is a REMOTE query -- the one community.chocolatey.org intermittently answers
+    # with 503/504 -- so it goes through Invoke-Choco, which retries that class of
+    # failure instead of letting it abort the step.
     param([Parameter(Mandatory=$true)][string]$Package)
-    $savedEap = $ErrorActionPreference
-    $output   = $null
-    try {
-        $ErrorActionPreference = "Continue"
-        $output = choco search $Package --exact -r 2>$null
-    } finally {
-        $ErrorActionPreference = $savedEap
-    }
+    $result = Invoke-Choco -Arguments @('search', $Package, '--exact', '-r') -Quiet
+    $output = if ($result.Ran) { $result.Output } else { $null }
     Write-DebugLog "VAR choco search $Package --exact -r => $output"
+    if ($result.Ran -and ($result.ExitCode -ne 0 -or $result.Transient)) {
+        $searchTail = [string]$output
+        if ($searchTail.Length -gt 800) { $searchTail = $searchTail.Substring($searchTail.Length - 800) }
+        Write-DebugLog "WARN" "choco search $Package failed (exit $($result.ExitCode), transient=$($result.Transient), attempts=$($result.Attempts)): $searchTail"
+    }
     if ([string]::IsNullOrWhiteSpace($output)) { return $null }
-    $parts = ([string]($output | Select-Object -First 1)) -split '\|'
+    $parts = ([string]($output -split "`n" | Where-Object { $_ -match '\|' } | Select-Object -First 1)) -split '\|'
     if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
     return $null
 }
@@ -475,18 +479,9 @@ function Get-InstalledChocoVersion {
     # Reads what Chocolatey reports for a package.
     # Returns: "<version>" | "unknown" (listed but unparseable) | $null (absent)
     param([Parameter(Mandatory=$true)][string]$Package)
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $listOutput = choco list --exact $Package -r 2>$null
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
+    $listOutput = Get-ChocoInstalledVersion -Package $Package
     Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
-    if ([string]::IsNullOrWhiteSpace($listOutput)) { return $null }
-    $parts = ([string]($listOutput | Select-Object -First 1)) -split '\|'
-    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
-    return "unknown"
+    return $listOutput
 }
 
 $DelugeDownloadDir = Join-Path $PSScriptRoot "..\bin"
@@ -494,10 +489,10 @@ Write-DebugLog "VAR PinnedVersion=$PinnedVersion DelugeTargetDir=$DelugeTargetDi
 
 # A box that was installed through Chocolatey still has the broken 2.1.1
 # registered there; log it, because the mirror build now owns those binaries.
-if (Get-Command choco -ErrorAction SilentlyContinue) {
+if (Resolve-ChocoExe) {
     Write-DebugLog "VAR choco reports deluge $(Get-InstalledChocoVersion -Package 'deluge')"
 } else {
-    Write-DebugLog "WARN" "choco not found in PATH - the Chocolatey fallback is unavailable (the mirror path does not need it)"
+    Write-DebugLog "WARN" "choco not found - the Chocolatey fallback is unavailable (the mirror path does not need it)"
 }
 
 $installedVersion = Get-DelugeInstalledVersion -TargetDir $DelugeTargetDir
@@ -526,9 +521,9 @@ try {
     # pinned version).  Chocolatey still serves 2.1.1, and silently installing
     # that would rebuild the /deluge 404 this path exists to fix, so an older
     # candidate is refused -- failing is better than a broken Web UI.
-    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+    if (-not (Resolve-ChocoExe)) {
         Write-Warning "[$AppName] Chocolatey is not available (00_prerequisites.ps1 installs it) and the mirror path failed. Cannot install Deluge."
-        Write-DebugLog "ERROR" "choco not found in PATH and mirror path failed; aborting Deluge install"
+        Write-DebugLog "ERROR" "choco not found (searched PATH, the standard install path and the registry) and the mirror path failed; aborting Deluge install"
         exit 1
     }
     $chocoCandidate = Get-ChocoAvailableVersion -Package "deluge"
@@ -550,20 +545,15 @@ try {
 
     Write-Host "  -> Falling back to Chocolatey (deluge $chocoCandidate)..." -ForegroundColor Yellow
     Write-DebugLog "WARN" "Falling back to Chocolatey for deluge $chocoCandidate"
-    $global:LASTEXITCODE = 0
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        choco install deluge --version $chocoCandidate -y --no-progress | Out-Null
-    } catch {
-        Write-DebugLog "WARN" "choco install deluge could not run: $_"
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
-    Write-DebugLog "INFO" "choco install deluge exit=$LASTEXITCODE"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[$AppName] choco install deluge returned exit code $LASTEXITCODE. Checking whether the package landed anyway..."
-        Write-DebugLog "WARN" "choco install deluge non-zero exit: $LASTEXITCODE"
+    $delugeInstall = Invoke-Choco -Arguments @('install', 'deluge', '--version', $chocoCandidate, '-y', '--no-progress')
+    $delugeTail = $delugeInstall.Output
+    if ($delugeTail -and $delugeTail.Length -gt 800) { $delugeTail = $delugeTail.Substring($delugeTail.Length - 800) }
+    Write-DebugLog "INFO" "choco install deluge exit=$($delugeInstall.ExitCode) attempts=$($delugeInstall.Attempts)"
+    if (-not $delugeInstall.Ran) {
+        Write-DebugLog "ERROR" "choco install deluge: choco.exe not found"
+    } elseif ($delugeInstall.ExitCode -ne 0 -or $delugeInstall.Transient) {
+        Write-Warning "[$AppName] choco install deluge returned exit code $($delugeInstall.ExitCode). Checking whether the package landed anyway..."
+        Write-DebugLog "WARN" "choco install deluge non-zero exit (exit $($delugeInstall.ExitCode), transient=$($delugeInstall.Transient), attempts=$($delugeInstall.Attempts)): $delugeTail"
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     Write-DebugLog "INFO" "PATH refreshed after deluge install"

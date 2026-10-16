@@ -24,6 +24,16 @@ function Write-UcLog {
     }
 }
 
+# -- Shared choco plumbing -----------------------------------------------------
+# Loaded here rather than in each caller because every per-app update script
+# (scripts\update_*.ps1) runs as a CHILD PROCESS and dot-sources this file: they
+# must not depend on master_update.ps1 having loaded the helpers first. Guarded so
+# repeated dot-sourcing of this file does not redefine them.
+if (-not (Get-Command Invoke-Choco -ErrorAction SilentlyContinue)) {
+    $chocoHelpers = Join-Path $PSScriptRoot "choco_helpers.ps1"
+    if (Test-Path $chocoHelpers) { . $chocoHelpers }
+}
+
 # -- Ledger helpers ------------------------------------------------------------
 
 function Get-LedgerPath {
@@ -183,18 +193,11 @@ function Detect-InstalledVersion {
     )
     try {
         if ($Entry -and $Entry.source -eq "chocolatey" -and $Entry.package) {
-            $oldEap = $ErrorActionPreference
-            $ErrorActionPreference = "Continue"
-            try {
-                $out = choco list --exact $Entry.package -r 2>$null
-            } finally {
-                $ErrorActionPreference = $oldEap
-            }
-            if ($out) {
-                $line  = ($out | Select-Object -First 1)
-                $parts = $line -split '\|'
-                if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
-            }
+            # "unknown" (listed but unparseable) is reported as absence here, which
+            # is the contract this function had before the choco helper took over:
+            # callers record the result in the ledger, so "unknown" must not leak.
+            $chocoVersion = Get-ChocoInstalledVersion -Package $Entry.package
+            if ($chocoVersion -and $chocoVersion -ne "unknown") { return $chocoVersion }
             return $null
         }
 
@@ -384,27 +387,31 @@ function Invoke-GitHubReleaseDownload {
 
 function Invoke-ChocoUpgrade {
     # Upgrades a Chocolatey package to an exact version and refreshes PATH.
+    # Goes through Invoke-Choco so the transient community.chocolatey.org failures
+    # (503/504/gateway timeout/feed-fetch) retry instead of failing the update, and
+    # so the real reason is logged rather than discarded by "| Out-Null".
     param(
         [Parameter(Mandatory = $true)][string]$Package,
         [string]$Version
     )
-    $oldEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    $code = 0
-    try {
-        $global:LASTEXITCODE = 0
-        if ($Version) {
-            Write-UcLog "INFO" "choco upgrade $Package --version $Version -y --no-progress"
-            choco upgrade $Package --version $Version -y --no-progress | Out-Null
-        } else {
-            Write-UcLog "INFO" "choco upgrade $Package -y --no-progress"
-            choco upgrade $Package -y --no-progress | Out-Null
-        }
-        $code = $global:LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $oldEap
+    $chocoArgs = @('upgrade', $Package)
+    if ($Version) { $chocoArgs += @('--version', $Version) }
+    $chocoArgs += @('-y', '--no-progress')
+    Write-UcLog "INFO" "choco $($chocoArgs -join ' ')"
+    $result = Invoke-Choco -Arguments $chocoArgs
+    $tail = $result.Output
+    if ($tail -and $tail.Length -gt 800) { $tail = $tail.Substring($tail.Length - 800) }
+    if (-not $result.Ran) {
+        Write-UcLog "ERROR" "choco upgrade ${Package}: choco.exe not found"
+        throw "choco upgrade $Package could not run: choco.exe not found"
     }
-    if ($code -ne 0) { throw "choco upgrade $Package exited with code $code" }
+    if ($result.ExitCode -ne 0) {
+        Write-UcLog "ERROR" "choco upgrade $Package failed (exit $($result.ExitCode), transient=$($result.Transient), attempts=$($result.Attempts)): $tail"
+        throw "choco upgrade $Package exited with code $($result.ExitCode)"
+    }
+    if ($result.Transient) {
+        Write-UcLog "WARN" "choco upgrade $Package reported a transient feed error (attempts=$($result.Attempts)): $tail"
+    }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
 }

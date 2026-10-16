@@ -38,6 +38,10 @@ if ($DomainMode -ne "cloudflare" -and $DomainMode -ne "duckdns") {
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution (a shell opened before Chocolatey
+# was installed never sees chocolatey\bin) plus retry-on-transient-feed-failure
+# with the output captured instead of discarded.
+. (Join-Path $PSScriptRoot "scripts\choco_helpers.ps1")
 Write-DebugLog "INFO" "master_install.ps1 started. SkipLayer2=$SkipLayer2"
 Write-DebugLog "INFO" "Config loaded from: $ConfigPath"
 Write-DebugLog "VAR DomainMode = $DomainMode"
@@ -162,29 +166,23 @@ if ($Force -ne "") {
             $pinVersion = $Versions.apps.$manifestApp.version
         }
 
-        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        if (-not (Resolve-ChocoExe)) {
             Write-Warning "[Force] Chocolatey not found -- cannot upgrade '$chocoPkg'."
         } else {
             $pinLabel = if ($pinVersion) { " to $pinVersion" } else { "" }
             Write-Host "[Force] Upgrading Chocolatey package '$chocoPkg'$pinLabel..." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "choco upgrade $chocoPkg$pinLabel"
-            $savedEap = $ErrorActionPreference
-            try {
-                $ErrorActionPreference = "Continue"
-                $global:LASTEXITCODE = 0
-                if ($pinVersion) {
-                    choco upgrade $chocoPkg --version $pinVersion -y --no-progress 2>&1 | Out-Null
-                } else {
-                    choco upgrade $chocoPkg -y --no-progress 2>&1 | Out-Null
-                }
-                $chocoExit = $LASTEXITCODE
-            } finally {
-                $ErrorActionPreference = $savedEap
-            }
+            $chocoArgs = @('upgrade', $chocoPkg)
+            if ($pinVersion) { $chocoArgs += @('--version', $pinVersion) }
+            $chocoArgs += @('-y', '--no-progress')
+            Write-DebugLog "INFO" "choco $($chocoArgs -join ' ')"
+            $chocoRun    = Invoke-Choco -Arguments $chocoArgs
+            $chocoExit   = $chocoRun.ExitCode
+            $chocoTail   = $chocoRun.Output
+            if ($chocoTail -and $chocoTail.Length -gt 800) { $chocoTail = $chocoTail.Substring($chocoTail.Length - 800) }
 
-            if ($chocoExit -ne 0) {
+            if ($chocoExit -ne 0 -or $chocoRun.Transient) {
                 Write-Warning "[Force] choco upgrade $chocoPkg exited with code $chocoExit -- version may be unchanged."
-                Write-DebugLog "ERROR" "choco upgrade $chocoPkg failed (exit $chocoExit)"
+                Write-DebugLog "ERROR" "choco upgrade $chocoPkg failed (exit $chocoExit, transient=$($chocoRun.Transient), attempts=$($chocoRun.Attempts)): $chocoTail"
             }
 
             # Record the real installed version so `box check` stops reporting it as pending.

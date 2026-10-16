@@ -12,6 +12,8 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 
 # -- Shared helpers (also used by scripts\update_ffmpeg.ps1) -------------------
 # ffmpeg comes from jellyfin-ffmpeg, not from the Chocolatey "ffmpeg" package:
@@ -307,34 +309,17 @@ function global:Remove-ChocolateyFfmpeg {
     # entry added afterwards makes this build win anyway.
     # Returns: "removed" | "absent" | "no-choco" | "failed"
     param([string]$Package = "ffmpeg")
-    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { return "no-choco" }
-    $savedEAP = $ErrorActionPreference
-    $listOutput = $null
-    try {
-        $ErrorActionPreference = "Continue"
-        $listOutput = choco list --exact $Package -r 2>$null
-    } catch {
-        Write-DebugLog "WARN" "choco list --exact $Package failed: $_"
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
+    if (-not (Resolve-ChocoExe)) { return "no-choco" }
+    $listOutput = Get-ChocoInstalledVersion -Package $Package
+    Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
     if ([string]::IsNullOrWhiteSpace($listOutput)) { return "absent" }
 
     Write-DebugLog "INFO" "Removing the Chocolatey '$Package' package (superseded by jellyfin-ffmpeg)"
-    $code = -1
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $global:LASTEXITCODE = 0
-        choco uninstall $Package -y --no-progress | Out-Null
-        $code = $global:LASTEXITCODE
-    } catch {
-        Write-DebugLog "WARN" "choco uninstall $Package could not run: $_"
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
-    if ($code -eq 0) { return "removed" }
-    Write-DebugLog "WARN" "choco uninstall $Package exit=$code"
+    $uninstall = Invoke-Choco -Arguments @('uninstall', $Package, '-y', '--no-progress')
+    $uninstallTail = $uninstall.Output
+    if ($uninstallTail -and $uninstallTail.Length -gt 800) { $uninstallTail = $uninstallTail.Substring($uninstallTail.Length - 800) }
+    if ($uninstall.ExitCode -eq 0) { return "removed" }
+    Write-DebugLog "WARN" "choco uninstall $Package exit=$($uninstall.ExitCode) (transient=$($uninstall.Transient), attempts=$($uninstall.Attempts)): $uninstallTail"
     return "failed"
 }
 

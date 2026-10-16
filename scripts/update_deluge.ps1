@@ -407,19 +407,21 @@ function Install-DelugeRelease {
 }
 
 function Get-ChocoAvailableVersion {
-    # Version Chocolatey would install for a package (repository metadata).
+    # Version Chocolatey would install for a package (repository metadata).  This
+    # is a REMOTE query -- the one community.chocolatey.org intermittently answers
+    # with 503/504 -- so it goes through Invoke-Choco, which retries that class of
+    # failure instead of letting it abort the step.
     param([Parameter(Mandatory=$true)][string]$Package)
-    $savedEap = $ErrorActionPreference
-    $output   = $null
-    try {
-        $ErrorActionPreference = "Continue"
-        $output = choco search $Package --exact -r 2>$null
-    } finally {
-        $ErrorActionPreference = $savedEap
-    }
+    $result = Invoke-Choco -Arguments @('search', $Package, '--exact', '-r') -Quiet
+    $output = if ($result.Ran) { $result.Output } else { $null }
     Write-DebugLog "VAR choco search $Package --exact -r => $output"
+    if ($result.Ran -and ($result.ExitCode -ne 0 -or $result.Transient)) {
+        $searchTail = [string]$output
+        if ($searchTail.Length -gt 800) { $searchTail = $searchTail.Substring($searchTail.Length - 800) }
+        Write-DebugLog "WARN" "choco search $Package failed (exit $($result.ExitCode), transient=$($result.Transient), attempts=$($result.Attempts)): $searchTail"
+    }
     if ([string]::IsNullOrWhiteSpace($output)) { return $null }
-    $parts = ([string]($output | Select-Object -First 1)) -split '\|'
+    $parts = ([string]($output -split "`n" | Where-Object { $_ -match '\|' } | Select-Object -First 1)) -split '\|'
     if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
     return $null
 }
@@ -436,18 +438,9 @@ function Get-InstalledChocoVersion {
     # Reads what Chocolatey reports for a package.
     # Returns: "<version>" | "unknown" (listed but unparseable) | $null (absent)
     param([Parameter(Mandatory=$true)][string]$Package)
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $listOutput = choco list --exact $Package -r 2>$null
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
+    $listOutput = Get-ChocoInstalledVersion -Package $Package
     Write-DebugLog "VAR choco list --exact $Package -r => $listOutput"
-    if ([string]::IsNullOrWhiteSpace($listOutput)) { return $null }
-    $parts = ([string]($listOutput | Select-Object -First 1)) -split '\|'
-    if ($parts.Count -ge 2 -and $parts[1].Trim()) { return $parts[1].Trim() }
-    return "unknown"
+    return $listOutput
 }
 
 # $Version is the plan target (the versions.json pin) and it wins over the

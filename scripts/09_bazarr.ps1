@@ -6,6 +6,8 @@
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
 Initialize-DebugLog -Config $Config
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "09_bazarr.ps1 started"
 
 $AppName    = "Bazarr"
@@ -175,17 +177,15 @@ Write-DebugLog "VAR PythonExe after auto-detection=$PythonExe"
 if (-not $PythonExe) {
     Write-Host "  -> Python 3.12 not found. Installing via Chocolatey..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Python not found on system. Installing python312 via choco..."
-    $savedEAP = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        choco install python312 -y --no-progress | Out-Null
-    } finally {
-        $ErrorActionPreference = $savedEAP
-    }
-    Write-DebugLog "INFO" "choco install python312 exit=$LASTEXITCODE"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "[Bazarr] choco install python312 returned exit code $LASTEXITCODE. Trying other Python locations..."
-        Write-DebugLog "WARN" "choco install python312 non-zero exit: $LASTEXITCODE"
+    $pythonInstall = Invoke-Choco -Arguments @('install', 'python312', '-y', '--no-progress')
+    $pythonTail = $pythonInstall.Output
+    if ($pythonTail -and $pythonTail.Length -gt 800) { $pythonTail = $pythonTail.Substring($pythonTail.Length - 800) }
+    Write-DebugLog "INFO" "choco install python312 exit=$($pythonInstall.ExitCode) attempts=$($pythonInstall.Attempts)"
+    if (-not $pythonInstall.Ran) {
+        Write-DebugLog "ERROR" "choco install python312: choco.exe not found"
+    } elseif ($pythonInstall.ExitCode -ne 0 -or $pythonInstall.Transient) {
+        Write-Warning "[Bazarr] choco install python312 returned exit code $($pythonInstall.ExitCode). Trying other Python locations..."
+        Write-DebugLog "WARN" "choco install python312 non-zero exit (exit $($pythonInstall.ExitCode), transient=$($pythonInstall.Transient), attempts=$($pythonInstall.Attempts)): $pythonTail"
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")

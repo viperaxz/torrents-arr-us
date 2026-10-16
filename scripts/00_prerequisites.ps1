@@ -11,6 +11,9 @@
 if ($Config) {
     Initialize-DebugLog -Config $Config
 }
+# Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure
+# with the output captured instead of discarded.
+. (Join-Path $PSScriptRoot "choco_helpers.ps1")
 Write-DebugLog "INFO" "00_prerequisites.ps1 started. MinChocoVersion=$MinChocoVersion"
 
 Write-Host "[Prerequisites] Starting prerequisites installation..." -ForegroundColor Cyan
@@ -40,9 +43,13 @@ function Test-MinimumVersion {
 }
 
 # 1. Install or Upgrade Chocolatey
-$chocoExists = Get-Command choco -ErrorAction SilentlyContinue
-Write-DebugLog "VAR choco in PATH: $($null -ne $chocoExists)"
-if (-not $chocoExists) {
+# Resolve-ChocoExe does not trust $env:Path: a shell opened before Chocolatey was
+# installed never sees chocolatey\bin even though the Machine PATH names it, so
+# Get-Command alone would re-run the bootstrapper on a healthy machine (and is
+# another way for the step to fail).
+$chocoExe = Resolve-ChocoExe
+Write-DebugLog "VAR choco resolved to: $(if ($chocoExe) { $chocoExe } else { '(not found)' })"
+if (-not $chocoExe) {
     Write-Host "[Prerequisites] Installing Chocolatey package manager..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Chocolatey not found. Downloading installer..."
     Set-ExecutionPolicy Bypass -Scope Process -Force
@@ -54,7 +61,7 @@ if (-not $chocoExists) {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     Write-DebugLog "INFO" "PATH refreshed after Chocolatey install"
 } else {
-    $chocoVersion = choco -v
+    $chocoVersion = ((& $chocoExe -v) -join ' ').Trim()
     Write-Host "[Prerequisites] Chocolatey is already installed (Version: $chocoVersion)." -ForegroundColor Green
     Write-DebugLog "VAR Chocolatey version found: $chocoVersion"
 
@@ -63,8 +70,15 @@ if (-not $chocoExists) {
     if (-not $meetsMin) {
         Write-Host "[Prerequisites] Chocolatey version is behind minimum required ($MinChocoVersion). Upgrading..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Upgrading Chocolatey from $chocoVersion to >= $MinChocoVersion"
-        choco upgrade chocolatey -y --no-progress | Out-Null
-        $newVersion = choco -v
+        $chocoUpgrade = Invoke-Choco -Arguments @('upgrade', 'chocolatey', '-y', '--no-progress')
+        $chocoUpgradeTail = $chocoUpgrade.Output
+        if ($chocoUpgradeTail -and $chocoUpgradeTail.Length -gt 800) { $chocoUpgradeTail = $chocoUpgradeTail.Substring($chocoUpgradeTail.Length - 800) }
+        if (-not $chocoUpgrade.Ran) {
+            Write-DebugLog "ERROR" "choco upgrade chocolatey: choco.exe could not be located"
+        } elseif ($chocoUpgrade.ExitCode -ne 0 -or $chocoUpgrade.Transient) {
+            Write-DebugLog "WARN" "choco upgrade chocolatey non-zero exit (exit $($chocoUpgrade.ExitCode), transient=$($chocoUpgrade.Transient), attempts=$($chocoUpgrade.Attempts)): $chocoUpgradeTail"
+        }
+        $newVersion = ((& $chocoExe -v) -join ' ').Trim()
         Write-DebugLog "INFO" "Chocolatey upgraded. New version: $newVersion"
         $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     } else {
@@ -85,45 +99,43 @@ function Install-ChocoPackage {
 
     Write-DebugLog "INFO" "Install-ChocoPackage: $PackageName (minVersion=$MinimumVersion)"
 
-    # Check if package is installed
-    $listOutput = choco list --exact $PackageName -r 2>$null
-    Write-DebugLog "VAR choco list $PackageName output: $listOutput"
-    if ([string]::IsNullOrWhiteSpace($listOutput)) {
-        $isInstalled = $false
-        $installedVersion = $null
-    } else {
-        $isInstalled = $true
-        $parts = $listOutput -split '\|'
-        $installedVersion = if ($parts.Count -gt 1) { $parts[1].Trim() } else { $null }
-    }
+    # Check if package is installed. Local-only lookup: the remote feed query is
+    # the part that breaks, and "is it on this machine" never needs it.
+    $installedVersion = Get-ChocoInstalledVersion -Package $PackageName
+    $isInstalled = -not [string]::IsNullOrWhiteSpace($installedVersion)
+    Write-DebugLog "VAR choco list $PackageName output: $installedVersion"
 
     Write-DebugLog "VAR $PackageName installed=$isInstalled version=$installedVersion"
 
     if (-not $isInstalled) {
         Write-Host "  -> Installing $PackageName..." -ForegroundColor Gray
         Write-DebugLog "INFO" "Installing $PackageName via choco..."
-        # EAP is "Stop" here (inherited from master_install.ps1) and choco writes
-        # warnings (pending reboot, deprecation notices) to stderr on otherwise
-        # successful installs -- which would abort this FATAL script. The explicit
-        # verification below is what actually decides success.
-        $savedEAP = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = "Continue"
-            choco install $PackageName -y --no-progress 2>&1 | Out-Null
-        } finally {
-            $ErrorActionPreference = $savedEAP
+        # choco's exit code is not authoritative: when the feed is unreachable it
+        # prints "Chocolatey installed 0/0 packages." and still returns 0, and it
+        # also returns non-zero for harmless warnings (pending reboot). The
+        # explicit verification below is what actually decides success, so the
+        # output is logged rather than discarded -- that discarded output is why
+        # a 503 from community.chocolatey.org took forensic work to diagnose.
+        $install     = Invoke-Choco -Arguments @('install', $PackageName, '-y', '--no-progress')
+        $installTail = $install.Output
+        if ($installTail -and $installTail.Length -gt 800) { $installTail = $installTail.Substring($installTail.Length - 800) }
+        if (-not $install.Ran) {
+            Write-Warning "  -> choco.exe could not be located -- cannot install $PackageName."
+            Write-DebugLog "ERROR" "choco install ${PackageName}: choco.exe not found"
+        } elseif ($install.ExitCode -ne 0 -or $install.Transient) {
+            Write-Warning "  -> choco install $PackageName exited with code $($install.ExitCode); verifying anyway..."
+            Write-DebugLog "WARN" "choco install $PackageName non-zero exit (exit $($install.ExitCode), transient=$($install.Transient), attempts=$($install.Attempts)): $installTail"
         }
 
         # Verify installation
-        $verifyOutput = choco list --exact $PackageName -r 2>$null
-        Write-DebugLog "VAR choco verify [$PackageName] output=$verifyOutput"
-        if ([string]::IsNullOrWhiteSpace($verifyOutput)) {
+        $verifyVersion = Get-ChocoInstalledVersion -Package $PackageName
+        Write-DebugLog "VAR choco verify [$PackageName] output=$verifyVersion"
+        if ([string]::IsNullOrWhiteSpace($verifyVersion)) {
             Write-Warning "  -> Failed to install $PackageName. Continuing..."
-            Write-DebugLog "ERROR" "$PackageName install FAILED (not found after install)"
+            Write-DebugLog "ERROR" "$PackageName install FAILED (not found after install): $installTail"
         } else {
-            $installedVer = ($verifyOutput -split '\|')[1].Trim()
             Write-Host "  -> $PackageName installed successfully." -ForegroundColor Green
-            Write-DebugLog "INFO" "$PackageName installed successfully. Version: $installedVer"
+            Write-DebugLog "INFO" "$PackageName installed successfully. Version: $verifyVersion"
         }
     } else {
         if (-not [string]::IsNullOrWhiteSpace($MinimumVersion)) {
@@ -132,14 +144,15 @@ function Install-ChocoPackage {
             if ($installedVersion -and -not $meetsMin) {
                 Write-Host "  -> Upgrading $PackageName from $installedVersion to at least $MinimumVersion..." -ForegroundColor Yellow
                 Write-DebugLog "INFO" "Upgrading $PackageName from $installedVersion..."
-                $savedEAP = $ErrorActionPreference
-                try {
-                    $ErrorActionPreference = "Continue"
-                    choco upgrade $PackageName -y --no-progress 2>&1 | Out-Null
-                } finally {
-                    $ErrorActionPreference = $savedEAP
+                $upgrade     = Invoke-Choco -Arguments @('upgrade', $PackageName, '-y', '--no-progress')
+                $upgradeTail = $upgrade.Output
+                if ($upgradeTail -and $upgradeTail.Length -gt 800) { $upgradeTail = $upgradeTail.Substring($upgradeTail.Length - 800) }
+                if (-not $upgrade.Ran) {
+                    Write-DebugLog "ERROR" "choco upgrade ${PackageName}: choco.exe not found"
+                } elseif ($upgrade.ExitCode -ne 0 -or $upgrade.Transient) {
+                    Write-DebugLog "WARN" "choco upgrade $PackageName non-zero exit (exit $($upgrade.ExitCode), transient=$($upgrade.Transient), attempts=$($upgrade.Attempts)): $upgradeTail"
                 }
-                $newVer = (choco list --exact $PackageName -r 2>$null -split '\|')[1]
+                $newVer = Get-ChocoInstalledVersion -Package $PackageName
                 Write-DebugLog "INFO" "$PackageName upgraded. New version: $newVer"
             } elseif ($installedVersion) {
                 Write-Host "  -> $PackageName is installed ($installedVersion) and meets minimum version ($MinimumVersion). Skipping." -ForegroundColor Green
