@@ -24,6 +24,7 @@ $mountLetter = "R"
 if ($Config.PSObject.Properties["RealDebrid"] -and $Config.RealDebrid.MountLetter) {
     $mountLetter = $Config.RealDebrid.MountLetter.ToString().ToUpper().TrimEnd(':')
 }
+if ($mountLetter -notmatch '^[A-Y]$') { $mountLetter = "R" }   # same fallback as scripts/16_rclone.ps1
 
 $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $AppName
 
@@ -49,7 +50,10 @@ try {
     $newExe = Get-ChildItem $tmpDir -Recurse -Filter "rclone.exe" | Select-Object -First 1
     if (-not $newExe) { throw "rclone.exe not found in archive" }
 
-    $mountCheck = { param() (Test-Path "${mountLetter}:\") }
+    # Test-Path alone passes while the mount root still cannot serve directory
+    # listings (Zurg rebuilding __all__ right after a restart), which is exactly
+    # the state a bad swap leaves behind.  A real readdir is the reliable signal.
+    $mountCheck = { param() try { $null = Get-ChildItem "${mountLetter}:\" -ErrorAction Stop; $true } catch { $false } }
     $swap = Swap-SingleExeWithRollback -AppName $AppName -ExePath $ExePath `
                 -NewExePath $newExe.FullName -ServiceNames @($ServiceName) -HealthSeconds 15 -PostHealthCheck $mountCheck
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue

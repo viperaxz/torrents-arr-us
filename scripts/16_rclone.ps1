@@ -37,7 +37,9 @@ $MountLetter = if ($Config.PSObject.Properties['RealDebrid'] -and $Config.RealDe
     $Config.RealDebrid.MountLetter.ToString().ToUpper().TrimEnd(':')
 } else { "R" }
 
-# Movies on MountLetter (e.g. R:\).
+# Movies on MountLetter (e.g. R:\).  TV shows are NOT split onto a second
+# drive: zurg serves one flat __all__ tree and the WebDAV layer has no reliable
+# movies/shows split, which is why only a Movies library is provisioned.
 if ($MountLetter -notmatch '^[A-Y]$') {
     Write-Warning "[$AppName] MountLetter '$MountLetter' is not A-Y. Falling back to 'R'."
     Write-DebugLog "WARN" "Invalid MountLetter '$MountLetter'. Using default R."
@@ -74,20 +76,29 @@ if (-not $winfspPresent) {
     } finally {
         $ErrorActionPreference = $savedEAP
     }
-    if ($LASTEXITCODE -eq 0) {
+    # Trust the installed files, not the exit code: an MSI that needs a reboot
+    # reports 3010, which is a success for our purposes.
+    $winfspPresent = Test-Path $winfspDir
+    if ($winfspPresent) {
         Write-Host "     OK WinFsp installed." -ForegroundColor Green
-        Write-DebugLog "INFO" "WinFsp installed successfully"
+        Write-DebugLog "INFO" "WinFsp installed successfully (choco exit=$LASTEXITCODE)"
     } else {
-        Write-Warning "     WinFsp install may have failed (exit $LASTEXITCODE). rclone mount may not work."
-        Write-DebugLog "WARN" "WinFsp choco install exit=$LASTEXITCODE"
+        Write-DebugLog "ERROR" "WinFsp missing after choco install (exit=$LASTEXITCODE)"
+        Write-Warning "     WinFsp install failed (exit $LASTEXITCODE). Not writing the lock file so a re-run retries."
+        Write-Error "[$AppName] WinFsp is required for the rclone mount and is not installed."
+        exit 1
     }
 } else {
     Write-Host "     WinFsp already present." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "WinFsp already installed"
 }
 
-# -- 1b. EnableLinkedConnections: share drive letters across service sessions ---
-# Without this, Jellyfin (running as seedbox-svc) cannot see the rclone mount.
+# -- 1b. EnableLinkedConnections: share drive mappings across the linked token --
+# Kept for the interactive side: a drive mapping made with the standard token
+# then stays visible to that user's elevated token.
+# It has no effect on the rclone mount -- WinFsp drive letters are per Windows
+# session, so rclone-rd-movies and Jellyfin see the same letter by both running
+# as services in session 0, while an interactive desktop session (1+) does not.
 $regPath  = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 $regName  = "EnableLinkedConnections"
 $regValue = (Get-ItemProperty -Path $regPath -Name $regName -ErrorAction SilentlyContinue).$regName
@@ -174,7 +185,7 @@ vendor = other
 pacer_min_sleep = 0
 "@
 
-[System.IO.File]::WriteAllText($RcloneConf, $rcloneIni, [System.Text.Encoding]::UTF8)
+[System.IO.File]::WriteAllText($RcloneConf, $rcloneIni, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "     OK rclone config written." -ForegroundColor Green
 Write-DebugLog "INFO" "rclone config written to $RcloneConf (Zurg WebDAV port=$ZurgPort)"
 
@@ -187,6 +198,14 @@ $MoviesSvc  = "rclone-rd-movies"
 $MoviesMountArgs = "mount zurg:__all__ ${MovieLetter}:\ $CommonFlags"
 
 Write-DebugLog "VAR MoviesSvc=$MoviesSvc MoviesMountArgs=$MoviesMountArgs"
+
+# A letter that is already a local volume or network mapping makes the mount
+# fail; surface it here rather than as a warning after the service is registered.
+$letterOwner = Get-PSDrive -Name $MovieLetter -PSProvider FileSystem -ErrorAction SilentlyContinue
+if ($letterOwner) {
+    Write-Warning "     Drive ${MovieLetter}: is already in use (root: $($letterOwner.Root)). rclone cannot mount over an existing drive -- set a free RealDebrid.MountLetter in config.json."
+    Write-DebugLog "WARN" "MountLetter ${MovieLetter}: already in use by $($letterOwner.Root)"
+}
 
 # -- 6. Register rclone-rd-movies NSSM service ----------------------------------
 Write-Host "  -> Registering $MoviesSvc service (${MovieLetter}:\)..." -ForegroundColor Gray
@@ -240,7 +259,7 @@ Write-Host "  -> Waiting for Zurg WebDAV on port $ZurgPort..." -ForegroundColor 
 $zurgDavUrl = "http://127.0.0.1:$ZurgPort/dav/"
 $zurgReady = $false
 $zurgDeadline = (Get-Date).AddSeconds(120)
-$zurgWaited = 0
+$zurgStart = Get-Date
 while (-not $zurgReady -and (Get-Date) -lt $zurgDeadline) {
     try {
         # Zurg v1.0.0+ may respond with 401, 207, or 200 to a GET on /dav/
@@ -254,14 +273,16 @@ while (-not $zurgReady -and (Get-Date) -lt $zurgDeadline) {
         if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
             $zurgReady = $true
         } else {
-            Start-Sleep -Seconds 3; $zurgWaited += 3
+            Start-Sleep -Seconds 3
         }
     }
 }
+$zurgWaited = [int]((Get-Date) - $zurgStart).TotalSeconds
 Write-DebugLog "VAR Zurg WebDAV ready=$zurgReady waited=${zurgWaited}s"
 if (-not $zurgReady) {
-    Write-Warning "     Zurg WebDAV not responding after 120s. rclone mount will fail."
-    Write-DebugLog "WARN" "Zurg WebDAV at $zurgDavUrl not ready after 120s"
+    Write-Warning "     Zurg WebDAV not responding after ${zurgWaited}s. rclone mount will fail."
+    Write-Warning "     A service that is Running but never opens port $ZurgPort usually means an invalid RealDebrid.ApiKey in config.json (Zurg loops in its network test) -- see $InstallDir\logs\zurg.log."
+    Write-DebugLog "WARN" "Zurg WebDAV at $zurgDavUrl not ready after ${zurgWaited}s"
 }
 
 # -- 8. Start service -----------------------------------------------------------
@@ -302,11 +323,14 @@ if ($listingOk) {
 }
 Write-DebugLog "VAR $MoviesSvc mount at ${MovieLetter}:\ ok=$mountOk"
 
-if ($mSvc -and $mSvc.Status -eq "Running" -and $mountOk) {
+$mSvcRunning = [bool]($mSvc -and $mSvc.Status -eq "Running")
+
+if ($mSvcRunning -and $mountOk) {
     Write-Host "     OK $MoviesSvc running (${MovieLetter}:\)" -ForegroundColor Green
     Write-DebugLog "INFO" "$MoviesSvc running, mount at ${MovieLetter}:\"
-} elseif ($mSvc -and $mSvc.Status -eq "Running" -and -not $mountOk) {
-    Write-Warning "     $MoviesSvc running but ${MovieLetter}:\ not visible. Mount may need more time."
+} elseif ($mSvcRunning -and -not $mountOk) {
+    Write-Warning "     $MoviesSvc running but ${MovieLetter}:\ not visible from this session. Mount may need more time."
+    Write-Warning "     Note: a WinFsp drive letter belongs to the session that created it. The mount is created by the $MoviesSvc service in session 0, so it is visible to other services (Jellyfin) but not to an interactive desktop session."
     Write-DebugLog "WARN" "$MoviesSvc running but drive ${MovieLetter}:\ not found"
 } else {
     Write-Warning "     $MoviesSvc not running (status: $mSvcStatus). Check $LogDir\rclone-rd-movies-error.log."
@@ -314,7 +338,20 @@ if ($mSvc -and $mSvc.Status -eq "Running" -and $mountOk) {
 }
 
 # -- 9. Write lock file ---------------------------------------------------------
-[System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), [System.Text.Encoding]::UTF8)
+# Only a running mount service counts as installed.  Writing the lock file (and
+# the ledger entry) after a failed start would make every later run report
+# "Already installed. Skipping." and would tell the updater that the version is
+# in place, so a transient failure could never be retried.  The drive-letter
+# check above is deliberately not part of this decision: WinFsp mount points are
+# per session, so an installer running in an interactive session may not see a
+# perfectly healthy mount.
+if (-not $mSvcRunning) {
+    Write-Warning "[$AppName] Install incomplete: service '$MoviesSvc' is $mSvcStatus. Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "$MoviesSvc not running ($mSvcStatus); lock file and ledger entry not written"
+    exit 1
+}
+
+[System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), (New-Object System.Text.UTF8Encoding($false)))
 # Ledger entry for the updater (single source of truth for versions)
 if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "update_common.ps1")

@@ -128,9 +128,14 @@ $ZurgPort = 9999
 # v1.0.0+ uses the zurg-public stable release channel.
 # __all__ is the built-in directory that exposes all torrents at the WebDAV root.
 # rclone mounts zurg:__all__ so torrent folders appear directly at the drive root.
+# host pins the WebDAV endpoint to loopback: zurg's default is "[::]" (every
+# interface) and the endpoint is unauthenticated, so without this the whole
+# Real-Debrid library is published to the LAN.  Nothing in this suite reaches
+# Zurg from off-box -- rclone mounts it over 127.0.0.1.
 $configYml = @"
 zurg: v1
 token: $RdApiKey
+host: "127.0.0.1"
 port: $ZurgPort
 concurrent_workers: 32
 check_for_changes_every_secs: 15
@@ -139,13 +144,37 @@ enable_thorough_hash_check: false
 cache_network_test_results: true
 "@
 
-[System.IO.File]::WriteAllText($ZurgConfig, $configYml, [System.Text.Encoding]::UTF8)
+# No BOM: the file is parsed by Go's YAML reader, which is happiest with plain UTF-8.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($ZurgConfig, $configYml, $utf8NoBom)
 Write-Host "     OK Zurg config written." -ForegroundColor Green
-Write-DebugLog "INFO" "Zurg config written to $ZurgConfig (port=$ZurgPort)"
+Write-DebugLog "INFO" "Zurg config written to $ZurgConfig (port=$ZurgPort, host=127.0.0.1)"
 
 # -- 4. Set ACLs ----------------------------------------------------------------
 Grant-SeedboxDirAccess -Path $AppBinDir
 Write-DebugLog "INFO" "ACLs set on $AppBinDir"
+
+# config.yml holds the Real-Debrid API token but inherits the install tree's ACL
+# (Everyone/Authenticated Users), which would expose the token -- and with it the
+# whole RD account -- to every local user.  Restrict the file to the service
+# account (zurg rewrites this file on startup to store the ffprobe/rclone paths
+# it downloads, so the service account needs write access) plus admins/SYSTEM.
+try {
+    $cfgAcl = Get-Acl -Path $ZurgConfig
+    $cfgAcl.SetAccessRuleProtection($true, $false)
+    $cfgAcl.Access | ForEach-Object { $cfgAcl.RemoveAccessRule($_) | Out-Null }
+    # Inheritance flags must stay "None" for a file rule.
+    $NoFlags = "None"
+    $Allow   = [System.Security.AccessControl.AccessControlType]::Allow
+    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("BUILTIN\Administrators", [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
+    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new("NT AUTHORITY\SYSTEM",    [System.Security.AccessControl.FileSystemRights]"FullControl", $NoFlags, $NoFlags, $Allow))
+    $cfgAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($SvcUser,                 [System.Security.AccessControl.FileSystemRights]"Modify",      $NoFlags, $NoFlags, $Allow))
+    Set-Acl -Path $ZurgConfig -AclObject $cfgAcl
+    Write-DebugLog "INFO" "config.yml ACL hardened: Admins/SYSTEM FullControl, $SvcUser Modify"
+} catch {
+    Write-Warning "[$AppName] Could not restrict ACL on config.yml (token file may be readable by all local users): $_"
+    Write-DebugLog "WARN" "config.yml ACL hardening failed: $_"
+}
 
 # -- 5. Register NSSM service ---------------------------------------------------
 Write-Host "  -> Registering Zurg service..." -ForegroundColor Gray
@@ -201,9 +230,10 @@ while ((Get-Date) -lt $pollDeadline) {
 }
 if (-not $svc) { $svc = Get-Service -Name $AppName -ErrorAction SilentlyContinue }
 
+$svcRunning = [bool]($svc -and $svc.Status -eq "Running")
 $svcStatus = if ($svc) { $svc.Status } else { "NOT FOUND" }
 Write-DebugLog "VAR service status=$svcStatus"
-if ($svc -and $svc.Status -eq "Running") {
+if ($svcRunning) {
     Write-Host "     OK Zurg service running (WebDAV on port $ZurgPort)." -ForegroundColor Green
     Write-DebugLog "INFO" "Zurg service running on port $ZurgPort"
 } else {
@@ -212,7 +242,17 @@ if ($svc -and $svc.Status -eq "Running") {
 }
 
 # -- 7. Write lock file ---------------------------------------------------------
-[System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), [System.Text.Encoding]::UTF8)
+# Only a running service counts as installed.  Writing the lock file (and the
+# ledger entry) after a failed start would make every later run report
+# "Already installed. Skipping." and would tell the updater that the version is
+# in place, so a transient failure could never be retried.
+if (-not $svcRunning) {
+    Write-Warning "[$AppName] Install incomplete: service '$AppName' is $svcStatus. Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "$AppName service not running ($svcStatus); lock file and ledger entry not written"
+    exit 1
+}
+
+[System.IO.File]::WriteAllText($LockFile, (Get-Date -Format "o"), $utf8NoBom)
 
 # Ledger entry for the updater (single source of truth for versions)
 if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
