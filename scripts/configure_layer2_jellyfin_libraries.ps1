@@ -127,6 +127,110 @@ try {
 }
 
 # -- 5. Create or update media libraries --------------------------------------
+
+# PS 5.1: ConvertFrom-Json objects cannot gain a property by assignment -- a
+# missing one throws "The property ... cannot be found on this object". Library
+# options round-trip through JSON, so every write goes through here.
+function Set-LibraryOptionProperty {
+    param($Options, [string]$Name, $Value)
+    if ($Options.PSObject.Properties[$Name]) { $Options.$Name = $Value }
+    else { $Options | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
+}
+
+# The Lean flags a library definition asks for, resolved once per library so the
+# create path and the existing-library path cannot drift apart.
+function Get-LeanLibraryChanges {
+    param($Lib)
+    $lean   = [bool]($Lib.PSObject.Properties['Lean'] -and $Lib.Lean)
+    $video  = $false; $meta = $false; $images = $false
+    if ($lean) {
+        if ($Lib.Lean.PSObject.Properties['DisableVideoExtraction']) { $video  = ($Lib.Lean.DisableVideoExtraction -eq $true) }
+        if ($Lib.Lean.PSObject.Properties['DisableMetadata'])        { $meta   = ($Lib.Lean.DisableMetadata        -eq $true) }
+        if ($Lib.Lean.PSObject.Properties['DisableImages'])          { $images = ($Lib.Lean.DisableImages          -eq $true) }
+    }
+    return [PSCustomObject]@{
+        Lean = $lean; DisableVideo = $video; DisableMeta = $meta; DisableImages = $images
+    }
+}
+
+# Applies the Lean settings to a LibraryOptions object, whether it is a fresh one
+# being built for a new library or the object Jellyfin returned for an existing
+# one (in which case everything else is preserved by construction). Idempotent:
+# callers compare a JSON snapshot before and after to decide whether to write.
+function Apply-LeanLibraryOptions {
+    param($Options, $Changes, [string]$JellyfinType)
+
+    if ($Changes.DisableVideo) {
+        # Jellyfin 10.9+ exposes trickplay per library; 'EnableTrickplay' itself is not
+        # a LibraryOptions property and is silently dropped by the JSON binder.
+        Set-LibraryOptionProperty -Options $Options -Name 'EnableChapterImageExtraction'           -Value $false
+        Set-LibraryOptionProperty -Options $Options -Name 'ExtractChapterImagesDuringLibraryScan'  -Value $false
+        Set-LibraryOptionProperty -Options $Options -Name 'EnableTrickplayImageExtraction'         -Value $false
+        Set-LibraryOptionProperty -Options $Options -Name 'ExtractTrickplayImagesDuringLibraryScan' -Value $false
+    }
+
+    if ($Changes.DisableMeta -or $Changes.DisableImages) {
+        $itemTypes = if ($JellyfinType -eq 'movies') { @('Movie') } else { @('Series', 'Season', 'Episode') }
+
+        # MERGE, never replace. This whole object is written back in one POST, so
+        # dropping the entries for item types we are not touching would silently
+        # reset their fetcher settings.
+        $byType = [ordered]@{}
+        foreach ($e in @($Options.TypeOptions)) {
+            if ($e -and $e.Type) { $byType[$e.Type] = $e }
+        }
+        foreach ($t in $itemTypes) {
+            if (-not $byType.Contains($t)) { $byType[$t] = [PSCustomObject]@{ Type = $t } }
+            $entry = $byType[$t]
+            if ($Changes.DisableMeta) {
+                foreach ($n in @('MetadataFetchers', 'MetadataFetcherOrder')) {
+                    Set-LibraryOptionProperty -Options $entry -Name $n -Value @()
+                }
+            }
+            if ($Changes.DisableImages) {
+                foreach ($n in @('ImageFetchers', 'ImageFetcherOrder', 'ImageOptions')) {
+                    Set-LibraryOptionProperty -Options $entry -Name $n -Value @()
+                }
+            }
+        }
+        $merged = @()
+        foreach ($k in @($byType.Keys | Sort-Object)) { $merged += $byType[$k] }
+        Set-LibraryOptionProperty -Options $Options -Name 'TypeOptions' -Value $merged
+    }
+}
+
+# Confirms the settings actually survived the round-trip. Jellyfin silently drops
+# properties it does not recognise, so a wrong DTO shape otherwise looks like a
+# success. Returns $true only when every requested setting reads back as asked.
+function Test-LeanLibraryOptions {
+    param($Options, $Changes, [string]$JellyfinType)
+    if (-not $Options) { return $false }
+    if ($Changes.DisableVideo) {
+        foreach ($n in @('EnableChapterImageExtraction', 'ExtractChapterImagesDuringLibraryScan',
+                         'EnableTrickplayImageExtraction', 'ExtractTrickplayImagesDuringLibraryScan')) {
+            if ($Options.PSObject.Properties[$n] -and $Options.$n -ne $false) { return $false }
+        }
+    }
+    if ($Changes.DisableMeta -or $Changes.DisableImages) {
+        $itemTypes = if ($JellyfinType -eq 'movies') { @('Movie') } else { @('Series', 'Season', 'Episode') }
+        foreach ($t in $itemTypes) {
+            $entry = @($Options.TypeOptions) | Where-Object { $_.Type -eq $t } | Select-Object -First 1
+            if (-not $entry) { return $false }
+            if ($Changes.DisableMeta) {
+                foreach ($n in @('MetadataFetchers', 'MetadataFetcherOrder')) {
+                    if (@($entry.$n).Count -ne 0) { return $false }
+                }
+            }
+            if ($Changes.DisableImages) {
+                foreach ($n in @('ImageFetchers', 'ImageFetcherOrder', 'ImageOptions')) {
+                    if (@($entry.$n).Count -ne 0) { return $false }
+                }
+            }
+        }
+    }
+    return $true
+}
+
 $rdEnabled = $Config.Apps.RealDebrid -eq $true
 foreach ($lib in $Layer2Config.MediaLibraries) {
     $libName = $lib.Name
@@ -189,6 +293,53 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
                 }
             }
         }
+
+        # -- Apply (or repair) the Lean library options ---------------------------
+        # These used to be computed inside the create branch only, so a library that
+        # already existed never received them: an 'RD Movies' library created without
+        # Lean stayed that way forever, because every later run takes this branch.
+        # Applied to the options object Jellyfin just returned, so the paths and every
+        # unrelated setting are preserved by construction.
+        $changes = Get-LeanLibraryChanges -Lib $lib
+        if ($changes.Lean) {
+            if ($exists.PSObject.Properties['ItemId'] -and $exists.PSObject.Properties['LibraryOptions'] -and $exists.LibraryOptions) {
+                $before = $exists.LibraryOptions | ConvertTo-Json -Depth 12 -Compress
+                Apply-LeanLibraryOptions -Options $exists.LibraryOptions -Changes $changes -JellyfinType $exists.CollectionType
+                $after  = $exists.LibraryOptions | ConvertTo-Json -Depth 12 -Compress
+
+                if ($before -eq $after) {
+                    Write-Host "     Library '$libName' already has the configured Lean options" -ForegroundColor DarkGray
+                    Write-DebugLog "INFO" "Library '$libName' Lean options already correct -- skip"
+                } else {
+                    try {
+                        $optDto = @{ Id = $exists.ItemId; LibraryOptions = $exists.LibraryOptions } | ConvertTo-Json -Depth 12 -Compress
+                        Invoke-RestMethod -Uri "$ApiBase/Library/VirtualFolders/LibraryOptions" -Method Post `
+                            -Body $optDto -ContentType "application/json" -Headers $UserAuth `
+                            -UseBasicParsing -ErrorAction Stop | Out-Null
+                        Write-Host "     OK Applied Lean options to existing library: $libName" -ForegroundColor Green
+                        Write-DebugLog "INFO" "Lean options applied to existing library '$libName'"
+
+                        # Read back rather than assume. Jellyfin silently drops properties
+                        # it does not recognise, so a wrong DTO shape would look like success.
+                        $recheck  = (Invoke-RestMethod -Uri "$ApiBase/Library/VirtualFolders" -Headers $UserAuth -UseBasicParsing -ErrorAction Stop) |
+                                    Where-Object { $_.Name -eq $libName }
+                        $verified = Test-LeanLibraryOptions -Options $recheck.LibraryOptions -Changes $changes -JellyfinType $recheck.CollectionType
+                        Write-DebugLog "VAR library '$libName' Lean verification ok=$verified"
+                        if ($verified) {
+                            Write-Host "     OK Verified Lean options on '$libName'." -ForegroundColor Green
+                        } else {
+                            Write-Warning "     Lean options on '$libName' did not stick -- check the LibraryOptions fields for this Jellyfin version."
+                        }
+                    } catch {
+                        Write-Warning "     Failed to apply Lean options to '${libName}': $_"
+                        Write-DebugLog "ERROR" "LibraryOptions update failed for '$libName': $_"
+                    }
+                }
+            } else {
+                Write-Warning "     Library '$libName' returned no ItemId/LibraryOptions -- Lean options not applied."
+                Write-DebugLog "WARN" "Library '$libName' has no ItemId/LibraryOptions; Lean options not applied"
+            }
+        }
     } else {
         try {
             $jellyfinType = switch ($libType) {
@@ -200,47 +351,22 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
             }
 
             # -- Build Lean LibraryOptions ----------------------------------------
-            $lean = $lib.PSObject.Properties['Lean'] -and $lib.Lean
-            $disableVideo  = $lean -and $lib.Lean.PSObject.Properties['DisableVideoExtraction'] -and ($lib.Lean.DisableVideoExtraction -eq $true)
-            $disableMeta   = $lean -and $lib.Lean.PSObject.Properties['DisableMetadata']        -and ($lib.Lean.DisableMetadata        -eq $true)
-            $disableImages = $lean -and ($lib.Lean.PSObject.Properties['DisableImages']          -and ($lib.Lean.DisableImages          -eq $true))
+            # One implementation for both paths: whatever a newly created library gets
+            # here, an existing library is brought to on the next Layer 2 run (see the
+            # existing-library branch above).
+            $changes = Get-LeanLibraryChanges -Lib $lib
 
-            Write-DebugLog "VAR creating library '$libName' jellyfinType=$jellyfinType path=$libPath lean=$lean disableVideo=$disableVideo disableMeta=$disableMeta disableImages=$disableImages"
+            Write-DebugLog "VAR creating library '$libName' jellyfinType=$jellyfinType path=$libPath lean=$($changes.Lean) disableVideo=$($changes.DisableVideo) disableMeta=$($changes.DisableMeta) disableImages=$($changes.DisableImages)"
 
-            $libOptions = [ordered]@{
-                PathInfos = @( @{ Path = $libPath } )
-            }
+            $libOptions = [PSCustomObject]@{}
+            Set-LibraryOptionProperty -Options $libOptions -Name 'PathInfos' -Value @( @{ Path = $libPath } )
+            Apply-LeanLibraryOptions -Options $libOptions -Changes $changes -JellyfinType $jellyfinType
 
-            if ($disableVideo) {
-                $libOptions['EnableChapterImageExtraction']          = $false
-                $libOptions['ExtractChapterImagesDuringLibraryScan'] = $false
-                # Jellyfin 10.9+ exposes trickplay per library; 'EnableTrickplay' is not a
-                # LibraryOptions property and is silently dropped by the JSON binder.
-                $libOptions['EnableTrickplayImageExtraction']        = $false
-                $libOptions['ExtractTrickplayImagesDuringLibraryScan'] = $false
-            }
-
-            # Build TypeOptions only when metadata or image fetchers need disabling
-            if ($disableMeta -or $disableImages) {
-                $itemTypes = if ($jellyfinType -eq "movies") {
-                    @("Movie")
-                } else {
-                    @("Series", "Season", "Episode")
-                }
-                $typeOptions = foreach ($t in $itemTypes) {
-                    $entry = [ordered]@{ Type = $t }
-                    if ($disableMeta)   { $entry['MetadataFetchers'] = @(); $entry['MetadataFetcherOrder'] = @() }
-                    if ($disableImages) { $entry['ImageFetchers']    = @(); $entry['ImageFetcherOrder']    = @(); $entry['ImageOptions'] = @() }
-                    $entry
-                }
-                $libOptions['TypeOptions'] = @($typeOptions)
-            }
-
-            $leanNote = if ($lean) {
+            $leanNote = if ($changes.Lean) {
                 $flags = @()
-                if ($disableVideo)  { $flags += "NoVideoExtraction" }
-                if ($disableMeta)   { $flags += "NoMetadata" }
-                if ($disableImages) { $flags += "NoImages" }
+                if ($changes.DisableVideo)  { $flags += "NoVideoExtraction" }
+                if ($changes.DisableMeta)   { $flags += "NoMetadata" }
+                if ($changes.DisableImages) { $flags += "NoImages" }
                 if ($flags) { " [Lean: $($flags -join ',')]" } else { " [Lean]" }
             } else { "" }
 
