@@ -644,6 +644,19 @@ if ($crowdsecOk) {
 if ($crowdsecOk) {
     [System.IO.File]::WriteAllText($LockFile, "installed", [System.Text.Encoding]::UTF8)
     Write-DebugLog "INFO" "12_security.ps1 complete. Lock: $LockFile"
+
+    # Ledger entries for the updater (single source of truth for versions)
+    if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+        . (Join-Path $PSScriptRoot "update_common.ps1")
+    }
+    $csEntry = if ($Config._Versions -and $Config._Versions.Apps.CrowdSec) { $Config._Versions.Apps.CrowdSec } else { $null }
+    $csVer = Detect-InstalledVersion -AppName "CrowdSec" -Entry $csEntry -InstallDir $InstallDir
+    if ($csVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "CrowdSec" -Version $csVer }
+    if ($bouncerOk) {
+        $cbEntry = if ($Config._Versions -and $Config._Versions.Apps.CrowdSecBouncer) { $Config._Versions.Apps.CrowdSecBouncer } else { $null }
+        $cbVer = Detect-InstalledVersion -AppName "CrowdSecBouncer" -Entry $cbEntry -InstallDir $InstallDir
+        if ($cbVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "CrowdSecBouncer" -Version $cbVer }
+    }
 } else {
     Write-DebugLog "WARN" "Lock file NOT written -- re-run will retry the install"
 }

@@ -342,6 +342,14 @@ if ($Config.Apps.RealDebrid -eq $true) {
     })
 }
 
+# Local LLM backend (optional, externally managed -- never installed by this project)
+if ($Config.LLM -and $Config.LLM.PSObject.Properties["Enabled"] -and $Config.LLM.Enabled -eq $true) {
+    $llmPort  = if ($Config.LLM.PSObject.Properties["BackendPort"] -and $Config.LLM.BackendPort) { [int]$Config.LLM.BackendPort } else { 8081 }
+    $llmOpen  = TcpOpen $llmPort
+    $llmCheck = QuickGet "http://127.0.0.1:$llmPort/health"
+    $svcs.Add((SvcEntry 'LLM' 'Local LLM' $llmOpen $llmCheck.ok $llmCheck.ms))
+}
+
 # -- System --------------------------------------------------------------------
 $status = [ordered]@{
     timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')

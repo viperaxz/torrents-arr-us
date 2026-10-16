@@ -22,13 +22,20 @@ function Show-Usage {
     Write-Host ""
 }
 
-function Assert-Admin {
-    param([string]$ForCommand)
+function Invoke-Elevated {
+    # Re-launches this script in an elevated PowerShell (UAC) and waits for it.
     if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Warning "'box $ForCommand' must be run as Administrator."
-        Write-Host ""
-        Write-Host "  Re-launch this window as Administrator and run the command again." -ForegroundColor Yellow
-        exit 1
+        Write-Host "Elevating (a UAC prompt may appear)..." -ForegroundColor Yellow
+        $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"", $Command)
+        if ($AutoApprove) { $argList += "-AutoApprove" }
+        if ($Force)      { $argList += "-Force" }
+        try {
+            $proc = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -ArgumentList $argList
+            exit $proc.ExitCode
+        } catch {
+            Write-Warning "Could not elevate: $_"
+            exit 1
+        }
     }
 }
 
@@ -37,7 +44,7 @@ switch ($Command.ToLower()) {
 
 # -- box update ----------------------------------------------------------------
 "update" {
-    Assert-Admin "update"
+    Invoke-Elevated
 
     Write-Host ""
     Write-Host "=============================================" -ForegroundColor Cyan
@@ -96,7 +103,6 @@ switch ($Command.ToLower()) {
     }
     $config     = Get-Content -Raw $configPath | ConvertFrom-Json
     $installDir = $config.General.InstallDir
-    $locksDir   = Join-Path $installDir ".locks"
 
     # Load local versions.json
     $localVersionsPath = Join-Path $ProjectRoot "versions.json"
@@ -105,19 +111,15 @@ switch ($Command.ToLower()) {
         exit 1
     }
     $localVersions = Get-Content -Raw $localVersionsPath | ConvertFrom-Json
-    $remoteUrl     = if ($localVersions.github_raw_url) { $localVersions.github_raw_url } else {
-        "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json"
-    }
 
-    # Fetch remote versions.json
+    # Fetch remote versions.json via the shared helper (parses text/plain JSON)
+    . (Join-Path $ProjectRoot "scripts\update_common.ps1")
     Write-Host "[check] Fetching remote version manifest..." -ForegroundColor Gray
-    $remoteVersions = $localVersions
-    try {
-        $remoteVersions = Invoke-RestMethod -Uri $remoteUrl -UseBasicParsing -TimeoutSec 15
+    $remoteVersions = Get-RemoteManifest -LocalManifest $localVersions
+    if ([object]::ReferenceEquals($remoteVersions, $localVersions)) {
+        Write-Warning "Could not reach remote manifest. Comparing against local versions.json."
+    } else {
         Write-Host "[check] Remote manifest: schema $($remoteVersions.schema), updated $($remoteVersions.updated)" -ForegroundColor DarkGray
-    } catch {
-        Write-Warning "Could not reach remote manifest: $_"
-        Write-Host "         Comparing against local versions.json." -ForegroundColor DarkGray
     }
 
     Write-Host ""
@@ -134,56 +136,58 @@ switch ($Command.ToLower()) {
         } catch { }
     }
 
-    # Compare app versions
+    # Compare app versions via the shared update plan (ledger + manifest)
+    $scriptsDir = Join-Path $ProjectRoot "scripts"
+    $plan = @(Get-UpdatePlan -Manifest $remoteVersions -InstallDir $installDir -ScriptsDir $scriptsDir) |
+        Sort-Object App
+
     $pendingCount    = 0
+    $manualCount     = 0
     $securityPending = $false
-    $appOrder        = @("Sonarr","Radarr","Prowlarr","Bazarr","Flaresolverr","Jellyfin","Deluge","ffmpeg","Caddy")
 
     Write-Host "  App versions:" -ForegroundColor White
-    Write-Host ("  {0,-16} {1,-22} {2,-22} {3}" -f "App", "Installed", "Available", "Status") -ForegroundColor DarkGray
+    Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f "App", "Installed", "Available", "Status") -ForegroundColor DarkGray
     Write-Host ("  " + ("-" * 75)) -ForegroundColor DarkGray
 
-    foreach ($appName in $appOrder) {
-        $manifestEntry = $remoteVersions.apps.$appName
-        if (-not $manifestEntry) { continue }
-
-        $lower    = $appName.ToLower()
-        $lockFile = Join-Path $locksDir ".$lower.lock"
-
-        if (-not (Test-Path $lockFile)) {
-            Write-Host ("  {0,-16} {1,-22} {2,-22} {3}" -f $appName, "(not installed)", $manifestEntry.version, "") -ForegroundColor DarkGray
-            continue
-        }
-
-        $installedVer   = (Get-Content $lockFile -Raw -ErrorAction SilentlyContinue).Trim()
-        $normalInstalled = $installedVer.TrimStart('v')
-        $normalManifest  = $manifestEntry.version.TrimStart('v')
-
-        if (-not $installedVer -or $installedVer -eq "unknown") {
-            Write-Host ("  {0,-16} {1,-22} {2,-22} {3}" -f $appName, "(unknown)", $manifestEntry.version, "") -ForegroundColor DarkGray
-        } elseif ($normalInstalled -ne $normalManifest) {
-            $isSecure = ($manifestEntry.PSObject.Properties["security"] -and $manifestEntry.security -eq $true)
-            $tag      = if ($isSecure) { "[SECURITY]" } else { "[UPDATE]" }
-            $color    = if ($isSecure) { "Red" } else { "Yellow" }
-            Write-Host ("  {0,-16} {1,-22} {2,-22} {3}" -f $appName, $installedVer, $manifestEntry.version, $tag) -ForegroundColor $color
-            if ($isSecure -and $manifestEntry.PSObject.Properties["securityNote"]) {
-                Write-Host ("  {0,-16} {1}" -f "", $manifestEntry.securityNote) -ForegroundColor Red
+    foreach ($item in $plan) {
+        switch ($item.State) {
+            "current" {
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, $item.Installed, $item.Target, "up to date") -ForegroundColor Green
             }
-            $pendingCount++
-            if ($isSecure) { $securityPending = $true }
-        } else {
-            Write-Host ("  {0,-16} {1,-22} {2,-22} {3}" -f $appName, $installedVer, $manifestEntry.version, "up to date") -ForegroundColor Green
+            "notinstalled" {
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, "(not installed)", $item.Target, "") -ForegroundColor DarkGray
+            }
+            "unresolved" {
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, "(n/a)", $item.Target, "") -ForegroundColor DarkGray
+            }
+            "unknown" {
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, "(unknown)", $item.Target, "verify: re-run installer") -ForegroundColor DarkGray
+            }
+            "manual" {
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, $item.Installed, $item.Target, "[MANUAL]") -ForegroundColor DarkYellow
+                $manualCount++
+            }
+            "update" {
+                $tag   = if ($item.Security) { "[SECURITY]" } else { "[UPDATE]" }
+                $color = if ($item.Security) { "Red" } else { "Yellow" }
+                Write-Host ("  {0,-18} {1,-22} {2,-22} {3}" -f $item.App, $item.Installed, $item.Target, $tag) -ForegroundColor $color
+                if ($item.Security -and $item.SecurityNote) {
+                    Write-Host ("  {0,-18} {1}" -f "", $item.SecurityNote) -ForegroundColor Red
+                }
+                $pendingCount++
+                if ($item.Security) { $securityPending = $true }
+            }
         }
     }
 
     Write-Host ""
-    Write-Host ("  {0,-16} {1}" -f "Project scripts", $(if ($projectBehind) { "BEHIND origin/main [UPDATE]" } elseif ($isGitRepo) { "up to date" } else { "(not a git repo)" })) `
+    Write-Host ("  {0,-18} {1}" -f "Project scripts", $(if ($projectBehind) { "BEHIND origin/main [UPDATE]" } elseif ($isGitRepo) { "up to date" } else { "(not a git repo)" })) `
         -ForegroundColor $(if ($projectBehind) { "Yellow" } else { "Green" })
 
     Write-Host ""
     Write-Host ("  " + ("-" * 75)) -ForegroundColor DarkGray
 
-    if ($pendingCount -eq 0 -and -not $projectBehind) {
+    if ($pendingCount -eq 0 -and $manualCount -eq 0 -and -not $projectBehind) {
         Write-Host "  Everything is up to date." -ForegroundColor Green
     } else {
         if ($securityPending) {
@@ -191,8 +195,12 @@ switch ($Command.ToLower()) {
         } else {
             $items = @()
             if ($pendingCount -gt 0) { $items += "$pendingCount app update$(if ($pendingCount -gt 1) {'s'})" }
+            if ($manualCount -gt 0)  { $items += "$manualCount manual update$(if ($manualCount -gt 1) {'s'})" }
             if ($projectBehind)      { $items += "project script updates" }
             Write-Host "  $($items -join ', ') available. Run 'box update' to apply." -ForegroundColor Yellow
+            if ($manualCount -gt 0) {
+                Write-Host "  Manual updates require: .\master_install.ps1 -Force <AppName>" -ForegroundColor DarkGray
+            }
         }
     }
     Write-Host ""
@@ -200,7 +208,7 @@ switch ($Command.ToLower()) {
 
 # -- box uninstall -------------------------------------------------------------
 "uninstall" {
-    Assert-Admin "uninstall"
+    Invoke-Elevated
 
     $uninstallScript = Join-Path $ProjectRoot "master_uninstall.ps1"
     if (-not (Test-Path $uninstallScript)) {

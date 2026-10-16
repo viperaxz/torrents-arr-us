@@ -212,6 +212,13 @@ CrowdSec splits into two independent components, and **both are required** — t
 - **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads).
 - **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`).
 
+### Optional LLM Reverse Proxy (bring-your-own backend)
+- Enabled by `LLM.Enabled = true` in `config.json`; the project **never installs or manages the LLM itself** — the user runs the backend (Strata, Ollama, LM Studio, or any OpenAI-compatible server) separately, bound to loopback.
+- `01_webserver.ps1` renders a `llm.<domain>` server block (Cloudflare mode) or a `/llm/v1` API path (DuckDNS mode) pointing at `LLM.BackendHost:LLM.BackendPort` (default `127.0.0.1:8081` — port 8080 is CrowdSec LAPI's).
+- When `LLM.ApiKey` is set, Caddy requires `Authorization: Bearer <key>` on the API path (phone apps don't speak basic auth). When `LLM.ExposeUi = true` (Cloudflare mode), the backend UI is proxied behind Caddy `basicauth` using the admin credentials.
+- **Strata note**: if the backend is Strata and its UI is exposed, add the published URL to the Strata config's `cors_origins` (e.g. `https://llm.example.com`) — otherwise the server refuses the browser page's chat requests. Caddy forwards the browser's `Origin`, so the UI path is only usable once that origin is trusted.
+- The LLM subdomain is added to the Cloudflare DNS updater and the cert-cache domain list, and the dashboard gets a card (Cloudflare mode). `collect_status.ps1` probes `<BackendHost>:<BackendPort>/health` and reports the LLM in the service list.
+
 ### Server Status Monitoring
 - `scripts/13_status.ps1` registers `Seedbox_Status_Collector` as a SYSTEM scheduled task that repeats every 5 minutes.
 - `scripts/collect_status.ps1` collects: system uptime and memory usage, per-drive free/used/total space, service running states for all seedbox services, active and waiting Deluge download counts, and security event counts.
@@ -275,6 +282,14 @@ CrowdSec splits into two independent components, and **both are required** — t
   "RealDebrid": {
     "ApiKey":      "...",  // Real-Debrid API key
     "MountLetter": "R"     // movies on R:\, shows on S:\
+  },
+  "LLM": {
+    "Enabled":      false,       // publish an externally managed LLM via Caddy
+    "Subdomain":    "llm",       // Cloudflare-mode subdomain
+    "BackendHost":  "127.0.0.1",  // LLM stays loopback-bound; Caddy is the only exposure
+    "BackendPort":  8081,         // NOT 8080 (CrowdSec LAPI)
+    "ApiKey":       "",          // optional Bearer gate on /v1/*
+    "ExposeUi":     true          // also proxy the UI (Caddy basicauth)
   },
   "Ports": {
     "Jellyfin": 8096, "Sonarr": 8989, "Radarr": 7878,
@@ -435,6 +450,7 @@ The most complex installer — sets up the entire public-facing layer.
 5. **Dashboard**: renders `templates/dashboard.html.template` with per-app card HTML and writes `dashboard/index.html`. URLs are generated for the active domain mode; only enabled apps get a card.
 6. **Caddyfile**: Renders `templates/Caddyfile_cloudflare.template` or `templates/Caddyfile_duckdns.template` by substituting all `{$TOKEN}` placeholders with real values (ports, domain, bcrypt hash, TLS block, data directory paths).
 7. **Caddy service**: Creates an NSSM service running under `seedbox-svc`, opens firewall rules for ports 80 and 443, starts the service, and waits to confirm it is running.
+8. **Optional LLM proxy**: when `LLM.Enabled` is true, renders a `llm.<domain>` server block (Cloudflare mode) or `/llm/v1` API path (DuckDNS mode) pointing at `LLM.BackendHost:LLM.BackendPort`, with an optional Bearer-key gate on the API and a basicauth-gated UI; adds the LLM subdomain to the DNS updater, cert-cache domain list, and dashboard cards. The LLM itself is never installed or managed.
 
 #### `scripts/02_jellyfin.ps1`
 - Installs Jellyfin via Chocolatey; if the package is already present but the service is missing, forces a reinstall.
@@ -690,12 +706,26 @@ Collects server health metrics and writes them as `dashboard/current_status.json
 - **Security**: Windows Firewall rule count for the abuse blocklist.
 Runs every 5 minutes via `Seedbox_Status_Collector` (SYSTEM scheduled task registered by `13_status.ps1`). No credentials or secrets are written to the output JSON.
 
+#### The update system
+
+Updates follow a **notify-then-apply** model with a single source of truth per side:
+
+- **Remote truth**: `versions.json` at the repo root (published via GitHub raw). It pins the recommended version, source, and asset pattern per app, plus optional `security` / `securityNote` flags. A maintainer tool (`scripts\bump_versions.ps1`) refreshes it from upstream releases, and a weekly GitHub Actions workflow opens a PR with the bumps.
+- **Local truth**: `<InstallDir>\.locks\installed_versions.json` (the "ledger"), written by every installer via `Set-InstalledVersion` and maintained by the update scripts. Legacy `.locks\*.lock` files still exist for install idempotency and are kept in sync on successful updates.
+
+Building blocks:
+
+- `scripts\update_common.ps1` — shared helpers: `Read-InstalledLedger` / `Set-InstalledVersion`, tolerant `Compare-Versions`, data-driven `Get-UpdatePlan` (states: `current`, `update`, `manual`, `notinstalled`, `unknown`, `unresolved`), `Invoke-GitHubReleaseDownload`, `Invoke-ChocoUpgrade`, `Swap-AppDirectoryWithRollback`, `Swap-SingleExeWithRollback`, `Detect-InstalledVersion` (self-heals legacy lock values like timestamps or `installed`).
+- `scripts\update_<App>.ps1` — one script per app (18 total). Contract: `-Version -InstallDir -BinDir -Config [-WhatIf]`, returns one result object (`App/Status/Installed/Target/Detail`), writes the ledger only after a verified success. Dir swaps for Sonarr/Radarr/Prowlarr/Flaresolverr/Grafana; exe-only swaps for Zurg/rclone/Loki/Alloy (config files live next to the binary); Bazarr re-runs `pip install -r requirements.txt` after the swap; Jellyseerr rebuilds from source via pnpm; choco upgrades for Jellyfin (re-applies the `seedbox-svc` service account), Deluge, ffmpeg, Caddy (reloads the Caddyfile), CrowdSec + bouncer; Recyclarr replaces the CLI exe. NSSM and Python312 are deliberately manual.
+- `master_update.ps1` — thin data-driven orchestrator: self-update via git pull, remote manifest fetch, ledger migration, `Get-UpdatePlan`, then per-app script invocation with the summary table. Supports `-AutoApprove`, `-App <Name>`, `-WhatIf`.
+- `box.ps1` — `box check` (read-only plan) and `box update` (auto-elevates) both consume the same plan; no hardcoded app list exists anywhere.
+
 #### `scripts/check_updates.ps1`
 Daily background update checker registered as the `win-seedbox Update Check` scheduled task (runs at 10:00 AM under the interactive user).
 - Fetches the remote `versions.json` from the GitHub raw URL defined in the local `versions.json`.
-- Compares pinned versions for each app against the installed `versions.json`.
+- Builds the same `Get-UpdatePlan` as `box check` and `master_update.ps1` (all apps, not a hardcoded subset), self-healing unknown ledger entries via `Detect-InstalledVersion`.
 - If the project itself is a git repository, fetches `origin/main` and compares HEAD SHA to detect script-level updates.
-- Shows a Windows toast notification listing available updates; never applies updates automatically.
+- Shows a Windows toast notification (with `msg.exe` fallback) and always writes `dashboard\update_notification.json`; never applies updates automatically.
 
 #### `scripts/sonarr_jellyfin_refresh.py`
 A Sonarr Custom Script connection that fires on `OnDownload` events to fix a timing-dependent hierarchy bug in Jellyfin.
@@ -718,6 +748,8 @@ Two templates exist depending on domain mode:
 | `Caddyfile_cloudflare.template` | Cloudflare | Each app on its own subdomain (`app.domain.com`) |
 | `Caddyfile_duckdns.template` | DuckDNS | All apps on path prefixes (`domain/app`) |
 | `Caddyfile.template` | Generic | Not currently used by installer |
+
+When `LLM.Enabled` is set, an extra `{$LLM_BLOCK}` placeholder renders the LLM proxy rules: `llm.<domain>` with a `/v1` bearer gate and basicauth-gated UI in Cloudflare mode; API-only `/llm/v1` in DuckDNS mode (the backend UI is not exposed in path mode).
 
 The Cloudflare Caddyfile illustrates the security split:
 - The **dashboard** (`domain.com`) is behind `basicauth`.

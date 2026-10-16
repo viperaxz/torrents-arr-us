@@ -5,6 +5,43 @@ RULE FOR AI 2: COMMIT ONLY AFTER A FULL UNINSTALL -> DO CHANGES -> FULLY INSTALL
 
 ## Upcoming
 
+### Priority 0 — LLM reverse proxy (bring-your-own LLM)
+
+Expose an externally managed LLM server (Strata, Ollama, LM Studio, any OpenAI-compatible backend) over the internet through the project's Caddy setup — **without the project installing or managing the LLM itself**. The user installs and runs the LLM separately; the project only publishes it.
+
+Rationale: the current `llm.viperax.org` / Open WebUI setup is a manual, hand-edited Caddyfile addition that is wiped on every reinstall. This feature makes it a first-class, config-driven, reinstall-safe part of the seedbox.
+
+Design (final):
+
+- **Config** — new `LLM` section in `config.json.example`, disabled by default:
+  - `Enabled: false`
+  - `Subdomain: "llm"` — Cloudflare-mode subdomain
+  - `BackendHost: "127.0.0.1"` — backend always stays loopback-bound; Caddy is the only exposure
+  - `BackendPort: 8081` — deliberately NOT 8080 (CrowdSec LAPI owns 8080)
+  - `ApiKey: ""` — if set, Caddy requires `Authorization: Bearer <key>` on `/v1/*` (works for phone apps that don't speak basic auth; satisfies Strata's "never expose without a key" rule)
+  - `ExposeUi: true` — also proxy the backend UI at `/`
+- **Caddy templates** — conditional LLM server block rendered only when `LLM.Enabled`:
+  - Cloudflare mode: `llm.<domain>` with `handle /v1/*` (bearer gate) and the UI behind `basicauth` (Strata's built-in UI has no login; Caddy's bcrypt-hashed admin credentials are the gate)
+  - DuckDNS mode: API-only (`/llm/v1/*`) — Strata's UI does not support path prefixes (same class of problem as Jellyseerr); document UI as Cloudflare-mode only
+- **`01_webserver.ps1`** — renders the block from config; adds `llm` to the Cloudflare DNS updater `$Subdomains` when enabled. No new firewall rules (Caddy 80/443 already open)
+- **Monitoring** — `collect_status.ps1` health probe `GET /health` on `127.0.0.1:<BackendPort>` + dashboard card when enabled
+- **Docs** — `TECHNICAL_OVERVIEW.md` + `README.md` section: "Optional LLM proxy — pair with Strata (`--port 8081`, keep `--host 127.0.0.1`, set `--api-key`) or any OpenAI-compatible backend"
+- **Uninstaller** — nothing to remove (Caddyfile is regenerated); explicitly document that the user's external LLM install is never touched by the project
+
+Reference (current hand-made live config to be replaced): `llm.viperax.org` proxies `/v1/*` → `127.0.0.1:11434` behind a static Bearer check and `/` → Open WebUI at `127.0.0.1:9090`; Open WebUI, Ollama, and ComfyUI live as manual installs under `E:\MediaServer`.
+
+Decisions (resolved during implementation on `feature/update-strategy`):
+- ComfyUI stays out of scope (manual Caddyfile addition; revisit later as a generic "extra subdomain proxy")
+- UI exposed behind Caddy `basicauth` by default (`ExposeUi: true`); set `ExposeUi: false` for API-only
+- `BackendPort` default confirmed as 8081
+- DuckDNS mode is API-only at `/llm/v1` (backend UI does not support path prefixes)
+
+Out of scope: installing/updating Strata or any LLM, LLM web UI hosting, model management.
+
+Status: implemented on `feature/update-strategy` (install/uninstall validation cycle deferred at the user's request).
+
+---
+
 ### Priority 1 — Setup wizard
 
 A first-time user should be able to go from a blank Windows machine to a fully configured seedbox by running one script and answering prompts — no JSON editing, no documentation reading, no prior knowledge of the apps involved.
@@ -73,7 +110,7 @@ Stops all services, archives each app's `C:\ProgramData\<App>` data directory (i
 | **Observability stack (Grafana + Loki + Alloy)** | `14_grafana.ps1` installs Grafana, Loki, and Alloy as NSSM services; Alloy ships logs from all services (Caddy, CrowdSec, Deluge, Sonarr, Radarr, Prowlarr, Jellyfin, Bazarr, Flaresolverr, Jellyseerr) to Loki; Grafana pre-provisioned with Loki data source and seedbox dashboards; Caddy route added automatically; `grafana_enable.ps1` / `grafana_disable.ps1` for post-install toggle; controlled by `Apps.Grafana` |
 | **Server status monitoring** | `13_status.ps1` registers `Seedbox_Status_Collector` scheduled task (every 5 min, SYSTEM); `collect_status.ps1` writes `dashboard/current_status.json` with system uptime, memory, drive usage, service states, download activity, and security stats; consumed by the dashboard UI |
 | **Prowlarr indexer Enabled flag + private tracker support** | Each indexer in `Layer2.Prowlarr.Indexers` now has an `Enabled` boolean; disabled indexers are skipped during Layer 2. Private trackers (FileList, IPTorrents, RuTracker, TorrentLeech) supported via per-indexer `Credentials` object and `SeedRules` (ratio + seed time) |
-| **Version pinning + updater + box CLI** | `versions.json` as single version source of truth; `master_update.ps1` for per-app updates with binary rollback; `box` CLI for status/update/restart from any prompt; daily scheduled task for update notifications |
+| **Version pinning + updater + box CLI** | `versions.json` as single version source of truth; per-app `scripts\update_<App>.ps1` scripts (18 apps) with rollback; `installed_versions.json` ledger; data-driven `master_update.ps1` / `box check` / daily `check_updates.ps1`; `scripts\bump_versions.ps1` + weekly CI PR for manifest bumps |
 | **Quality automation (Recyclarr + TRaSH Guides)** | Custom formats, quality profiles, and scoring synced to Sonarr/Radarr on every install from TRaSH Guides trash_ids |
 | **Structured debug logging** | `debug_logger.ps1` dot-sourced by every script; opt-in via `General.DebugLogging`; timestamped per-session log to `<InstallDir>\logs\` |
 | **End-to-end sanity check** | `scripts/sanity_check.py` drives the full Prowlarr -> Radarr/Sonarr -> Deluge -> Jellyfin -> Bazarr pipeline via REST APIs and reports pass/fail per stage |

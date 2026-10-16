@@ -1,5 +1,7 @@
 ﻿param(
-    [switch]$AutoApprove   # skip all confirmation prompts
+    [switch]$AutoApprove,  # skip all confirmation prompts
+    [string]$App = "",     # update only the named app (manifest key, e.g. "Sonarr")
+    [switch]$WhatIf         # print the update plan without applying anything
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,7 +24,8 @@ $BinDir     = Join-Path $PSScriptRoot "bin"
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
 Initialize-DebugLog -Config $Config
-Write-DebugLog "INFO" "master_update.ps1 started. AutoApprove=$AutoApprove"
+. (Join-Path $PSScriptRoot "scripts\update_common.ps1")
+Write-DebugLog "INFO" "master_update.ps1 started. AutoApprove=$AutoApprove App=$App WhatIf=$WhatIf"
 
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Cyan
@@ -76,6 +79,8 @@ if ($isGitRepo) {
                 Write-DebugLog "INFO" "Self-update applied. Re-executing master_update.ps1."
                 $relaunchArgs = @()
                 if ($AutoApprove) { $relaunchArgs += "-AutoApprove" }
+                if ($App)        { $relaunchArgs += "-App"; $relaunchArgs += $App }
+                if ($WhatIf)     { $relaunchArgs += "-WhatIf" }
                 & powershell.exe -ExecutionPolicy Bypass -File "$PSScriptRoot\master_update.ps1" @relaunchArgs
                 exit $LASTEXITCODE
             } else {
@@ -115,81 +120,103 @@ if (-not $RemoteVersionsUrl) {
     $RemoteVersionsUrl = "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json"
 }
 
-try {
-    $RemoteVersions = Invoke-RestMethod -Uri $RemoteVersionsUrl -UseBasicParsing
+$RemoteVersions = Get-RemoteManifest -LocalManifest $LocalVersions -Url $RemoteVersionsUrl
+if ([object]::ReferenceEquals($RemoteVersions, $LocalVersions)) {
+    Write-Warning "  -> Could not fetch remote versions.json. Using local versions.json for update check."
+    Write-DebugLog "WARN" "Remote versions.json fetch failed. Using local."
+} else {
     Write-Host "  -> Remote manifest loaded (schema $($RemoteVersions.schema), updated $($RemoteVersions.updated))." -ForegroundColor Green
     Write-DebugLog "INFO" "Remote versions.json loaded. updated=$($RemoteVersions.updated)"
-} catch {
-    Write-Warning "  -> Could not fetch remote versions.json: $_"
-    Write-Warning "     Using local versions.json for update check."
-    Write-DebugLog "WARN" "Remote versions.json fetch failed: $_. Using local."
-    $RemoteVersions = $LocalVersions
 }
 
+# Attach the manifest to the config object so per-app update scripts can read
+# repo/asset/package metadata (same convention as master_install.ps1).
+$Config | Add-Member -MemberType NoteProperty -Name "_Versions" -Value $RemoteVersions -Force
+
 # -----------------------------------------------------------------------------
-# PHASE 3: Compare installed versions vs manifest
+# PHASE 3: Compare installed versions vs manifest (data-driven plan)
 # -----------------------------------------------------------------------------
 Write-Host ""
 Write-Host "[Versions] Comparing installed versions..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE: Version comparison ==="
 
-function Get-InstalledVersion([string]$AppName) {
-    $lower    = $AppName.ToLower()
-    $lockFile = Join-Path $LocksDir ".$lower.lock"
-    if (Test-Path $lockFile) {
-        $v = (Get-Content $lockFile -Raw -ErrorAction SilentlyContinue).Trim()
-        if ($v) { return $v } else { return "unknown" }
+$ScriptsDir = Join-Path $PSScriptRoot "scripts"
+
+# Self-heal: detect real versions for apps whose legacy lock files stored
+# timestamps or placeholders ("installed", empty), and for apps installed
+# before the ledger existed (Loki, Alloy, Recyclarr, CrowdSec have no lock
+# files at all).  Record everything found in the ledger.
+foreach ($prop in $RemoteVersions.apps.PSObject.Properties) {
+    $appName   = $prop.Name
+    $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $appName
+    if ($installed -ieq "unknown" -or $null -eq $installed) {
+        $detected = Detect-InstalledVersion -AppName $appName -Entry $prop.Value -InstallDir $InstallDir
+        if ($detected) {
+            Set-InstalledVersion -InstallDir $InstallDir -AppName $appName -Version $detected
+            Write-Host ("  {0,-18} detected installed version: {1}" -f $appName, $detected) -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Ledger migration: $appName -> $detected"
+        }
     }
-    return $null   # not installed
 }
 
-$updates = [System.Collections.Generic.List[hashtable]]::new()
-$appOrder = @("Sonarr","Radarr","Prowlarr","Bazarr","Flaresolverr","Jellyfin","Deluge","ffmpeg","Caddy")
+$plan = @(Get-UpdatePlan -Manifest $RemoteVersions -InstallDir $InstallDir -ScriptsDir $ScriptsDir) |
+    Sort-Object App
 
-foreach ($appName in $appOrder) {
-    $manifestEntry = $RemoteVersions.apps.$appName
-    if (-not $manifestEntry) { continue }
-
-    $manifestVer  = $manifestEntry.version
-    $installedVer = Get-InstalledVersion $appName
-
-    if ($null -eq $installedVer) {
-        Write-Host ("  {0,-15} not installed (skipping)" -f $appName) -ForegroundColor DarkGray
-        continue
+foreach ($item in $plan) {
+    switch ($item.State) {
+        "current" {
+            Write-Host ("  {0,-18} {1} (up to date)" -f $item.App, $item.Installed) -ForegroundColor Green
+        }
+        "notinstalled" {
+            Write-Host ("  {0,-18} not installed (skipping)" -f $item.App) -ForegroundColor DarkGray
+        }
+        "unresolved" {
+            Write-Host ("  {0,-18} target version unresolved (skipping)" -f $item.App) -ForegroundColor DarkGray
+        }
+        "unknown" {
+            Write-Host ("  {0,-18} installed (version unknown) -> {1} (re-run installer to re-register)" -f $item.App, $item.Target) -ForegroundColor DarkGray
+        }
+        "manual" {
+            Write-Host ("  {0,-18} {1} -> {2} (manual: .\master_install.ps1 -Force {0})" -f $item.App, $item.Installed, $item.Target) -ForegroundColor DarkYellow
+        }
+        "update" {
+            $color = if ($item.Security) { "Red" } else { "Yellow" }
+            $tag   = if ($item.Security) { " [SECURITY]" } else { "" }
+            Write-Host ("  {0,-18} {1} -> {2}{3}" -f $item.App, $item.Installed, $item.Target, $tag) -ForegroundColor $color
+            if ($item.Security -and $item.SecurityNote) {
+                Write-Host ("                    {0}" -f $item.SecurityNote) -ForegroundColor Red
+            }
+        }
     }
-    if ($installedVer -eq "unknown") {
-        Write-Host ("  {0,-15} installed (version unknown) -> {1}" -f $appName, $manifestVer) -ForegroundColor DarkGray
-        continue
-    }
+}
 
-    $normalInstalledVer  = $installedVer.TrimStart('v')
-    $normalManifestVer   = $manifestVer.TrimStart('v')
-
-    if ($normalInstalledVer -ne $normalManifestVer) {
-        $securityFlag = ($manifestEntry.PSObject.Properties["security"] -and $manifestEntry.security -eq $true)
-        $noteText     = if ($manifestEntry.PSObject.Properties["securityNote"]) { $manifestEntry.securityNote } else { "" }
-        $color        = if ($securityFlag) { "Red" } else { "Yellow" }
-        $tag          = if ($securityFlag) { " [SECURITY]" } else { "" }
-        Write-Host ("  {0,-15} {1} -> {2}{3}" -f $appName, $installedVer, $manifestVer, $tag) -ForegroundColor $color
-        if ($securityFlag -and $noteText) { Write-Host ("               {0}" -f $noteText) -ForegroundColor Red }
-        $updates.Add(@{
-            Name         = $appName
-            Installed    = $installedVer
-            Manifest     = $manifestVer
-            Source       = $manifestEntry.source
-            Security     = $securityFlag
-            SecurityNote = $noteText
-            Entry        = $manifestEntry
-        })
-    } else {
-        Write-Host ("  {0,-15} {1} (up to date)" -f $appName, $installedVer) -ForegroundColor Green
+$updates = @($plan | Where-Object { $_.State -eq "update" })
+if ($App) {
+    $updates = @($updates | Where-Object { $_.App -ieq $App })
+    if ($updates.Count -eq 0) {
+        Write-Host ""
+        Write-Host "No pending update for '$App'." -ForegroundColor Green
+        exit 0
     }
 }
 Write-DebugLog "INFO" "Version comparison complete. Updates pending: $($updates.Count)"
 
 if ($updates.Count -eq 0) {
+    $manual = @($plan | Where-Object { $_.State -eq "manual" })
     Write-Host ""
-    Write-Host "All apps are up to date." -ForegroundColor Green
+    if ($manual.Count -gt 0) {
+        Write-Host "App updates are up to date." -ForegroundColor Green
+        Write-Host "Manual updates (no update script): $($manual.App -join ', ')." -ForegroundColor DarkYellow
+        Write-Host "Run: .\master_install.ps1 -Force <AppName>" -ForegroundColor DarkGray
+    } else {
+        Write-Host "All apps are up to date." -ForegroundColor Green
+    }
+    exit 0
+}
+
+if ($WhatIf) {
+    Write-Host ""
+    Write-Host "Dry run: $($updates.Count) update(s) would be applied. No changes made." -ForegroundColor Yellow
     exit 0
 }
 
@@ -207,166 +234,60 @@ if (-not $proceed) {
 }
 
 # -----------------------------------------------------------------------------
-# PHASE 4: Apply updates
+# PHASE 4: Apply updates (per-app update scripts)
 # -----------------------------------------------------------------------------
 Write-Host ""
 Write-Host "[Update] Applying updates..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE: Apply updates ==="
 
-$updateResults = @{}
+$updateResults = [System.Collections.Generic.List[object]]::new()
 
 foreach ($upd in $updates) {
-    $appName  = $upd.Name
-    $newVer   = $upd.Manifest
-    $source   = $upd.Source
-    $entry    = $upd.Entry
-
     if ($upd.Security -and $upd.SecurityNote) {
         Write-Host ""
-        Write-Host "  [SECURITY] $appName - $($upd.SecurityNote)" -ForegroundColor Red
+        Write-Host "  [SECURITY] $($upd.App) - $($upd.SecurityNote)" -ForegroundColor Red
     }
     Write-Host ""
-    Write-Host "  Updating $appName $($upd.Installed) -> $newVer ..." -ForegroundColor Cyan
-    Write-DebugLog "INFO" "Updating $($appName): $($upd.Installed) -> $newVer (source=$source)"
+    Write-Host "  Updating $($upd.App) $($upd.Installed) -> $($upd.Target) ..." -ForegroundColor Cyan
+    Write-DebugLog "INFO" "Updating $($upd.App): $($upd.Installed) -> $($upd.Target) (script=$($upd.ScriptPath))"
 
-    try {
-        if ($source -eq "chocolatey") {
-            # -- Choco upgrade ------------------------------------------------
-            $pkg = $entry.package
-            Write-Host "    choco upgrade $pkg --version $newVer" -ForegroundColor Gray
-            choco upgrade $pkg --version $newVer -y --no-progress | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "choco upgrade exited with code $LASTEXITCODE" }
-            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-
-        } elseif ($source -eq "github") {
-            # -- GitHub binary swap with rollback -----------------------------
-            $appBinDir = Join-Path $InstallDir $appName
-            $appBinBak = "$appBinDir.bak"
-            $assetPattern = $entry.asset
-            $repo         = $entry.repo
-
-            # Download the new release zip
-            $apiUri = "https://api.github.com/repos/$repo/releases/tags/$newVer"
-            Write-Host "    Fetching $apiUri ..." -ForegroundColor Gray
-            $release = Invoke-RestMethod -Uri $apiUri -UseBasicParsing
-            $asset   = $release.assets | Where-Object { $_.name -like $assetPattern } | Select-Object -First 1
-            if (-not $asset) { throw "No asset matching '$assetPattern' in release $newVer" }
-
-            $zipName = if ($appName -in @("Bazarr","Flaresolverr")) {
-                "$($appName.ToLower())-$newVer.zip"
-            } else {
-                $asset.name
-            }
-            $zipPath = Join-Path $BinDir $zipName
-            if (-not (Test-Path $zipPath)) {
-                Write-Host "    Downloading $($asset.name)..." -ForegroundColor Gray
-                Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
-                Write-DebugLog "INFO" "Downloaded $($asset.browser_download_url) -> $zipPath"
-            } else {
-                Write-Host "    Using cached $zipName." -ForegroundColor Gray
-            }
-
-            # Stop service
-            $svc = Get-Service -Name $appName -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -eq "Running") {
-                Write-Host "    Stopping $appName service..." -ForegroundColor Gray
-                Stop-Service -Name $appName -Force
-                Start-Sleep -Seconds 3
-            }
-
-            # Backup existing binaries
-            if (Test-Path $appBinBak) { Remove-Item $appBinBak -Recurse -Force }
-            if (Test-Path $appBinDir) {
-                Rename-Item -Path $appBinDir -NewName "$appName.bak" -Force
-                Write-DebugLog "INFO" "Backed up $appBinDir to $appBinBak"
-            }
-
-            # Extract new binaries
-            New-Item -Path $appBinDir -ItemType Directory -Force | Out-Null
-            Expand-Archive -Path $zipPath -DestinationPath $appBinDir -Force
-
-            # Flatten single-directory zips (Bazarr, Flaresolverr pattern)
-            $children = Get-ChildItem $appBinDir
-            if ($children.Count -eq 1 -and $children[0].PSIsContainer) {
-                $inner = $children[0].FullName
-                Get-ChildItem $inner | ForEach-Object { Move-Item $_.FullName $appBinDir -Force }
-                Remove-Item $inner -Recurse -Force
-            }
-
-            # Restart service
-            Start-Service -Name $appName -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
-
-            # Health check  --  service must be Running
-            $svcAfter = Get-Service -Name $appName -ErrorAction SilentlyContinue
-            if (-not $svcAfter -or $svcAfter.Status -ne "Running") {
-                Write-Warning "    Health check FAILED for $appName  --  rolling back."
-                Write-DebugLog "WARN" "$appName health check failed. Rolling back."
-
-                Stop-Service -Name $appName -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                if (Test-Path $appBinDir)  { Remove-Item $appBinDir  -Recurse -Force }
-                if (Test-Path $appBinBak)  { Rename-Item -Path $appBinBak -NewName $appName -Force }
-                Start-Service -Name $appName -ErrorAction SilentlyContinue
-
-                $updateResults[$appName] = "ROLLBACK"
-                continue
-            }
-
-            # Success: remove backup, clean old cached zips for this app
-            if (Test-Path $appBinBak) { Remove-Item $appBinBak -Recurse -Force }
-            Get-ChildItem $BinDir -Filter "$($appName.ToLower())-*.zip" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne $zipName } |
-                ForEach-Object { Remove-Item $_.FullName -Force }
-            Get-ChildItem $BinDir -Filter "$appName.*.zip" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne $asset.name } |
-                ForEach-Object { Remove-Item $_.FullName -Force }
-
-        } elseif ($source -eq "github_source") {
-            Write-Host "    $appName is built from source and cannot be auto-updated." -ForegroundColor DarkYellow
-            Write-Host "    Run: .\master_install.ps1 -Force $appName" -ForegroundColor DarkYellow
-            $updateResults[$appName] = "SKIPPED (source build)"
-            continue
-
-        } else {
-            Write-Warning "    Unknown source '$source' for $appName. Skipping."
-            $updateResults[$appName] = "SKIPPED (unknown source)"
-            continue
+    $res = Invoke-UpdateScriptForPlanItem -PlanItem $upd -InstallDir $InstallDir -BinDir $BinDir -Config $Config
+    if (-not $res) {
+        $res = [PSCustomObject]@{
+            App       = $upd.App
+            Status    = "FAILED"
+            Installed = $upd.Installed
+            Target    = $upd.Target
+            Detail    = "update script produced no result"
         }
+    }
+    $updateResults.Add($res)
 
-        # Write updated lock file
-        $lower    = $appName.ToLower()
-        $lockFile = Join-Path $LocksDir ".$lower.lock"
-        [System.IO.File]::WriteAllText($lockFile, $newVer, [System.Text.Encoding]::UTF8)
-        Write-Host "    $appName updated to $newVer." -ForegroundColor Green
-        Write-DebugLog "INFO" "$appName successfully updated to $newVer"
-        $updateResults[$appName] = "OK"
-
-    } catch {
-        Write-Warning "    Update FAILED for $appName : $_"
-        Write-DebugLog "ERROR" "$appName update failed: $_"
-        $updateResults[$appName] = "FAILED: $_"
+    if ($res.Status -eq "OK" -and $res.Target) {
+        # Keep the legacy lock file in sync (the ledger remains the source of truth).
+        $lockFile = Join-Path $LocksDir ".$($upd.App.ToLower()).lock"
+        [System.IO.File]::WriteAllText($lockFile, $res.Target, [System.Text.Encoding]::UTF8)
+        Write-Host "    $($upd.App) updated to $($res.Target)." -ForegroundColor Green
+        Write-DebugLog "INFO" "$($upd.App) successfully updated to $($res.Target)"
+    } elseif ($res.Status -eq "SKIPPED") {
+        Write-Host "    $($upd.App) skipped: $($res.Detail)" -ForegroundColor DarkYellow
+    } else {
+        Write-Warning "    $($upd.App): $($res.Status) - $($res.Detail)"
     }
 }
 
 # -----------------------------------------------------------------------------
 # PHASE 5: Summary
 # -----------------------------------------------------------------------------
-Write-Host ""
-Write-Host "=============================================" -ForegroundColor Cyan
-Write-Host "  Update Summary" -ForegroundColor Cyan
-Write-Host "=============================================" -ForegroundColor Cyan
+Write-SummaryTable -Results $updateResults -Title "Update Summary"
 
-foreach ($upd in $updates) {
-    $result = $updateResults[$upd.Name]
-    $color  = switch -Wildcard ($result) {
-        "OK"       { "Green" }
-        "ROLLBACK" { "Red" }
-        "FAILED*"  { "Red" }
-        default    { "DarkYellow" }
+$manual = @($plan | Where-Object { $_.State -eq "manual" })
+if ($manual.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  Manual updates (run .\master_install.ps1 -Force <AppName>):" -ForegroundColor DarkYellow
+    foreach ($m in $manual) {
+        Write-Host ("    {0,-18} {1} -> {2}" -f $m.App, $m.Installed, $m.Target) -ForegroundColor DarkGray
     }
-    Write-Host ("  {0,-15} {1}" -f $upd.Name, $result) -ForegroundColor $color
 }
 
-Write-Host "=============================================" -ForegroundColor Cyan
 Write-DebugLog "INFO" "master_update.ps1 finished."

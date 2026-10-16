@@ -1,0 +1,39 @@
+name: Bump recommended versions
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bump check (dry run)
+        shell: pwsh
+        run: .\scripts\bump_versions.ps1 -DryRun
+
+      - name: Apply bump
+        shell: pwsh
+        run: .\scripts\bump_versions.ps1
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: bump recommended app versions"
+          title: "chore: bump recommended app versions"
+          branch: versions/bump
+          delete-branch: true
+          body: |
+            Automated weekly bump of `versions.json` from upstream releases.
+
+            Review each version change before merging. Remember:
+            - Zurg is skipped by default (mount workaround needs re-verification per release).
+            - Use `-Security <App>` (manual run) to flag urgent security fixes.

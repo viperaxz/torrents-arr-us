@@ -135,6 +135,8 @@
         }
     }
 
+    {$LLM_BLOCK}
+
     # Dashboard at root — catches everything else (static HTML)
     handle {
         basic_auth {

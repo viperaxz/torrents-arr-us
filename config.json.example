@@ -34,6 +34,14 @@
     "ApiKey": "",
     "MountLetter": "R"
   },
+  "LLM": {
+    "Enabled": false,
+    "Subdomain": "llm",
+    "BackendHost": "127.0.0.1",
+    "BackendPort": 8081,
+    "ApiKey": "",
+    "ExposeUi": true
+  },
   "Ports": {
     "Jellyfin": 8096,
     "Sonarr": 8989,

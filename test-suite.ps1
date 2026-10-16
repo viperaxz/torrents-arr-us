@@ -47,6 +47,7 @@ $modules = [ordered]@{
     'Security'     = 'Test-Security.ps1'
     'Grafana'      = 'Test-Grafana.ps1'
     'RealDebrid'   = 'Test-RealDebrid.ps1'
+    'Update'       = 'Test-Update.ps1'
 }
 
 # -- Run selected modules -------------------------------------------------------

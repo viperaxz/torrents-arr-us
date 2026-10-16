@@ -254,5 +254,12 @@ if ($svc -and $svc.Status -eq "Running") {
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, [System.Text.Encoding]::UTF8)
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
+
+# Ledger entry for the updater (single source of truth for installed versions)
+if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "update_common.ps1")
+}
+Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $LockVersion
+
 Write-Host "[$AppName] Done." -ForegroundColor Cyan
 Write-DebugLog "INFO" "03_sonarr.ps1 complete"
