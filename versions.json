@@ -57,9 +57,10 @@
       "package": "deluge"
     },
     "ffmpeg": {
-      "version": "9.0.0",
-      "source": "chocolatey",
-      "package": "ffmpeg"
+      "version": "v8.1.3-1",
+      "source": "github",
+      "repo": "jellyfin/jellyfin-ffmpeg",
+      "asset": "*portable_win64-clang-gpl.zip"
     },
     "Caddy": {
       "version": "2.11.4",
