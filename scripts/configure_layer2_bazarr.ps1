@@ -16,14 +16,49 @@ if (-not $Config) {
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer2_bazarr.ps1 started"
 
+# -- helpers -------------------------------------------------------------------
+function Get-YamlKey {
+    param([string]$Path, [string]$Section, [string]$Key)
+    $inSection = $false
+    # -Encoding UTF8: the default (ANSI) decoder mangles non-ASCII YAML values.
+    foreach ($line in Get-Content -Path $Path -Encoding UTF8 -ErrorAction SilentlyContinue) {
+        if ($line -match "^$([regex]::Escape($Section)):") { $inSection = $true; continue }
+        if ($line -match "^\S" -and $line -notmatch "^---") { $inSection = $false }
+        if ($inSection -and $line -match "^\s{2}$([regex]::Escape($Key)):\s*(.*)$") {
+            $val = $matches[1].Trim()
+            # 'null' / '~' mean the setting is unset (Bazarr resets a null
+            # base_url to the empty default, i.e. served at the root).
+            if ($val -eq 'null' -or $val -eq '~') { return "" }
+            # Strip the quotes the YAML writer may have added around the scalar.
+            if ($val.Length -ge 2 -and $val.StartsWith("'") -and $val.EndsWith("'")) {
+                $val = $val.Substring(1, $val.Length - 2)
+            } elseif ($val.Length -ge 2 -and $val.StartsWith('"') -and $val.EndsWith('"')) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            return $val
+        }
+    }
+    return $null
+}
+
 $AppName    = "Bazarr"
 $Port       = $Config.Ports.Bazarr
 $DomainMode = $Config.General.DomainMode
 $DataDir    = "C:\ProgramData\$AppName"
 $ConfigFile = Join-Path $DataDir "config\config.yaml"
 
-$BaseUrl = if ($DomainMode -eq "duckdns") { "/bazarr" } else { "" }
+# The API lives under whatever base_url is stored in config.yaml (/bazarr in
+# DuckDNS mode).  Read the live value instead of assuming it, so a manual change
+# or a base_url that the installer could not write does not send every API call
+# to a path Bazarr does not serve.
+$ExpectedBaseUrl = if ($DomainMode -eq "duckdns") { "/bazarr" } else { "" }
+$LiveBaseUrl     = Get-YamlKey -Path $ConfigFile -Section "general" -Key "base_url"
+$BaseUrl = if ($null -ne $LiveBaseUrl) { ([string]$LiveBaseUrl).TrimEnd('/') } else { $ExpectedBaseUrl }
 $ApiBase = "http://127.0.0.1:$Port$BaseUrl"
+if ($BaseUrl -ne $ExpectedBaseUrl) {
+    Write-Warning "[$AppName] config.yaml base_url is '$BaseUrl' but '$ExpectedBaseUrl' is expected in $DomainMode mode."
+    Write-DebugLog "WARN" "base_url mismatch: live='$BaseUrl' expected='$ExpectedBaseUrl' mode=$DomainMode"
+}
 
 Write-DebugLog "VAR AppName=$AppName Port=$Port DomainMode=$DomainMode"
 Write-DebugLog "VAR BaseUrl=$BaseUrl ApiBase=$ApiBase ConfigFile=$ConfigFile"
@@ -35,20 +70,6 @@ if ($Config.Apps.Bazarr -ne $true) {
 }
 
 Write-Host "[$AppName] Configuring application integration..." -ForegroundColor Cyan
-
-# -- helpers -------------------------------------------------------------------
-function Get-YamlKey {
-    param([string]$Path, [string]$Section, [string]$Key)
-    $inSection = $false
-    foreach ($line in Get-Content $Path -ErrorAction SilentlyContinue) {
-        if ($line -match "^$([regex]::Escape($Section)):") { $inSection = $true; continue }
-        if ($line -match "^\S" -and $line -notmatch "^---") { $inSection = $false }
-        if ($inSection -and $line -match "^\s{2}$([regex]::Escape($Key)):\s*(.*)$") {
-            return $matches[1].Trim()
-        }
-    }
-    return $null
-}
 
 function Invoke-BazarrSettings {
     param([string[]]$FormParts)
@@ -96,6 +117,22 @@ if (-not $apiUp) {
     Write-DebugLog "ERROR" "Bazarr API not responding after 60s"
     exit 1
 }
+
+# -- 1b. Read current settings (so re-runs do not clobber manual changes) ------
+$CurrentSettings = $null
+try {
+    $CurrentSettings = Invoke-RestMethod -Uri "$ApiBase/api/system/settings" -Method Get `
+        -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+    Write-DebugLog "INFO" "Read current Bazarr settings for merge"
+} catch {
+    Write-DebugLog "WARN" "Could not read current settings (defaults will be written as-is): $_"
+}
+
+$ExistingProviders = @()
+if ($CurrentSettings -and $CurrentSettings.general -and $CurrentSettings.general.enabled_providers) {
+    $ExistingProviders = @($CurrentSettings.general.enabled_providers | Where-Object { $_ })
+}
+Write-DebugLog "VAR existing enabled_providers=$($ExistingProviders -join ',')"
 
 # -- 2. Read Sonarr/Radarr API keys --------------------------------------------
 $SonarrKey  = $null
@@ -187,6 +224,9 @@ $providerParts = [System.Collections.Generic.List[string]]::new()
 $providers = @("opensubtitlescom","yifysubtitles","embeddedsubtitles","gestdown")
 if ($TitloviUser) { $providers += "titlovi" }
 if ($SubdlApiKey) { $providers += "subdl" }
+# Merge with what is already enabled: a re-run must only add providers, never
+# silently disable ones the user turned on in the UI.
+$providers = @(($ExistingProviders + $providers) | Select-Object -Unique)
 $providers | ForEach-Object { $providerParts.Add("settings-general-enabled_providers=$_") }
 Write-DebugLog "VAR enabling providers=$($providers -join ',')"
 if ($OsComUser) {
@@ -206,8 +246,8 @@ if ($SubdlApiKey) {
 
 try {
     Invoke-BazarrSettings -FormParts $providerParts
-    Write-Host "     OK Providers: opensubtitlescom, yifysubtitles, embeddedsubtitles," -ForegroundColor Green
-    Write-Host "                   gestdown, titlovi, subdl (credential-gated)" -ForegroundColor Green
+    Write-Host "     OK Providers: $($providers -join ', ')" -ForegroundColor Green
+    Write-Host "                   (titlovi/subdl only when credentials are configured)" -ForegroundColor Green
     Write-DebugLog "INFO" "Subtitle providers enabled"
     if (-not $OsComUser)   { Write-Host "     ! Add OpenSubtitles.com credentials in Bazarr Settings for full quota." -ForegroundColor Yellow; Write-DebugLog "WARN" "OpenSubtitles.com credentials not set" }
     if (-not $TitloviUser) { Write-Host "     ! Add Titlovi credentials in Bazarr Settings for Romanian subtitles." -ForegroundColor Yellow; Write-DebugLog "WARN" "Titlovi credentials not set" }
@@ -218,10 +258,17 @@ try {
 }
 
 # -- 5. Create language profiles -----------------------------------------------
+# Bazarr's `languages-profiles` payload is a full replacement list: profiles that
+# are absent from it are DELETED.  It is therefore merged with the profiles that
+# already exist so that a re-run re-pushes our three managed profiles (the
+# documented remedy for a broken profile) without deleting or duplicating
+# user-created ones.
 Write-Host "  -> Creating language profiles..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Creating 3 language profiles (English, Romanian, English+Romanian)..."
 
-$profilesJson = @(
+$DefaultProfileName = "English + Romanian"
+$DefaultProfileId   = 3
+$DesiredProfiles = @(
     @{
         profileId      = 1
         name           = "English"
@@ -252,7 +299,57 @@ $profilesJson = @(
         mustNotContain = @()
         originalFormat = $false
     }
-) | ConvertTo-Json -Depth 5 -Compress
+)
+
+$ExistingProfiles = @()
+try {
+    # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the whole
+    # response array into ONE element, so the comparisons below would see the array
+    # itself, silently drop every existing profile from the payload (which Bazarr
+    # reads as "deleted") and mis-resolve the managed profile ids.
+    $fetchedProfiles = Invoke-RestMethod -Uri "$ApiBase/api/system/languages/profiles" -Method Get `
+        -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+    if ($fetchedProfiles) {
+        # Only keep entries that actually look like a profile, so a non-array
+        # payload (error document served with HTTP 200) cannot be posted back.
+        $ExistingProfiles = @($fetchedProfiles | Where-Object {
+            $_ -and $_.PSObject.Properties['name'] -and $_.PSObject.Properties['profileId']
+        })
+    }
+    Write-DebugLog "VAR existing language profiles=$(@($ExistingProfiles | ForEach-Object { "$($_.profileId):$($_.name)" }) -join ', ')"
+} catch {
+    Write-DebugLog "WARN" "Could not list existing language profiles (using fixed ids 1-3): $_"
+}
+
+$ProfilesPayload = @()
+if ($ExistingProfiles.Count -gt 0) {
+    # Keep every existing profile, then append/overwrite our managed ones.
+    $managedNames = @($DesiredProfiles | ForEach-Object { $_.name })
+    $ProfilesPayload = @($ExistingProfiles | Where-Object { $_.name -notin $managedNames })
+    $nextId = 1
+    foreach ($p in $ExistingProfiles) {
+        $profId = 0
+        [void][int]::TryParse([string]$p.profileId, [ref]$profId)
+        if ($profId -ge $nextId) { $nextId = $profId + 1 }
+    }
+    foreach ($d in $DesiredProfiles) {
+        $match = @($ExistingProfiles | Where-Object { $_.name -eq $d.name }) | Select-Object -First 1
+        $mid = 0
+        if ($match) { [void][int]::TryParse([string]$match.profileId, [ref]$mid) }
+        if ($mid -gt 0) {
+            $d.profileId = $mid
+        } else {
+            $d.profileId = $nextId
+            $nextId++
+        }
+        if ($d.name -eq $DefaultProfileName) { $DefaultProfileId = [int]$d.profileId }
+        $ProfilesPayload += $d
+    }
+} else {
+    $ProfilesPayload = $DesiredProfiles
+}
+
+$profilesJson = @($ProfilesPayload) | ConvertTo-Json -Depth 10 -Compress
 
 Write-DebugLog "VAR profiles JSON length=$($profilesJson.Length) chars"
 try {
@@ -260,8 +357,8 @@ try {
     Invoke-RestMethod -Uri "$ApiBase/api/system/settings" -Method POST `
         -Headers $Headers -Body $body -ContentType "application/x-www-form-urlencoded" `
         -UseBasicParsing -ErrorAction Stop | Out-Null
-    Write-Host "     OK Profiles: English (1), Romanian (2), English + Romanian (3)" -ForegroundColor Green
-    Write-DebugLog "INFO" "Language profiles created: English(1) Romanian(2) English+Romanian(3)"
+    Write-Host "     OK Profiles: $(@($ProfilesPayload | ForEach-Object { "$($_.name) ($($_.profileId))" }) -join ', ')" -ForegroundColor Green
+    Write-DebugLog "INFO" "Language profiles written: $(@($ProfilesPayload | ForEach-Object { "$($_.name)($($_.profileId))" }) -join ' ')"
 } catch {
     Write-Warning "[$AppName] Could not create language profiles: $_"
     Write-DebugLog "ERROR" "Language profiles creation failed: $_"
@@ -269,18 +366,18 @@ try {
 
 # -- 6. Set defaults: auto-download for all content ---------------------------
 Write-Host "  -> Configuring auto-download defaults..." -ForegroundColor Gray
-Write-DebugLog "INFO" "Setting auto-download defaults to profile 3 (English+Romanian)..."
+Write-DebugLog "INFO" "Setting auto-download defaults to profile $DefaultProfileId ($DefaultProfileName)..."
 try {
     Invoke-BazarrSettings -FormParts @(
         "settings-general-serie_default_enabled=true"
-        "settings-general-serie_default_profile=3"
+        "settings-general-serie_default_profile=$DefaultProfileId"
         "settings-general-movie_default_enabled=true"
-        "settings-general-movie_default_profile=3"
+        "settings-general-movie_default_profile=$DefaultProfileId"
         "settings-general-use_embedded_subs=true"
         "settings-general-utf8_encode=true"
     )
-    Write-Host "     OK Auto-download enabled with 'English + Romanian' profile." -ForegroundColor Green
-    Write-DebugLog "INFO" "Auto-download: series+movies default_profile=3 use_embedded_subs=true utf8_encode=true"
+    Write-Host "     OK Auto-download enabled with '$DefaultProfileName' profile ($DefaultProfileId)." -ForegroundColor Green
+    Write-DebugLog "INFO" "Auto-download: series+movies default_profile=$DefaultProfileId use_embedded_subs=true utf8_encode=true"
 } catch {
     Write-Warning "[$AppName] Could not set auto-download defaults: $_"
     Write-DebugLog "ERROR" "Auto-download defaults failed: $_"

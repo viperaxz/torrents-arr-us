@@ -21,6 +21,24 @@ $AppName     = "Bazarr"
 $ServiceName = "Bazarr"
 $AppBinDir   = Join-Path $InstallDir $AppName
 
+# Bazarr mounts its API under the base_url stored in config.yaml (/bazarr in
+# DuckDNS mode).  Read it so the health check can probe the real path.
+function Get-BazarrBaseUrl {
+    param([string]$ConfigYaml)
+    if (-not (Test-Path $ConfigYaml)) { return $null }
+    $inGeneral = $false
+    foreach ($line in (Get-Content -Path $ConfigYaml -Encoding UTF8 -ErrorAction SilentlyContinue)) {
+        if ($line -match '^general:') { $inGeneral = $true; continue }
+        if ($line -match '^\S' -and $line -notmatch '^---') { $inGeneral = $false }
+        if ($inGeneral -and $line -match '^\s{2}base_url:\s*(.*)$') {
+            $v = $Matches[1].Trim().Trim("'").Trim('"')
+            if ($v -eq 'null' -or $v -eq '~') { $v = '' }
+            return $v.TrimEnd('/')
+        }
+    }
+    return $null
+}
+
 $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $AppName
 
 if ($WhatIf) {
@@ -84,11 +102,33 @@ try {
         }
     }
 
-    # Start service and health-check.
+    # Start service and health-check.  Bazarr runs from Python, so the first
+    # start after a pip refresh can take far longer than a fixed sleep -- and a
+    # bare "service is Running" check cannot tell a healthy Bazarr from one that
+    # crash-loops (NSSM restarts it, so the status flaps back to Running).
+    # Poll the service AND the unauthenticated API before declaring success.
     Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 15
-    $svcAfter = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "Bazarr service not Running after update" }
+    $bazarrPort = if ($Config -and $Config.Ports -and $Config.Ports.Bazarr) { $Config.Ports.Bazarr } else { 6767 }
+    $baseUrl    = Get-BazarrBaseUrl -ConfigYaml "C:\ProgramData\$AppName\config\config.yaml"
+    $pingUrl    = if ($null -eq $baseUrl) { $null } else { "http://127.0.0.1:$bazarrPort$baseUrl/api/system/ping" }
+    if ($pingUrl) { Write-Host "  -> Waiting for the Bazarr API at $pingUrl ..." -ForegroundColor Gray }
+
+    $deadline = (Get-Date).AddSeconds(60)
+    $healthy  = $false
+    while (-not $healthy -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        $svcAfter = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svcAfter -or $svcAfter.Status -ne "Running") { continue }
+        if (-not $pingUrl) { $healthy = $true; break }
+        try {
+            Invoke-RestMethod -Uri $pingUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
+            $healthy = $true
+        } catch { }
+    }
+    if (-not $healthy) {
+        if ($pingUrl) { throw "Bazarr API not responding after update (60s): $pingUrl" }
+        throw "Bazarr service not Running after update (60s)"
+    }
 
     if (Test-Path $appBinBak) { Remove-Item $appBinBak -Recurse -Force }
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version

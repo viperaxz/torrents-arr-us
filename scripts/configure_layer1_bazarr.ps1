@@ -16,6 +16,31 @@ if (-not $Config) {
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer1_bazarr.ps1 started"
 
+# -- helpers -------------------------------------------------------------------
+function Get-YamlKey {
+    param([string]$Path, [string]$Section, [string]$Key)
+    $inSection = $false
+    # -Encoding UTF8: the default (ANSI) decoder mangles non-ASCII YAML values.
+    foreach ($line in Get-Content -Path $Path -Encoding UTF8 -ErrorAction SilentlyContinue) {
+        if ($line -match "^$([regex]::Escape($Section)):") { $inSection = $true; continue }
+        if ($line -match "^\S" -and $line -notmatch "^---") { $inSection = $false }
+        if ($inSection -and $line -match "^\s{2}$([regex]::Escape($Key)):\s*(.*)$") {
+            $val = $matches[1].Trim()
+            # 'null' / '~' mean the setting is unset (Bazarr resets a null
+            # base_url to the empty default, i.e. served at the root).
+            if ($val -eq 'null' -or $val -eq '~') { return "" }
+            # Strip the quotes the YAML writer may have added around the scalar.
+            if ($val.Length -ge 2 -and $val.StartsWith("'") -and $val.EndsWith("'")) {
+                $val = $val.Substring(1, $val.Length - 2)
+            } elseif ($val.Length -ge 2 -and $val.StartsWith('"') -and $val.EndsWith('"')) {
+                $val = $val.Substring(1, $val.Length - 2)
+            }
+            return $val
+        }
+    }
+    return $null
+}
+
 $AppName    = "Bazarr"
 $Port       = $Config.Ports.Bazarr
 $DomainMode = $Config.General.DomainMode
@@ -24,9 +49,18 @@ $Password   = $Config.General.AdminPassword
 $DataDir    = "C:\ProgramData\$AppName"
 $ConfigFile = Join-Path $DataDir "config\config.yaml"
 
-# Bazarr API lives under /bazarr in DuckDNS mode (base_url set during install)
-$BaseUrl = if ($DomainMode -eq "duckdns") { "/bazarr" } else { "" }
+# The API lives under whatever base_url is stored in config.yaml (/bazarr in
+# DuckDNS mode).  Read the live value instead of assuming it, so a manual change
+# or a base_url that the installer could not write does not send every API call
+# to a path Bazarr does not serve.
+$ExpectedBaseUrl = if ($DomainMode -eq "duckdns") { "/bazarr" } else { "" }
+$LiveBaseUrl     = Get-YamlKey -Path $ConfigFile -Section "general" -Key "base_url"
+$BaseUrl = if ($null -ne $LiveBaseUrl) { ([string]$LiveBaseUrl).TrimEnd('/') } else { $ExpectedBaseUrl }
 $ApiBase = "http://127.0.0.1:$Port$BaseUrl"
+if ($BaseUrl -ne $ExpectedBaseUrl) {
+    Write-Warning "[$AppName] config.yaml base_url is '$BaseUrl' but '$ExpectedBaseUrl' is expected in $DomainMode mode."
+    Write-DebugLog "WARN" "base_url mismatch: live='$BaseUrl' expected='$ExpectedBaseUrl' mode=$DomainMode"
+}
 
 Write-DebugLog "VAR AppName=$AppName Port=$Port DomainMode=$DomainMode"
 Write-DebugLog "VAR BaseUrl=$BaseUrl ApiBase=$ApiBase"
@@ -40,20 +74,6 @@ if ($Config.Apps.Bazarr -ne $true) {
 }
 
 Write-Host "[$AppName] Configuring..." -ForegroundColor Cyan
-
-# -- helpers -------------------------------------------------------------------
-function Get-YamlKey {
-    param([string]$Path, [string]$Section, [string]$Key)
-    $inSection = $false
-    foreach ($line in Get-Content $Path -ErrorAction SilentlyContinue) {
-        if ($line -match "^$([regex]::Escape($Section)):") { $inSection = $true; continue }
-        if ($line -match "^\S" -and $line -notmatch "^---") { $inSection = $false }
-        if ($inSection -and $line -match "^\s{2}$([regex]::Escape($Key)):\s*(.*)$") {
-            return $matches[1].Trim()
-        }
-    }
-    return $null
-}
 
 # -- 1. Ensure service is running ----------------------------------------------
 $svc = Get-Service -ErrorAction SilentlyContinue |

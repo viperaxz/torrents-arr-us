@@ -61,8 +61,12 @@ function Test-YamlNeedsQuoting {
 function Set-YamlKey {
     param([string]$Path, [string]$Section, [string]$Key, [string]$Value)
     Write-DebugLog "INFO" "Set-YamlKey: file=$Path section=$Section key=$Key value=$Value"
-    $quotedValue = if (Test-YamlNeedsQuoting $Value) { "'$Value'" } else { $Value }
-    $lines     = Get-Content $Path
+    # A single quote inside a single-quoted YAML scalar must be doubled,
+    # otherwise the value terminates the scalar early and breaks the whole file.
+    $quotedValue = if (Test-YamlNeedsQuoting $Value) { "'" + ($Value -replace "'", "''") + "'" } else { $Value }
+    # -Encoding UTF8: PowerShell 5.1's default (ANSI) decoder mangles every
+    # non-ASCII character, and the mangled text would be written back as UTF-8.
+    $lines     = Get-Content -Path $Path -Encoding UTF8
     $inSection = $false
     $found     = $false
     $sectionIndent = ""
@@ -93,6 +97,11 @@ function Set-YamlKey {
     }
     [System.IO.File]::WriteAllText($Path, ($out -join "`n"), (New-Object System.Text.UTF8Encoding $false))
     Write-DebugLog "INFO" "Set-YamlKey complete. Found existing key=$found"
+    if (-not $found) {
+        Write-Warning "  -> Section '$Section' not found in $(Split-Path $Path -Leaf); '$Key' was NOT written."
+        Write-DebugLog "ERROR" "Set-YamlKey: section '$Section' not found in $Path -- '$Key' not written"
+    }
+    return $found
 }
 
 # -- 1. Ensure Python 3.12 is installed ---------------------------------------
@@ -130,13 +139,25 @@ $candidate = Test-PythonCandidate "C:\Python312\python.exe"
 if ($candidate) { $PythonExe = $candidate.Path; Write-DebugLog "INFO" "Found Python $($candidate.VersionStr) at $PythonExe (Chocolatey default)" }
 
 # Step 2: Scan C:\Python3* directories (user-installed, winget, etc.)
+# Compare parsed versions (minor/patch) rather than directory names: a plain
+# descending name sort puts "Python39" ahead of "Python310"/"Python312" and
+# would silently select an older interpreter.
 if (-not $PythonExe) {
-    Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue |
-        Sort-Object Name -Descending | ForEach-Object {
-            if ($PythonExe) { return }
-            $candidate = Test-PythonCandidate (Join-Path $_.FullName "python.exe")
-            if ($candidate) { $PythonExe = $candidate.Path; Write-DebugLog "INFO" "Found Python $($candidate.VersionStr) at $PythonExe (C:\Python3* scan)" }
+    $bestCandidate = $null
+    Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $candidate = Test-PythonCandidate (Join-Path $_.FullName "python.exe")
+        if ($candidate) {
+            if (-not $bestCandidate -or
+                $candidate.Minor -gt $bestCandidate.Minor -or
+                ($candidate.Minor -eq $bestCandidate.Minor -and $candidate.Patch -gt $bestCandidate.Patch)) {
+                $bestCandidate = $candidate
+            }
         }
+    }
+    if ($bestCandidate) {
+        $PythonExe = $bestCandidate.Path
+        Write-DebugLog "INFO" "Found Python $($bestCandidate.VersionStr) at $PythonExe (C:\Python3* scan, newest)"
+    }
 }
 
 # Step 3: Check PATH (system-wide installs, venvs, etc.)
@@ -193,10 +214,18 @@ $PinnedVersion = if ($Config._Versions -and $Config._Versions.Apps.Bazarr) { $Co
 $AssetName     = if ($Config._Versions -and $Config._Versions.Apps.Bazarr) { $Config._Versions.Apps.Bazarr.asset } else { "bazarr.zip" }
 Write-DebugLog "VAR PinnedVersion=$PinnedVersion AssetName=$AssetName"
 
-# Version-specific cache check
+# Version-specific cache check.  The pinned version must match: falling back to
+# "any cached zip" would install an older release while the lock file/ledger
+# record the pinned version (and update_bazarr.ps1 would then consider the
+# install up to date).
+$VersionNumeric = if ($PinnedVersion) { $PinnedVersion.TrimStart('v') } else { $null }
 $CacheFile = if ($PinnedVersion) { Join-Path $BinDir "bazarr-$PinnedVersion.zip" } else { $null }
 $CachedZip = if ($CacheFile -and (Test-Path $CacheFile)) {
     Get-Item $CacheFile
+} elseif ($VersionNumeric) {
+    Get-ChildItem $BinDir -Filter "bazarr*$VersionNumeric*.zip" -ErrorAction SilentlyContinue |
+        Where-Object { $_.BaseName -match "(^|[^0-9])$([regex]::Escape($VersionNumeric))([^0-9]|$)" } |
+        Select-Object -First 1
 } else {
     Get-ChildItem $BinDir -Filter "bazarr-*.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
 }
@@ -206,6 +235,12 @@ if ($CachedZip) {
     Write-Host "  -> Using cached $($CachedZip.Name)..." -ForegroundColor Gray
     $ZipPath = $CachedZip.FullName
     Write-DebugLog "INFO" "Using cached zip: $ZipPath"
+    # Unpinned installs: keep the recorded version aligned with the archive we
+    # actually install instead of writing "unknown" to the ledger.
+    if (-not $PinnedVersion -and $CachedZip.BaseName -match '(\d+\.\d+\.\d+[0-9A-Za-z\.\-]*)$') {
+        $PinnedVersion = $Matches[1]
+        Write-DebugLog "VAR PinnedVersion derived from cached zip name=$PinnedVersion"
+    }
 } else {
     $ApiUri = if ($PinnedVersion) {
         "https://api.github.com/repos/morpheus65535/bazarr/releases/tags/$PinnedVersion"
@@ -302,7 +337,7 @@ if (Test-Path $ReqFile) {
         Write-Host "  -> webrtcvad-wheels not available for this Python version (no MSVC build tools)." -ForegroundColor Yellow
         Write-Host "     ffsubsync disabled; alass will handle subtitle sync." -ForegroundColor Yellow
         Write-DebugLog "WARN" "webrtcvad-wheels unavailable  --  installing requirements without webrtcvad"
-        $FilteredReq = [System.IO.Path]::GetTempFileName() + ".txt"
+        $FilteredReq = [System.IO.Path]::GetTempFileName()
         (Get-Content $ReqFile | Where-Object { $_ -notmatch "webrtcvad" }) | Set-Content $FilteredReq
         Write-DebugLog "VAR filtered requirements file=$FilteredReq"
         try {
@@ -433,9 +468,14 @@ if (-not (Test-Path $ConfigFile)) {
     # -- 9. Set base_url for DuckDNS path routing ------------------------------
     if ($DomainMode -eq "duckdns") {
         Write-DebugLog "INFO" "DuckDNS mode: setting base_url=/$AppLower in $ConfigFile"
-        Set-YamlKey -Path $ConfigFile -Section "general" -Key "base_url" -Value "/$AppLower"
-        Write-Host "  -> base_url set to /$AppLower (DuckDNS mode)." -ForegroundColor Green
-        Write-DebugLog "INFO" "config.yaml base_url updated to '/$AppLower'"
+        $placed = @(Set-YamlKey -Path $ConfigFile -Section "general" -Key "base_url" -Value "/$AppLower") -contains $true
+        if ($placed) {
+            Write-Host "  -> base_url set to /$AppLower (DuckDNS mode)." -ForegroundColor Green
+            Write-DebugLog "INFO" "config.yaml base_url updated to '/$AppLower'"
+        } else {
+            Write-Warning "  -> Could not set base_url in config.yaml. Bazarr will serve at the domain root instead of /$AppLower."
+            Write-DebugLog "ERROR" "Set-YamlKey did not write base_url to $ConfigFile"
+        }
     } else {
         Write-DebugLog "INFO" "Cloudflare mode: base_url not set in config.yaml"
     }
