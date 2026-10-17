@@ -350,6 +350,63 @@ if (Test-Path $checkScript) {
     }
 }
 
+# -- Register periodic health-check (test suite) task --------------------------
+# The "Test Suite Results" Grafana dashboard reads {job="test-suite"} from Loki, so
+# it stays empty until test-suite.ps1 runs -- nothing used to run it but a human.
+# A -Quick pass is L1 across every service (52 probes, ~3 s), which is exactly the
+# "is the whole stack healthy right now" question the panel asks, so run it on a
+# timer and fire one immediately so the panel has data on day one.
+$suiteScript = Join-Path $PSScriptRoot "test-suite.ps1"
+if (Test-Path $suiteScript) {
+    $suiteTask = "Seedbox_TestSuite"
+    try {
+        $suiteAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                              -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -Quick"
+        $suiteTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                              -RepetitionInterval (New-TimeSpan -Minutes 15) `
+                              -RepetitionDuration (New-TimeSpan -Days 3650)
+        # IgnoreNew so a slow run is never overlapped; the battery flags match the
+        # other Seedbox_* registrations (a desktop box is often on a UPS/battery).
+        $suiteSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                              -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                              -MultipleInstances IgnoreNew `
+                              -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+        $suitePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+                              -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $suiteTask -Action $suiteAction -Trigger $suiteTrigger `
+            -Settings $suiteSettings -Principal $suitePrincipal -Force | Out-Null
+        Write-Host "  Health-check task registered (test-suite -Quick every 15 min, SYSTEM)." -ForegroundColor DarkGray
+        Write-DebugLog "INFO" "Scheduled task '$suiteTask' registered"
+    } catch {
+        Write-Warning "Could not register the health-check task: $_"
+        Write-DebugLog "WARN" "Failed to register scheduled task '$suiteTask': $_"
+    }
+
+    # First run now: the task fires at the next 10-minute boundary, and an empty
+    # dashboard until then reads as "broken".  This context is elevated, so the
+    # <InstallDir>\dashboard\test_results.json export succeeds too.
+    try {
+        Write-Host "  Running the first health check (test-suite -Quick)..." -ForegroundColor DarkGray
+        $savedEAP = $ErrorActionPreference
+        try {
+            # test-suite.ps1 warns to stderr on a SKIP; that must not abort the install.
+            $ErrorActionPreference = "Continue"
+            $suiteOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $suiteScript -Quick 2>&1 | Out-String
+        } finally {
+            $ErrorActionPreference = $savedEAP
+        }
+        $suiteSummary = ($suiteOut -split "`r?`n" | Where-Object { $_ -match 'PASS:\d+' } | Select-Object -Last 1)
+        if ($suiteSummary) {
+            Write-Host "  $($suiteSummary.Trim())" -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Initial health check: $($suiteSummary.Trim())"
+        } else {
+            Write-DebugLog "WARN" "Initial health check produced no summary line (exit=$LASTEXITCODE)"
+        }
+    } catch {
+        Write-DebugLog "WARN" "Initial health check run failed: $_"
+    }
+}
+
 # -- Register 'box' CLI in system PATH ----------------------------------------
 $projectRoot    = $PSScriptRoot
 $machinePath    = [Environment]::GetEnvironmentVariable("Path", "Machine")

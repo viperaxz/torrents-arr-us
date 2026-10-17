@@ -5,7 +5,7 @@
     { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" }
   ],
   "annotations": { "list": [] },
-  "description": "win-seedbox test suite results",
+  "description": "win-seedbox test suite results. Fed by test-suite.ps1: the Seedbox_TestSuite scheduled task runs it with -Quick every 15 minutes, so the panels show the latest run.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -13,7 +13,7 @@
   "links": [],
   "panels": [
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "green", "mode": "fixed" },
@@ -29,15 +29,15 @@
       "type": "stat",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-          "expr": "sum(count_over_time({job=\"test-suite\", status=\"PASS\"}[$__range]))",
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
+          "expr": "count(count by (service, test) (count_over_time({job=\"test-suite\", status=\"PASS\"}[$__range])))",
           "legendFormat": "PASS",
           "refId": "A"
         }
       ]
     },
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "red", "mode": "fixed" },
@@ -53,15 +53,15 @@
       "type": "stat",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-          "expr": "sum(count_over_time({job=\"test-suite\", status=\"FAIL\"}[$__range]))",
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
+          "expr": "count(count by (service, test) (count_over_time({job=\"test-suite\", status=\"FAIL\"}[$__range])))",
           "legendFormat": "FAIL",
           "refId": "A"
         }
       ]
     },
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "orange", "mode": "fixed" },
@@ -77,15 +77,15 @@
       "type": "stat",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-          "expr": "sum(count_over_time({job=\"test-suite\", status=\"WARN\"}[$__range]))",
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
+          "expr": "count(count by (service, test) (count_over_time({job=\"test-suite\", status=\"WARN\"}[$__range])))",
           "legendFormat": "WARN",
           "refId": "A"
         }
       ]
     },
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "blue", "mode": "fixed" },
@@ -101,15 +101,15 @@
       "type": "stat",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-          "expr": "sum(count_over_time({job=\"test-suite\", status=\"SKIP\"}[$__range]))",
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
+          "expr": "count(count by (service, test) (count_over_time({job=\"test-suite\", status=\"SKIP\"}[$__range])))",
           "legendFormat": "SKIP",
           "refId": "A"
         }
       ]
     },
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "custom": {
@@ -130,7 +130,7 @@
       "type": "table",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
           "expr": "{job=\"test-suite\"} | logfmt | line_format \"{{.status}}\\t{{.service}}\\tL{{.layer}}\\t{{.test}}\\t{{.message}}\"",
           "legendFormat": "",
           "refId": "A",
@@ -139,7 +139,7 @@
       ]
     },
     {
-      "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
+      "datasource": { "type": "loki", "uid": "loki-seedbox" },
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -155,8 +155,8 @@
       "type": "timeseries",
       "targets": [
         {
-          "datasource": { "type": "loki", "uid": "${DS_LOKI}" },
-          "expr": "sum by (service) (count_over_time({job=\"test-suite\", status=\"PASS\"}[$__range])) / sum by (service) (count_over_time({job=\"test-suite\"}[$__range]))",
+          "datasource": { "type": "loki", "uid": "loki-seedbox" },
+          "expr": "count by (service) (count by (service, test) (count_over_time({job=\"test-suite\", status=\"PASS\"}[$__range]))) / count by (service) (count by (service, test) (count_over_time({job=\"test-suite\"}[$__range])))",
           "legendFormat": "{{service}}",
           "refId": "A"
         }
@@ -166,21 +166,7 @@
   "refresh": "5m",
   "schemaVersion": 38,
   "tags": ["seedbox", "tests"],
-  "templating": {
-    "list": [
-      {
-        "current": {},
-        "hide": 0,
-        "includeAll": false,
-        "name": "DS_LOKI",
-        "options": [],
-        "query": "loki",
-        "refresh": 1,
-        "type": "datasource"
-      }
-    ]
-  },
-  "time": { "from": "now-7d", "to": "now" },
+  "time": { "from": "now-15m", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
   "title": "Test Suite Results",
