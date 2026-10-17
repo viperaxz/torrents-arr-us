@@ -879,16 +879,25 @@ Layers 2 and 3 assert values rather than counts on purpose: an indexer count alo
 
 An unknown `-Service` exits 1 rather than running zero modules. Results are written to `<InstallDir>\dashboard\test_results.json` — including a `loki_push` field recording whether Loki accepted them — and pushed to Loki when `Apps.Grafana = true`. Output uses `[PASS]` / `[FAIL]` / `[WARN]` / `[SKIP]` lines per check, with a final summary count.
 
-**It runs on a schedule — at two different depths.**
+**It runs on a schedule — at two different depths, both read from `config.json`.**
 
 | Task | Cadence | Runs | Why |
 |---|---|---|---|
-| `Seedbox_TestSuite` | every 15 minutes | `-Quick` (Layer 1, 52 probes, ~3 s) | the cheap "is everything up" tick that feeds the *Test Suite Results* dashboard |
-| `Seedbox_TestSuiteFull` | daily at 04:00 | all layers (115 checks) | Layer 3 runs real operations — an RSS sync over every synced indexer, a live indexer search, a magnet added and removed — so once a day is the limit |
+| `Seedbox_TestSuite` | `Tests.Quick.IntervalMinutes` (default **15 min**) | `-Quick` (Layer 1, 52 probes, ~3 s) | the cheap "is everything up" tick that feeds the *Test Suite Results* dashboard |
+| `Seedbox_TestSuiteFull` | `Tests.Full.Hour` daily (default **13:00**) | all layers (115 checks) | Layer 3 runs real operations — an RSS sync over every synced indexer, a live indexer search, a magnet added and removed — so once a day is the limit |
 
-Both are registered by `master_install.ps1` as SYSTEM and removed by `master_uninstall.ps1`. `test-suite.ps1` gets `-ScheduledDaily` from the daily task, which refuses a second run on the same calendar day by claiming the date in `<InstallDir>\.locks\test-suite-full.last-run` **before** the suite starts — so a hung or crashed run cannot be retried into a second full pass, and Task Scheduler's `-StartWhenAvailable` catch-up cannot produce one either. Manual runs are never gated: `.\test-suite.ps1` with no switch always runs.
+```json
+"Tests": {
+  "Quick": { "Enabled": true, "IntervalMinutes": 15 },
+  "Full":  { "Enabled": true, "Hour": 13 }
+}
+```
 
-The 15-minute tick is what keeps the Grafana panel populated (it queries `{job="test-suite"}` over a 15-minute window); without it the panel is permanently empty.
+Missing keys fall back to those defaults, so a `config.json` written before this block existed still installs. `IntervalMinutes` is clamped to 1–1440 and `Hour` to 0–23, with a warning rather than a task that never fires. Setting `"Enabled": false` also **removes** a task left by an earlier install, so disabling a schedule in config actually takes effect rather than leaving the old task running. Both are registered by `master_install.ps1` as SYSTEM and removed by `master_uninstall.ps1`.
+
+`test-suite.ps1` gets `-ScheduledDaily` from the daily task, which refuses a second run on the same calendar day by claiming the date in `<InstallDir>\.locks\test-suite-full.last-run` **before** the suite starts — so a hung or crashed run cannot be retried into a second full pass, and Task Scheduler's `-StartWhenAvailable` catch-up cannot produce one either. Manual runs are never gated: `.\test-suite.ps1` with no switch always runs.
+
+The quick tick is what keeps the Grafana panel populated (it queries `{job="test-suite"}` over a 15-minute window); without it the panel is permanently empty.
 
 `-Layer 2` and `-Layer 3` can be run in isolation, but the per-app modules authenticate for themselves (Deluge's session used to be created only by its Layer 1 block, so isolated runs reported every RPC as a failure).
 

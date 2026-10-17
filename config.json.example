@@ -65,6 +65,16 @@
     "ExtraWhitelistIps": [],
     "AbuseBlocklists": true
   },
+  "Tests": {
+    "Quick": {
+      "Enabled": true,
+      "IntervalMinutes": 15
+    },
+    "Full": {
+      "Enabled": true,
+      "Hour": 13
+    }
+  },
   "Users": [
     { "Username": "alice", "Password": "" },
     { "Username": "bob",   "Password": "" }

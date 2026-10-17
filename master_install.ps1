@@ -350,89 +350,147 @@ if (Test-Path $checkScript) {
     }
 }
 
-# -- Register periodic health-check (test suite) task --------------------------
+# -- Register health-check (test suite) tasks, schedules from config ------------
 # The "Test Suite Results" Grafana dashboard reads {job="test-suite"} from Loki, so
-# it stays empty until test-suite.ps1 runs -- nothing used to run it but a human.
-# A -Quick pass is L1 across every service (52 probes, ~3 s), which is exactly the
-# "is the whole stack healthy right now" question the panel asks, so run it on a
-# timer and fire one immediately so the panel has data on day one.
+# it stays empty until test-suite.ps1 runs. Two schedules, both read from config.json:
+#
+#   Tests.Quick { Enabled, IntervalMinutes }  ->  -Quick          L1 only, cheap tick
+#   Tests.Full  { Enabled, Hour }             ->  -ScheduledDaily all layers, once/day
+#
+# Missing keys fall back to the defaults below, so a config written before this block
+# existed still installs. Disabling a schedule also *removes* a task left behind by an
+# earlier install -- otherwise "disabled" in config would silently keep running.
 $suiteScript = Join-Path $PSScriptRoot "test-suite.ps1"
+$testsCfg    = if ($Config.PSObject.Properties['Tests']) { $Config.Tests } else { $null }
+$quickCfg    = if ($testsCfg -and $testsCfg.PSObject.Properties['Quick']) { $testsCfg.Quick } else { $null }
+$fullCfg     = if ($testsCfg -and $testsCfg.PSObject.Properties['Full'])  { $testsCfg.Full }  else { $null }
+
+$quickEnabled = -not ($quickCfg -and $quickCfg.PSObject.Properties['Enabled'] -and $quickCfg.Enabled -eq $false)
+$quickMinutes = 15
+if ($quickCfg -and $quickCfg.PSObject.Properties['IntervalMinutes']) {
+    $quickMinutes = [int]$quickCfg.IntervalMinutes
+    if ($quickMinutes -lt 1 -or $quickMinutes -gt 1440) {
+        Write-Warning "  Tests.Quick.IntervalMinutes=$($quickCfg.IntervalMinutes) is out of range (1-1440); using 15."
+        Write-DebugLog "WARN" "Tests.Quick.IntervalMinutes out of range, defaulted to 15"
+        $quickMinutes = 15
+    }
+}
+
+$fullEnabled = -not ($fullCfg -and $fullCfg.PSObject.Properties['Enabled'] -and $fullCfg.Enabled -eq $false)
+$fullHour    = 13
+if ($fullCfg -and $fullCfg.PSObject.Properties['Hour']) {
+    $fullHour = [int]$fullCfg.Hour
+    if ($fullHour -lt 0 -or $fullHour -gt 23) {
+        Write-Warning "  Tests.Full.Hour=$($fullCfg.Hour) is out of range (0-23); using 13."
+        Write-DebugLog "WARN" "Tests.Full.Hour out of range, defaulted to 13"
+        $fullHour = 13
+    }
+}
+Write-DebugLog "VAR Tests.Quick enabled=$quickEnabled interval=${quickMinutes}m  Tests.Full enabled=$fullEnabled hour=$fullHour"
+
 if (Test-Path $suiteScript) {
+    # -- Quick tick (Layer 1) --------------------------------------------------
     $suiteTask = "Seedbox_TestSuite"
-    try {
-        $suiteAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                              -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -Quick"
-        $suiteTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                              -RepetitionInterval (New-TimeSpan -Minutes 15) `
-                              -RepetitionDuration (New-TimeSpan -Days 3650)
-        # IgnoreNew so a slow run is never overlapped; the battery flags match the
-        # other Seedbox_* registrations (a desktop box is often on a UPS/battery).
-        $suiteSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-                              -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                              -MultipleInstances IgnoreNew `
-                              -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
-        $suitePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
-                              -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $suiteTask -Action $suiteAction -Trigger $suiteTrigger `
-            -Settings $suiteSettings -Principal $suitePrincipal -Force | Out-Null
-        Write-Host "  Health-check task registered (test-suite -Quick every 15 min, SYSTEM)." -ForegroundColor DarkGray
-        Write-DebugLog "INFO" "Scheduled task '$suiteTask' registered"
-    } catch {
-        Write-Warning "Could not register the health-check task: $_"
-        Write-DebugLog "WARN" "Failed to register scheduled task '$suiteTask': $_"
-    }
-
-    # First run now: the task fires at the next 10-minute boundary, and an empty
-    # dashboard until then reads as "broken".  This context is elevated, so the
-    # <InstallDir>\dashboard\test_results.json export succeeds too.
-    try {
-        Write-Host "  Running the first health check (test-suite -Quick)..." -ForegroundColor DarkGray
-        $savedEAP = $ErrorActionPreference
+    if ($quickEnabled) {
         try {
-            # test-suite.ps1 warns to stderr on a SKIP; that must not abort the install.
-            $ErrorActionPreference = "Continue"
-            $suiteOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $suiteScript -Quick 2>&1 | Out-String
-        } finally {
-            $ErrorActionPreference = $savedEAP
+            $suiteAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                                  -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -Quick"
+            $suiteTrigger   = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                                  -RepetitionInterval (New-TimeSpan -Minutes $quickMinutes) `
+                                  -RepetitionDuration (New-TimeSpan -Days 3650)
+            # IgnoreNew so a slow run is never overlapped; the battery flags match the
+            # other Seedbox_* registrations (a desktop box is often on a UPS/battery).
+            $suiteSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                                  -MultipleInstances IgnoreNew `
+                                  -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+            $suitePrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+                                  -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $suiteTask -Action $suiteAction -Trigger $suiteTrigger `
+                -Settings $suiteSettings -Principal $suitePrincipal -Force | Out-Null
+            Write-Host "  Health-check task registered (test-suite -Quick every $quickMinutes min, SYSTEM)." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Scheduled task '$suiteTask' registered (every ${quickMinutes}m)"
+        } catch {
+            Write-Warning "Could not register the health-check task: $_"
+            Write-DebugLog "WARN" "Failed to register scheduled task '$suiteTask': $_"
         }
-        $suiteSummary = ($suiteOut -split "`r?`n" | Where-Object { $_ -match 'PASS:\d+' } | Select-Object -Last 1)
-        if ($suiteSummary) {
-            Write-Host "  $($suiteSummary.Trim())" -ForegroundColor DarkGray
-            Write-DebugLog "INFO" "Initial health check: $($suiteSummary.Trim())"
+
+        # First run now: the task fires at the next interval boundary, and an empty
+        # dashboard until then reads as "broken".  This context is elevated, so the
+        # <InstallDir>\dashboard\test_results.json export succeeds too.
+        try {
+            Write-Host "  Running the first health check (test-suite -Quick)..." -ForegroundColor DarkGray
+            $savedEAP = $ErrorActionPreference
+            try {
+                # test-suite.ps1 warns to stderr on a SKIP; that must not abort the install.
+                $ErrorActionPreference = "Continue"
+                $suiteOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $suiteScript -Quick 2>&1 | Out-String
+            } finally {
+                $ErrorActionPreference = $savedEAP
+            }
+            $suiteSummary = ($suiteOut -split "`r?`n" | Where-Object { $_ -match 'PASS:\d+' } | Select-Object -Last 1)
+            if ($suiteSummary) {
+                Write-Host "  $($suiteSummary.Trim())" -ForegroundColor DarkGray
+                Write-DebugLog "INFO" "Initial health check: $($suiteSummary.Trim())"
+            } else {
+                Write-DebugLog "WARN" "Initial health check produced no summary line (exit=$LASTEXITCODE)"
+            }
+        } catch {
+            Write-DebugLog "WARN" "Initial health check run failed: $_"
+        }
+    } else {
+        $existingQuick = Get-ScheduledTask -TaskName $suiteTask -ErrorAction SilentlyContinue
+        if ($existingQuick) {
+            Unregister-ScheduledTask -TaskName $suiteTask -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "  Health check disabled in config.json -- removed $suiteTask." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Tests.Quick.Enabled=false: removed scheduled task '$suiteTask'"
         } else {
-            Write-DebugLog "WARN" "Initial health check produced no summary line (exit=$LASTEXITCODE)"
+            Write-Host "  Health check disabled in config.json (Tests.Quick.Enabled=false)." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Tests.Quick disabled by config; no task present"
         }
-    } catch {
-        Write-DebugLog "WARN" "Initial health check run failed: $_"
     }
 
-    # Daily full pass. The 15-minute task above is Layer 1 only; a full pass runs real
-    # operations (RSS sync over every synced indexer, a live indexer search, a magnet
-    # added and removed), so it is scheduled once a day and -ScheduledDaily refuses a
-    # second run on the same calendar day.
-    try {
-        $fullAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -ScheduledDaily"
-        $fullTrigger   = New-ScheduledTaskTrigger -Daily -At "04:00"
-        $fullSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
-                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                            -MultipleInstances IgnoreNew `
-                            -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
-        $fullPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
-                            -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName "Seedbox_TestSuiteFull" -Action $fullAction -Trigger $fullTrigger `
-            -Settings $fullSettings -Principal $fullPrincipal -Force | Out-Null
-        $fullTask = Get-ScheduledTask -TaskName "Seedbox_TestSuiteFull" -ErrorAction SilentlyContinue
-        if ($fullTask) {
-            Write-Host "  Full health-check task registered (test-suite daily at 04:00, once per day)." -ForegroundColor DarkGray
-            Write-DebugLog "INFO" "Scheduled task 'Seedbox_TestSuiteFull' registered (daily 04:00, state=$($fullTask.State))"
-        } else {
-            Write-Warning "  Seedbox_TestSuiteFull did NOT register -- the full suite will not run on a schedule."
-            Write-DebugLog "ERROR" "Seedbox_TestSuiteFull registration did not take effect"
+    # -- Daily full pass (all layers) ------------------------------------------
+    # A full pass runs real operations (RSS sync over every synced indexer, a live
+    # indexer search, a magnet added and removed), so once a day and -ScheduledDaily
+    # refuses a second run on the same calendar day.
+    $fullTaskName = "Seedbox_TestSuiteFull"
+    if ($fullEnabled) {
+        try {
+            $fullAt         = ('{0:00}:00' -f $fullHour)
+            $fullAction     = New-ScheduledTaskAction -Execute "powershell.exe" `
+                                  -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -ScheduledDaily"
+            $fullTrigger    = New-ScheduledTaskTrigger -Daily -At $fullAt
+            $fullSettings   = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                                  -MultipleInstances IgnoreNew `
+                                  -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+            $fullPrincipal  = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+                                  -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $fullTaskName -Action $fullAction -Trigger $fullTrigger `
+                -Settings $fullSettings -Principal $fullPrincipal -Force | Out-Null
+            $fullTask = Get-ScheduledTask -TaskName $fullTaskName -ErrorAction SilentlyContinue
+            if ($fullTask) {
+                Write-Host "  Full health-check task registered (test-suite daily at $fullAt, once per day)." -ForegroundColor DarkGray
+                Write-DebugLog "INFO" "Scheduled task '$fullTaskName' registered (daily $fullAt, state=$($fullTask.State))"
+            } else {
+                Write-Warning "  $fullTaskName did NOT register -- the full suite will not run on a schedule."
+                Write-DebugLog "ERROR" "$fullTaskName registration did not take effect"
+            }
+        } catch {
+            Write-Warning "Could not register the full health-check task: $_"
+            Write-DebugLog "WARN" "Failed to register scheduled task '$fullTaskName': $_"
         }
-    } catch {
-        Write-Warning "Could not register the full health-check task: $_"
-        Write-DebugLog "WARN" "Failed to register scheduled task 'Seedbox_TestSuiteFull': $_"
+    } else {
+        $existingFull = Get-ScheduledTask -TaskName $fullTaskName -ErrorAction SilentlyContinue
+        if ($existingFull) {
+            Unregister-ScheduledTask -TaskName $fullTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "  Full health check disabled in config.json -- removed $fullTaskName." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Tests.Full.Enabled=false: removed scheduled task '$fullTaskName'"
+        } else {
+            Write-Host "  Full health check disabled in config.json (Tests.Full.Enabled=false)." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Tests.Full disabled by config; no task present"
+        }
     }
 }
 
