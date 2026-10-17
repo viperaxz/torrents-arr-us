@@ -275,6 +275,14 @@ function Invoke-IndexerPut {
         return [pscustomobject]@{ Ok = $false; Status = 0; Body = $_.Exception.Message }
     }
 }
+# Prowlarr answers 429 while the tracker is in its own failure backoff, and some
+# definitions reply "no results in the configured categories" -- both mean this app
+# can never validate that indexer, so retrying the same PUT is pointless.
+function Test-IndexerPermanentlyUnavailable {
+    param([string]$Body)
+    if (-not $Body) { return $false }
+    return ($Body -match '\[429' -or $Body -match 'TooManyRequests' -or $Body -match 'no results in the configured categor')
+}
 $SeedRatio = if ($Config.Layer2.PSObject.Properties['PublicTrackerSeedRatio'] -and $null -ne $Config.Layer2.PublicTrackerSeedRatio) {
     [double]$Config.Layer2.PublicTrackerSeedRatio
 } else { 1.0 }
@@ -332,6 +340,7 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
             # later. Retry once instead of leaving the ratio unset.
             $putOk = $false
             $putBody = ''
+            $putUnavailable = $false
             # Three attempts with backoff: right after a fresh install every indexer is
             # being validated at once and a Cloudflare-backed one can time out twice in
             # a row before answering.
@@ -341,6 +350,15 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
                     -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} -Body $body
                 $putBody = $res.Body
                 if ($res.Ok) { $putOk = $true; break }
+                # A tracker in Prowlarr's own 429 backoff, or one whose definition has
+                # nothing in these categories, will reject the identical PUT for the
+                # rest of the install: retrying only buys 15s of sleep per indexer
+                # (measured 4.5 minutes per app across 9 such indexers on a fresh
+                # install). Classify on the first answer and move on.
+                if (Test-IndexerPermanentlyUnavailable -Body $putBody) {
+                    $putUnavailable = $true
+                    break
+                }
                 if ($putAttempt -lt 3) {
                     Write-DebugLog "DEBUG" "Indexer '$($idx.name)' PUT rejected (attempt $putAttempt, HTTP $($res.Status)), retrying"
                     Start-Sleep -Seconds $putDelays[$putAttempt - 1]
@@ -359,7 +377,7 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
                 # When Prowlarr itself answers 429 the tracker is in its own failure
                 # backoff -- nothing this installer can fix, and warning about it per
                 # indexer turned one upstream outage into 18 scary lines per app.
-                if ($putBody -match '\[429' -or $putBody -match 'no results in the configured categor') {
+                if ($putUnavailable) {
                     $skippedUnavailable++
                     Write-DebugLog "INFO" "Indexer '$($idx.name)' skipped: Prowlarr cannot serve it for these categories (429 backoff or no results)"
                 } else {

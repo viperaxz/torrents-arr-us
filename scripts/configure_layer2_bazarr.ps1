@@ -249,9 +249,9 @@ try {
     Write-Host "     OK Providers: $($providers -join ', ')" -ForegroundColor Green
     Write-Host "                   (titlovi/subdl only when credentials are configured)" -ForegroundColor Green
     Write-DebugLog "INFO" "Subtitle providers enabled"
-    if (-not $OsComUser)   { Write-Host "     ! Add OpenSubtitles.com credentials in Bazarr Settings for full quota." -ForegroundColor Yellow; Write-DebugLog "WARN" "OpenSubtitles.com credentials not set" }
-    if (-not $TitloviUser) { Write-Host "     ! Add Titlovi credentials in Bazarr Settings for Romanian subtitles." -ForegroundColor Yellow; Write-DebugLog "WARN" "Titlovi credentials not set" }
-    if (-not $SubdlApiKey) { Write-Host "     ! Add Layer2.Bazarr.SubdlApiKey to enable the subdl provider." -ForegroundColor Yellow; Write-DebugLog "WARN" "subdl API key not set -- provider disabled" }
+    if (-not $OsComUser)   { Write-Host "     ! Add OpenSubtitles.com credentials in Bazarr Settings for full quota." -ForegroundColor Yellow; Write-DebugLog "INFO" "OpenSubtitles.com credentials not set (optional)" }
+    if (-not $TitloviUser) { Write-Host "     ! Add Titlovi credentials in Bazarr Settings for Romanian subtitles." -ForegroundColor Yellow; Write-DebugLog "INFO" "Titlovi credentials not set (optional)" }
+    if (-not $SubdlApiKey) { Write-Host "     ! Add Layer2.Bazarr.SubdlApiKey to enable the subdl provider." -ForegroundColor Yellow; Write-DebugLog "INFO" "subdl API key not set -- provider disabled (optional)" }
 } catch {
     Write-Warning "[$AppName] Could not configure providers: $_"
     Write-DebugLog "ERROR" "Provider configuration failed: $_"

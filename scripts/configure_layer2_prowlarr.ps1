@@ -58,6 +58,15 @@ function Set-ApiFieldValue {
     else { $Field | Add-Member -MemberType NoteProperty -Name 'value' -Value $Value -Force }
 }
 
+# Prowlarr answers 429 while a tracker is in its own failure backoff, and some
+# definitions reply "no results in the configured categories" -- both mean the
+# indexer cannot be validated right now, so retrying the same PUT is pointless.
+function Test-IndexerPermanentlyUnavailable {
+    param([string]$Body)
+    if (-not $Body) { return $false }
+    return ($Body -match '\[429' -or $Body -match 'TooManyRequests' -or $Body -match 'no results in the configured categor')
+}
+
 if (-not $Enabled) {
     Write-Host "[$AppName] Skipped per configuration." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "$AppName skipped (not enabled)"
@@ -937,6 +946,7 @@ if ($syncTargets.Count -gt 0) {
 
     $plUpdated = 0
     $plEnabled = 0
+    $plUnavailable = [System.Collections.Generic.List[string]]::new()
     try {
         $plIndexers = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer" `
             -Headers @{"X-Api-Key"=$ApiKey} -UseBasicParsing -ErrorAction Stop
@@ -967,6 +977,7 @@ if ($syncTargets.Count -gt 0) {
             # fresh install, then fine on re-run). Retry once before warning.
             $plPutOk = $false
             $plPutErr = $null
+            $plPutUnavailable = $false
             for ($plAttempt = 1; $plAttempt -le 2; $plAttempt++) {
                 try {
                     Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($plIdx.id)" `
@@ -978,6 +989,21 @@ if ($syncTargets.Count -gt 0) {
                     break
                 } catch {
                     $plPutErr = $_
+                    # Prowlarr validates the indexer on PUT. Reading the body is the only
+                    # way to tell "this tracker is in its own backoff" (expected, nothing
+                    # to fix) from a real configuration failure.
+                    $plBodyText = ''
+                    $plResp = $_.Exception.Response
+                    if ($plResp) {
+                        try {
+                            $plSr = New-Object System.IO.StreamReader($plResp.GetResponseStream())
+                            $plBodyText = $plSr.ReadToEnd()
+                        } catch { }
+                    }
+                    if (Test-IndexerPermanentlyUnavailable -Body $plBodyText) {
+                        $plPutUnavailable = $true
+                        break
+                    }
                     if ($plAttempt -lt 2) {
                         Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_"
                         Start-Sleep -Seconds 5
@@ -986,6 +1012,9 @@ if ($syncTargets.Count -gt 0) {
             }
             if ($plPutOk) {
                 $plUpdated++
+            } elseif ($plPutUnavailable) {
+                $plUnavailable += $plIdx.name
+                Write-DebugLog "INFO" "Prowlarr indexer '$($plIdx.name)' skipped: Prowlarr cannot validate it right now (429 backoff or no results)"
             } else {
                 Write-Warning "     Prowlarr indexer '$($plIdx.name)' seed settings update failed: $plPutErr"
                 Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' seed settings PUT failed after 2 attempts: $plPutErr"
@@ -994,6 +1023,10 @@ if ($syncTargets.Count -gt 0) {
         }
         if ($plUpdated -gt 0) {
             Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plEnabled indexer(s)" -ForegroundColor Green
+        }
+        if ($plUnavailable.Count -gt 0) {
+            Write-Host "     $($plUnavailable.Count) indexer(s) not updated in Prowlarr: $($plUnavailable -join ', ') -- Prowlarr is in its own backoff for them, so the ratios stay on the app side only." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Prowlarr seed criteria skipped for unavailable indexers: $($plUnavailable -join ', ')"
         }
         Write-DebugLog "INFO" "Prowlarr seed criteria stored on $plUpdated/$plEnabled indexers"
     } catch {
