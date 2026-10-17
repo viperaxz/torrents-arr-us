@@ -1,4 +1,4 @@
-﻿# tests/Test-RealDebrid.ps1 -- Zurg + rclone Real-Debrid integration test module
+# tests/Test-RealDebrid.ps1 -- Zurg + rclone Real-Debrid integration test module
 
 param([int]$LayerFilter = 0)
 
@@ -72,8 +72,14 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         $apiKey = ([System.IO.File]::ReadAllText($apiKeyPath, [System.Text.Encoding]::UTF8)).TrimStart([char]0xFEFF).Trim()
     }
     if ($apiKey) {
+        # Jellyfin 12.x answers 401 for X-Emby-Authorization / X-Emby-Token, with an
+        # API key just as with a user token; only the Authorization header carrying
+        # the MediaBrowser client string plus Token= is accepted. Same format as
+        # collect_status.ps1 and configure_layer2_jellyfin_libraries.ps1.
+        $jfClient = 'MediaBrowser Client="seedbox-tests", Device="test-suite", DeviceId="seedbox-tests", Version="1.0.0"'
+        $jfAuth   = @{ 'Authorization' = ($jfClient + ', Token="' + $apiKey + '"') }
         $jellyfinBase = Get-AppUrlBase 'jellyfin' $Config.General.DomainMode
-        $libs = Invoke-ApiCheck "http://127.0.0.1:$jellyfinPort${jellyfinBase}/Library/VirtualFolders" @{'X-Emby-Authorization'="MediaBrowser Token=`"$apiKey`""} -TimeoutSec 8
+        $libs = Invoke-ApiCheck "http://127.0.0.1:$jellyfinPort${jellyfinBase}/Library/VirtualFolders" $jfAuth -TimeoutSec 8
         if ($libs.ok) {
             $libPaths = @($libs.data | ForEach-Object { $_.Locations } | ForEach-Object { $_ })
             $hasMovieDrive = $libPaths | Where-Object { $_ -match "^$([regex]::Escape($mDrive))" }

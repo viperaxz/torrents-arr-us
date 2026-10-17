@@ -82,13 +82,26 @@ foreach ($key in $modules.Keys) {
 }
 
 # -- Output --------------------------------------------------------------------
+# Push before the JSON export so the export can record whether Loki accepted the
+# results: an empty Grafana panel is otherwise indistinguishable from a suite that
+# never ran.
+$lokiPush = 'skipped (Apps.Grafana is not true)'
+if ($Script:LokiEnabled) {
+    $pushRes  = Push-TestResultsToLoki -Results $Script:Results.ToArray()
+    $lokiPush = if ($pushRes.ok) { 'ok' } else { 'failed: ' + $pushRes.error }
+    if (-not $pushRes.ok) {
+        Write-Warning "Could not push results to Loki: $($pushRes.error)"
+        Write-Host "  The Grafana 'Test Suite Results' dashboard will not show this run." -ForegroundColor DarkGray
+    }
+}
+
 $resultJson = Join-Path $InstallDir 'dashboard\test_results.json'
 try {
-    Export-TestResults -Results $Script:Results.ToArray() -OutputPath $resultJson -StartTime $StartTime
+    Export-TestResults -Results $Script:Results.ToArray() -OutputPath $resultJson -StartTime $StartTime -LokiPush $lokiPush
 } catch {
     # <InstallDir> is administrator-only, so an unelevated run cannot drop the
     # JSON next to the dashboard.  The console summary and the Loki/Grafana push
-    # below are unaffected -- say so, and print the same grant command the
+    # above are unaffected -- say so, and print the same grant command the
     # installer prints so the operator can restore the export deliberately.
     $dashboardDir = Split-Path -Parent $resultJson
     Write-Warning "Could not write $resultJson : $($_.Exception.Message)"
@@ -98,8 +111,8 @@ try {
     Write-Host "  (Granting the whole install tree instead would also expose the service binaries and secrets\ to that account.)" -ForegroundColor DarkGray
 }
 
-if ($Script:LokiEnabled) {
-    Push-TestResultsToLoki -Results $Script:Results.ToArray()
+if ($lokiPush -notin @('ok', 'skipped (Apps.Grafana is not true)')) {
+    Write-Host "  Results were NOT published to Grafana (loki_push = $lokiPush)." -ForegroundColor Yellow
 }
 
 Write-TestSummary -Results $Script:Results.ToArray()

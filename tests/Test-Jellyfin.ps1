@@ -1,4 +1,4 @@
-﻿# tests/Test-Jellyfin.ps1 -- Jellyfin media server test module
+# tests/Test-Jellyfin.ps1 -- Jellyfin media server test module
 
 param([int]$LayerFilter = 0)
 
@@ -54,7 +54,13 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     } catch {}
 
     if ($apiKey) {
-        $libs = Invoke-ApiCheck "http://127.0.0.1:$port${base}/Library/VirtualFolders" @{'X-Emby-Authorization'="MediaBrowser Token=`"$apiKey`""} -TimeoutSec 8
+        # Jellyfin 12.x answers 401 for X-Emby-Authorization / X-Emby-Token, with an
+        # API key just as with a user token; only the Authorization header carrying
+        # the MediaBrowser client string plus Token= is accepted. Same format as
+        # collect_status.ps1 and configure_layer2_jellyfin_libraries.ps1.
+        $jfClient = 'MediaBrowser Client="seedbox-tests", Device="test-suite", DeviceId="seedbox-tests", Version="1.0.0"'
+        $jfAuth   = @{ 'Authorization' = ($jfClient + ', Token="' + $apiKey + '"') }
+        $libs = Invoke-ApiCheck "http://127.0.0.1:$port${base}/Library/VirtualFolders" $jfAuth -TimeoutSec 8
         if ($libs.ok -and $libs.data -is [array]) {
             $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' $(if ($libs.data.Count -gt 0) { 'PASS' } else { 'WARN' }) "$($libs.data.Count) virtual folder(s) found"))
         } elseif ($libs.ok) {
@@ -63,7 +69,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
             $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' 'FAIL' $libs.error))
         }
 
-        $users = Invoke-ApiCheck "http://127.0.0.1:$port${base}/Users" @{'X-Emby-Authorization'="MediaBrowser Token=`"$apiKey`""} -TimeoutSec 8
+        $users = Invoke-ApiCheck "http://127.0.0.1:$port${base}/Users" $jfAuth -TimeoutSec 8
         if ($users.ok) {
             $cfgUsers = @($Config.Users | Where-Object { $_.Username } | ForEach-Object { $_.Username.ToLower() })
             $jfUsers  = @($users.data   | Where-Object { $_.Name }     | ForEach-Object { $_.Name.ToLower() })
@@ -94,7 +100,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
     if (-not $cfgGpu) {
         $Script:Results.Add((New-TestResult $svc 3 'GpuProfile' 'SKIP' 'GPU profile not configured (CPU fallback)'))
     } elseif ($apiKey) {
-        $enc = Invoke-ApiCheck "http://127.0.0.1:$port${base}/System/Configuration/encoding" @{'X-Emby-Authorization'="MediaBrowser Token=`"$apiKey`""} -TimeoutSec 8
+        $enc = Invoke-ApiCheck "http://127.0.0.1:$port${base}/System/Configuration/encoding" $jfAuth -TimeoutSec 8
         if ($enc.ok) {
             $hwAccel = $enc.data.HardwareAccelerationType
             if ($hwAccel -and $hwAccel -ne 'none') {

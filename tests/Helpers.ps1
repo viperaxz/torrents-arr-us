@@ -136,7 +136,10 @@ function Push-TestResultsToLoki {
         [string]$LokiUrl = 'http://127.0.0.1:3100',
         [int]$TimeoutSec = 8
     )
-    if (-not $Results -or $Results.Count -eq 0) { return }
+    # Returns {ok, error}. The caller records the outcome: a push that fails silently
+    # is indistinguishable from a suite that never ran, because the Grafana panel is
+    # equally empty either way.
+    if (-not $Results -or $Results.Count -eq 0) { return [PSCustomObject]@{ ok = $true; error = $null } }
     try {
         $nowNs   = [string]([long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) * 1000000)
         $streams = @($Results | ForEach-Object {
@@ -153,7 +156,10 @@ function Push-TestResultsToLoki {
         $body = @{ streams = $streams } | ConvertTo-Json -Depth 8 -Compress
         Invoke-RestMethod "$LokiUrl/loki/api/v1/push" -Method Post -Body $body `
             -ContentType 'application/json' -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop | Out-Null
-    } catch {}
+        return [PSCustomObject]@{ ok = $true; error = $null }
+    } catch {
+        return [PSCustomObject]@{ ok = $false; error = $_.Exception.Message }
+    }
 }
 
 # Write test_results.json to the dashboard directory
@@ -161,7 +167,8 @@ function Export-TestResults {
     param(
         [object[]]$Results,
         [string]$OutputPath,
-        [datetime]$StartTime
+        [datetime]$StartTime,
+        [string]$LokiPush = ''
     )
     $pass = @($Results | Where-Object { $_.status -eq 'PASS' }).Count
     $fail = @($Results | Where-Object { $_.status -eq 'FAIL' }).Count
@@ -173,6 +180,9 @@ function Export-TestResults {
         results          = $Results
         summary          = [ordered]@{ pass = $pass; fail = $fail; warn = $warn; skip = $skip; total = $Results.Count }
     }
+    # Record the push outcome next to the results: when the Grafana panel is empty,
+    # this file is what tells you whether the suite never ran or Loki refused it.
+    if ($LokiPush) { $out['loki_push'] = $LokiPush }
     $dir = Split-Path $OutputPath -Parent
     if (-not (Test-Path $dir)) { New-Item $dir -ItemType Directory -Force | Out-Null }
     $utf8 = New-Object System.Text.UTF8Encoding($false)

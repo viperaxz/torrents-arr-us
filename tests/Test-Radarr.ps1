@@ -1,4 +1,4 @@
-﻿# tests/Test-Radarr.ps1 -- Radarr movie automation test module
+# tests/Test-Radarr.ps1 -- Radarr movie automation test module
 
 param([int]$LayerFilter = 0)
 
@@ -61,8 +61,30 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
 
     $idx = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v3/indexer" $hdr -TimeoutSec 8
     if ($idx.ok) {
-        $idxCount = if ($idx.data -is [array]) { $idx.data.Count } else { 0 }
-        $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' $(if ($idxCount -gt 0) { 'PASS' } else { 'WARN' }) "$idxCount indexer(s) synced from Prowlarr"))
+        $idxList  = @($idx.data | Where-Object { $null -ne $_ })
+        $idxCount = $idxList.Count
+        # A count is not enough. Prowlarr writes each synced indexer's baseUrl at sync
+        # time and never revisits it, so a DomainMode change (DuckDNS <-> Cloudflare)
+        # leaves every one of them on a path Prowlarr no longer serves: the *arr then
+        # reports a bogus XML parse error ("'/' is an unexpected token ... Line 54",
+        # which is line 54 of Prowlarr's login page) and every search fails, while the
+        # indexer count still looks perfectly healthy.
+        $prPort  = $Config.Ports.Prowlarr
+        $prBase  = Get-AppUrlBase 'prowlarr' $Config.General.DomainMode
+        $wantUrl = '^http://127\.0\.0\.1:' + $prPort + [regex]::Escape($prBase) + '/\d+/$'
+        $stale   = @()
+        foreach ($e in $idxList) {
+            if ($e.name -notmatch '\(Prowlarr\)\s*$') { continue }
+            $u = ($e.fields | Where-Object { $_.name -eq 'baseUrl' } | Select-Object -First 1).value
+            if ("$u" -notmatch $wantUrl) { $stale += "$($e.name)=$u" }
+        }
+        if ($idxCount -eq 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'WARN' 'no indexers synced from Prowlarr'))
+        } elseif ($stale.Count -gt 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'FAIL' "$($stale.Count)/$idxCount on a stale URL (expected http://127.0.0.1:$prPort$prBase/<id>/): $($stale[0])"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'PASS' "$idxCount indexer(s) synced from Prowlarr, URLs correct"))
+        }
     } else {
         $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'FAIL' $idx.error))
     }
@@ -77,7 +99,7 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 3) -and $apiKey) {
     } else {
         $cmdId = $cmd.data.id
         $done  = $false; $attempts = 0
-        while (-not $done -and $attempts -lt 15) {
+        while (-not $done -and $attempts -lt 60) {
             Start-Sleep -Seconds 2; $attempts++
             $status = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v3/command/$cmdId" $hdr -TimeoutSec 8
             if ($status.ok -and $status.data.status -in @('completed','failed')) { $done = $true }
@@ -87,7 +109,7 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 3) -and $apiKey) {
         } elseif ($done -and $status.ok -and $status.data.status -eq 'failed') {
             $Script:Results.Add((New-TestResult $svc 3 'RssSync' 'FAIL' "Command failed: $($status.data.exception)"))
         } else {
-            $Script:Results.Add((New-TestResult $svc 3 'RssSync' 'WARN' 'Still running after 30s'))
+            $Script:Results.Add((New-TestResult $svc 3 'RssSync' 'WARN' 'Still running after 120s (32 synced indexers, several behind FlareSolverr)'))
         }
     }
 }

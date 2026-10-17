@@ -85,6 +85,9 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
 
 # -- Layer 2: Auth accepted, Web UI via proxy ----------------------------------
 if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $password) {
+    # Authenticate here too: the session is established by the Layer 1 block, so
+    # "test-suite.ps1 -Layer 2" on its own was reporting every RPC call as a failure.
+    $null = DelugeLogin
     # Verify daemon connection status via Web UI (core.* daemon methods are RenCode-only)
     $hostsRes = DelugeRpc 'web.get_hosts' ''
     if ($hostsRes.ok -and $hostsRes.data.result -and $hostsRes.data.result.Count -gt 0) {
@@ -101,9 +104,26 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $password) {
         $Script:Results.Add((New-TestResult $svcDaemon 2 'AuthAccepted' 'FAIL' 'no daemon hosts'))
     }
 
+    # Deluge's Label plugin raises KeyError for a label it has never seen, and the
+    # grab then fails on the *arr side (Radarr: "deluge_label\core.py:307 get_options
+    # -> KeyError: 'radarr'"). configure_layer2_sonarr.ps1 sets tvCategory "tv-sonarr"
+    # and configure_layer2_radarr.ps1 sets movieCategory "radarr"; both must exist.
+    $expectedLabels = @('tv-sonarr', 'radarr')
+    $labelsRes = DelugeRpc 'label.get_labels' ''
+    if ($labelsRes.ok -and $null -ne $labelsRes.data.result) {
+        $have    = @($labelsRes.data.result | Where-Object { $null -ne $_ })
+        $missing = @($expectedLabels | Where-Object { $have -notcontains $_ })
+        if ($missing.Count -eq 0) {
+            $Script:Results.Add((New-TestResult $svcDaemon 2 'LabelsPresent' 'PASS' ($have -join ', ') $labelsRes.ms))
+        } else {
+            $Script:Results.Add((New-TestResult $svcDaemon 2 'LabelsPresent' 'FAIL' "missing: $($missing -join ', ') -- every grab in that category fails with KeyError" $labelsRes.ms))
+        }
+    } else {
+        $Script:Results.Add((New-TestResult $svcDaemon 2 'LabelsPresent' 'WARN' 'label.get_labels unavailable (Label plugin not enabled?)'))
+    }
+
     # Check Web UI accessible via Caddy proxy
-    $domain       = if ($Config.General.DomainMode -eq 'duckdns') { $Config.General.DuckDnsDomain } else { $Config.General.Domain }
-    $delugeWebUrl = if ($Config.General.DomainMode -eq 'duckdns') {
+    $domain       = if ($Config.General.DomainMode -eq 'duckdns') { $Config.General.DuckDnsDomain } else { $Config.General.Domain }    $delugeWebUrl = if ($Config.General.DomainMode -eq 'duckdns') {
         "https://$domain/deluge/"
     } else {
         "https://deluge.$domain/"
@@ -120,6 +140,8 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $password) {
 
 # -- Layer 3: Add paused magnet, verify hash, remove ---------------------------
 if (($LayerFilter -eq 0 -or $LayerFilter -eq 3) -and $password) {
+    # Same as Layer 2: authenticate so "-Layer 3" works without Layer 1 having run.
+    $null = DelugeLogin
     # Add a magnet link for a well-known Linux ISO in paused state
     $magnet = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c&dn=Big+Buck+Bunny&tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969&tr=http%3A%2F%2Ftracker.tfile.me%2Fannounce"
     $addRes = DelugeRpc 'core.add_torrent_magnet' "`"$magnet`",{`"add_paused`":true,`"download_location`":`"$($Config.Paths.Downloads -replace '\\','/')`"}"
