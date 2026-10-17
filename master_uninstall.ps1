@@ -129,13 +129,20 @@ function Register-PathForDeletionAtReboot {
     }
 
     $queued = 0
+    $already = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($e in $entries) { if ($e) { [void]$already.Add([string]$e) } }
     foreach ($item in $items) {
         $full = $item.FullName
         if ($full.StartsWith('\\?\')) { $full = $full.Substring(4) }
+        # A path queued by an earlier uninstall that has not rebooted yet must not be
+        # queued again -- repeated cycles without a reboot would otherwise keep
+        # appending the same 17 entries per profile folder to this value forever.
+        if (-not $already.Add('\??\' + $full)) { continue }
         $entries.Add('\??\' + $full)
         $entries.Add('')
         $queued++
     }
+    if ($queued -eq 0) { return 0 }
     Set-ItemProperty -Path $key -Name PendingFileRenameOperations -Value ([string[]]$entries.ToArray()) -Type MultiString -ErrorAction Stop
     return $queued
 }
