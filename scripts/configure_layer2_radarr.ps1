@@ -257,13 +257,16 @@ function Invoke-IndexerPut {
         return [pscustomobject]@{ Ok = $false; Status = 0; Body = $_.Exception.Message }
     }
 }
-# Prowlarr answers 429 while the tracker is in its own failure backoff, and some
-# definitions reply "no results in the configured categories" -- both mean this app
-# can never validate that indexer, so retrying the same PUT is pointless.
+# Prowlarr answers 429 while the tracker is in its own failure backoff, some
+# definitions reply "no results in the configured categories", and a private
+# tracker with no credentials in config answers 403 from its own login page
+# ("Unable to connect to indexer ... [403:Forbidden] at .../login.php", captured
+# from RuTracker). All three mean this app can never validate that indexer, so
+# retrying the same PUT is pointless.
 function Test-IndexerPermanentlyUnavailable {
     param([string]$Body)
     if (-not $Body) { return $false }
-    return ($Body -match '\[429' -or $Body -match 'TooManyRequests' -or $Body -match 'no results in the configured categor')
+    return ($Body -match '\[429' -or $Body -match 'TooManyRequests' -or $Body -match 'no results in the configured categor' -or $Body -match 'Unable to connect to indexer')
 }
 
 $SeedRatio = if ($Config.Layer2.PSObject.Properties['PublicTrackerSeedRatio'] -and $null -ne $Config.Layer2.PublicTrackerSeedRatio) {
