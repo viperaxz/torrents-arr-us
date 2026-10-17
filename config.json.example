@@ -107,7 +107,6 @@
     "Prowlarr": {
       "Indexers": [
         { "Name": "1337x",              "DefinitionName": "1337x",              "Enabled": true, "FlareSolverr": true },
-        { "Name": "52BT",               "DefinitionName": "52bt",               "Enabled": true, "FlareSolverr": true },
         { "Name": "Bangumi Moe",        "DefinitionName": "bangumi-moe",        "Enabled": true, "FlareSolverr": true },
         { "Name": "BigFANGroup",        "DefinitionName": "bigfangroup",        "Enabled": true, "FlareSolverr": true },
         { "Name": "dmhy",               "DefinitionName": "dmhy",               "Enabled": true, "FlareSolverr": true },
