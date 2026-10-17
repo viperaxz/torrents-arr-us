@@ -433,9 +433,16 @@ try {
         # Same BaseUrl prefix as the health probe above -- without it Jellyfin
         # 302s to the web client, the body comes back as HTML and the library
         # card reads 0 movies / 0 series / 0 episodes.
+        #
+        # The key must travel in the Authorization header: Jellyfin answers 401
+        # for X-MediaBrowser-Token, with an API key as well as a user token
+        # (measured on a live server). Sending it the old way left this card
+        # reading zero without any error surfacing.
         $jfBase   = UBase 'jellyfin'
+        $jfClient = 'MediaBrowser Client="seedbox-status", Device="collector", DeviceId="seedbox-status", Version="1.0.0"'
         $jfCounts = Invoke-RestMethod "http://127.0.0.1:$jellyfinPort${jfBase}/Items/Counts" `
-                        -Headers @{'X-MediaBrowser-Token'=$jfKey} -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                        -Headers @{ 'Authorization' = ($jfClient + ', Token="' + $jfKey + '"') } `
+                        -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
         $status.media.jellyfin = [ordered]@{
             movies   = [int]$jfCounts.MovieCount
             series   = [int]$jfCounts.SeriesCount

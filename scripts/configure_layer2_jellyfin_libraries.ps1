@@ -116,7 +116,11 @@ if (-not $authResp.AccessToken) {
 }
 
 $Token    = $authResp.AccessToken
-$UserAuth = @{"X-MediaBrowser-Token" = $Token; "Authorization" = $Client}
+# Jellyfin does not accept a USER access token in X-MediaBrowser-Token or
+# X-Emby-Token for admin endpoints: both return 401. Only the Authorization
+# header form works. Filtered property assignment rather than string
+# concatenation, so a token containing a quote cannot corrupt the header.
+$UserAuth = @{"Authorization" = $Client + ', Token="' + $Token + '"'}
 Write-DebugLog "VAR UserAuth token=[REDACTED] length=$($Token.Length)"
 
 # -- 4. Get existing libraries -------------------------------------------------
@@ -644,7 +648,7 @@ if ($needInstall) {
             $authResp2 = Invoke-RestMethod -Uri "$ApiBase/Users/AuthenticateByName" -Method Post `
                 -Body $authBody2 -ContentType "application/json" `
                 -Headers @{"Authorization" = $Client} -UseBasicParsing -ErrorAction Stop
-            $UserAuth = @{"X-MediaBrowser-Token" = $authResp2.AccessToken; "Authorization" = $Client}
+            $UserAuth = @{"Authorization" = $Client + ', Token="' + $authResp2.AccessToken + '"'}
             Write-DebugLog "INFO" "Re-authenticated after plugin restart"
         } catch {
             Write-Warning "     Re-authentication after restart failed: $_"
