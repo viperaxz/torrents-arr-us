@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -345,3 +345,5 @@ try {
 
 Write-Host "  $AppName Layer 2 configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_flaresolverr.ps1 complete"
+
+exit 0

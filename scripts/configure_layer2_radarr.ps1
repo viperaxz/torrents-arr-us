@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -461,3 +461,5 @@ if ($Config.Apps.Jellyfin -eq $true) {
 
 Write-Host "  [OK] $AppName Layer 2 configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_radarr.ps1 complete"
+
+exit 0

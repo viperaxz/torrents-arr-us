@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -340,3 +340,5 @@ if ($RecyclarrVersion) {
 }
 
 Write-DebugLog "INFO" "configure_layer2_recyclarr.ps1 complete"
+
+exit 0

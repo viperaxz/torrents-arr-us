@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null,
     [string]$GPU    = ""          # family slug (e.g. "nvidia_ada") or legacy vendor name ("nvidia"|"intel"|"amd")
 )
@@ -152,7 +152,7 @@ if (-not $authResp.AccessToken) {
     Write-DebugLog "ERROR" "No access token in auth response"
     exit 1
 }
-$UserAuth = @{"X-MediaBrowser-Token" = $authResp.AccessToken; "Authorization" = $Client}
+$UserAuth = @{"Authorization" = ($Client + ', Token="' + $authResp.AccessToken + '"')}
 
 # -- 4. Fetch current encoding config and merge profile -----------------------
 Write-Host "  -> Applying transcoding profile '$GPU'..." -ForegroundColor Gray
@@ -203,3 +203,5 @@ try {
 
 Write-Host "  OK: $AppName transcoding configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_jellyfin_transcoding.ps1 complete"
+
+exit 0

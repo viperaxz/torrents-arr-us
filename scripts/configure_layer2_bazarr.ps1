@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -404,3 +404,5 @@ try {
 Write-Host "  OK Bazarr Layer 2 configuration complete." -ForegroundColor Green
 Write-Host "[$AppName] OK Configuration complete." -ForegroundColor Cyan
 Write-DebugLog "INFO" "configure_layer2_bazarr.ps1 complete"
+
+exit 0

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -723,3 +723,5 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
 
 Write-Host "  [OK] $AppName Layer 2 configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_sonarr.ps1 complete"
+
+exit 0

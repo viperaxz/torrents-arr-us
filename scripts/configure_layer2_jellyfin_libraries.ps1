@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -737,3 +737,5 @@ try {
 
 Write-Host "  [OK] $AppName Layer 2 configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_jellyfin_libraries.ps1 complete"
+
+exit 0

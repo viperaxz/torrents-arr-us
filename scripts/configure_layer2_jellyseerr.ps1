@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -245,3 +245,5 @@ try {
 
 Write-Host "[$AppName] Layer 2 user provisioning complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_jellyseerr.ps1 complete"
+
+exit 0

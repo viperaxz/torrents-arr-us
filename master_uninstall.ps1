@@ -61,7 +61,10 @@ function Stop-ServiceBounded {
     # Send the stop request without blocking, poll briefly, then kill the supervisor.
     param(
         [Parameter(Mandatory = $true)][string]$Name,
-        [int]$TimeoutSeconds = 20
+        # Measured on this class of box: a healthy nssm service can take 25-42s to
+        # report Stopped, so a short bound kills services that were about to stop.
+        # 60s clears that comfortably while still bounding a genuine wedge.
+        [int]$TimeoutSeconds = 60
     )
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { return $true }
