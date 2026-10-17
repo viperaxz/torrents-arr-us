@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging ---------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "15_zurg.ps1 started"
 
@@ -188,7 +194,7 @@ Write-DebugLog "INFO" "Registering NSSM service '$AppName'..."
 $svcExists = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 if ($svcExists) {
     Write-DebugLog "INFO" "Service '$AppName' already exists -- removing for clean registration"
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     # Wait up to 30 s for the process to exit before asking NSSM to remove it.
     # Without this, nssm remove blocks until the process dies (can take minutes).
     $waited = 0
@@ -223,7 +229,7 @@ Write-DebugLog "INFO" "NSSM service '$AppName' registered"
 # -- 6. Start service -----------------------------------------------------------
 Write-Host "  -> Starting Zurg service..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting service '$AppName'..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 
 $svc = $null
 $pollDeadline = (Get-Date).AddSeconds(30)

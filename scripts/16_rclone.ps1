@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging ---------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 . (Join-Path $PSScriptRoot "choco_helpers.ps1")
@@ -211,7 +217,7 @@ Write-Host "  -> Registering $MoviesSvc service (${MovieLetter}:\)..." -Foregrou
 
 $svcExists = Get-Service -Name $MoviesSvc -ErrorAction SilentlyContinue
 if ($svcExists) {
-    Stop-Service -Name $MoviesSvc -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $MoviesSvc
     $waited = 0
     while ((Get-Service -Name $MoviesSvc -ErrorAction SilentlyContinue).Status -eq 'StopPending' -and $waited -lt 30) {
         Start-Sleep -Seconds 2; $waited += 2
@@ -286,7 +292,7 @@ if (-not $zurgReady) {
 
 # -- 8. Start service -----------------------------------------------------------
 Write-Host "  -> Starting $MoviesSvc..." -ForegroundColor Gray
-Start-Service -Name $MoviesSvc -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $MoviesSvc
 
 $mSvc = $null
 $pollDeadline = (Get-Date).AddSeconds(30)

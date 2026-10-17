@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging ---------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "11_jellyseerr.ps1 started"
 
@@ -156,7 +162,7 @@ if (-not (Test-Path $SrcZip)) {
 Write-Host "  -> Extracting source..." -ForegroundColor Gray
 $existingSvc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 if ($existingSvc) {
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
 }
 if (Test-Path $AppSrcDir) {
@@ -316,7 +322,7 @@ Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 Write-Host "  -> Starting $AppName (first start initialises the database, allow 3 min)..." `
     -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName service. Waiting up to 180s for API readiness..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 
 $deadline = (Get-Date).AddSeconds(180)
 $started  = $false

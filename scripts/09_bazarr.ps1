@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 . (Join-Path $PSScriptRoot "choco_helpers.ps1")
@@ -407,7 +413,7 @@ $existingSvc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR existing $AppName service=$(if ($existingSvc) { $existingSvc.Status } else { 'NOT FOUND' })"
 if ($existingSvc) {
     Write-DebugLog "INFO" "Stopping existing $AppName service before extraction..."
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
 }
 $appBinExists = Test-Path $AppBinDir
@@ -560,7 +566,7 @@ Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 # otherwise our base_url edit gets overwritten on the next start.
 Write-Host "  -> Starting Bazarr for first-run config generation (up to 180s)..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName service for first-run initialization..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 $svcAfterStart = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 $svcStatus = if ($svcAfterStart) { $svcAfterStart.Status } else { "NOT FOUND" }
 Write-DebugLog "VAR $AppName status immediately after start=$svcStatus"
@@ -603,7 +609,7 @@ if (-not (Test-Path $ConfigFile)) {
     }
 
     Write-DebugLog "INFO" "Stopping $AppName before config.yaml edit..."
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
 
     # -- 9. Set base_url for DuckDNS path routing ------------------------------
@@ -622,7 +628,7 @@ if (-not (Test-Path $ConfigFile)) {
     }
 
     Write-DebugLog "INFO" "Restarting $AppName after config edit..."
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
 }
 
 # -- 10. Validate --------------------------------------------------------------

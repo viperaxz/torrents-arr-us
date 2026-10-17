@@ -54,7 +54,7 @@ if (-not $daemonSvc) {
 if ($daemonSvc.Status -ne "Running") {
     Write-Host "  -> Starting DelugeDaemon..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting DelugeDaemon (was $($daemonSvc.Status))..."
-    Start-Service -Name "DelugeDaemon" -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name "DelugeDaemon"
     Start-Sleep -Seconds 5
     $daemonSvc = Get-Service -Name "DelugeDaemon"
     Write-DebugLog "VAR DelugeDaemon status after start=$($daemonSvc.Status)"
@@ -65,7 +65,7 @@ Write-DebugLog "VAR DelugeWeb exists=$($null -ne $webSvc) status=$(if ($webSvc) 
 if ($webSvc -and $webSvc.Status -ne "Running") {
     Write-Host "  -> Starting DelugeWeb..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting DelugeWeb (was $($webSvc.Status))..."
-    Start-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name "DelugeWeb"
     Start-Sleep -Seconds 5
     $webSvc = Get-Service -Name "DelugeWeb"
     Write-DebugLog "VAR DelugeWeb status after start=$($webSvc.Status)"

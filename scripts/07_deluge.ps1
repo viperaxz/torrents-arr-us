@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 . (Join-Path $PSScriptRoot "choco_helpers.ps1")
@@ -323,7 +329,7 @@ function Stop-DelugeForInstall {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne "Stopped") {
             Write-DebugLog "INFO" "Stopping service $svcName (was $($svc.Status))"
-            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            $null = Stop-ServiceBounded -Name $svcName
         }
     }
     $deadline = (Get-Date).AddSeconds(30)
@@ -873,7 +879,7 @@ if (-not $existingWeb -and $delugeWebPath) {
         $runningWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
         if ($runningWeb -and $runningWeb.Status -eq "Running") {
             Write-Host "  -> Restarting DelugeWeb so the base path takes effect..." -ForegroundColor Gray
-            Restart-Service -Name "DelugeWeb" -Force -ErrorAction SilentlyContinue
+            $null = Restart-ServiceBounded -Name "DelugeWeb"
             Start-Sleep -Seconds 3
         }
     } else {
@@ -939,7 +945,7 @@ if ($delugeWebPath) {
 # -- 7. Start + verify Daemon --------------------------------------------------
 Write-Host "  -> Starting DelugeDaemon..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting DelugeDaemon service..."
-Start-Service -Name "DelugeDaemon" -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name "DelugeDaemon"
 Start-Sleep -Seconds 5
 $svcDaemon = Get-Service -Name "DelugeDaemon" -ErrorAction SilentlyContinue
 Write-DebugLog "VAR DelugeDaemon status after start=$(if ($svcDaemon) { $svcDaemon.Status } else { 'NOT FOUND' })"
@@ -955,7 +961,7 @@ if ($svcDaemon -and $svcDaemon.Status -eq "Running") {
 if ($delugeWebPath) {
     Write-Host "  -> Starting DelugeWeb..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting DelugeWeb service..."
-    Start-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name "DelugeWeb"
     Start-Sleep -Seconds 5
     $svcWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
     Write-DebugLog "VAR DelugeWeb status after start=$(if ($svcWeb) { $svcWeb.Status } else { 'NOT FOUND' })"

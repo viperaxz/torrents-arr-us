@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "10_flaresolverr.ps1 started"
 
@@ -115,7 +121,7 @@ $existingSvc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR existing $AppName service=$(if ($existingSvc) { $existingSvc.Status } else { 'NOT FOUND' })"
 if ($existingSvc) {
     Write-DebugLog "INFO" "Stopping existing $AppName service before extraction..."
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     # NSSM only reports Stopped once the child process is gone; extracting over a
     # still-locked chrome.dll would fail half-way, so wait for the state instead
     # of assuming a fixed delay.
@@ -212,7 +218,7 @@ Write-DebugLog "INFO" "No firewall rule for $AppName (loopback-only); legacy rul
 # check cannot tell the difference between a working and a broken install.
 Write-Host "  -> Starting $AppName (first startup initialises Chromium, may take up to 2 min)..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName service. Waiting up to 120s for API readiness..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 
 $deadline = (Get-Date).AddSeconds(120)
 $started  = $false

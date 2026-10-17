@@ -58,7 +58,7 @@ if (-not $svc) {
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting $AppName..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting $AppName (was $($svc.Status))..."
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 5
     $svc = Get-Service -Name $AppName
     Write-DebugLog "VAR $AppName status after start=$($svc.Status)"
@@ -184,7 +184,7 @@ Write-Host "  -> Restarting $AppName..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Restarting $AppName service..."
 $null = Stop-ServiceBounded -Name $AppName
 Start-Sleep -Seconds 3
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 Write-DebugLog "INFO" "$AppName restart initiated"
 
 # -- 9. Verify: wait for API and confirm the new auth method is active ---------
@@ -264,7 +264,7 @@ if (-not $rolledBack -and (Test-Path $ConfigBak)) {
 $svcFinal = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $AppName status before restart after rollback=$(if ($svcFinal) { $svcFinal.Status } else { 'N/A' })"
 if ($svcFinal -and $svcFinal.Status -ne "Running") {
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
     Write-DebugLog "INFO" "$AppName restarted after rollback"
 }

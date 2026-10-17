@@ -1,10 +1,16 @@
-﻿param (
+param (
     [Parameter(Mandatory=$true)]
     [object]$Config
 )
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 . (Join-Path $PSScriptRoot "choco_helpers.ps1")
@@ -155,8 +161,7 @@ Write-DebugLog "VAR $ServiceName status before stop=$svcStatus"
 if ($svcStatus -eq "Running") {
     Write-Host "  -> Stopping service to configure..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Stopping $ServiceName to write network.xml..."
-    Stop-Service -Name $ServiceName -Force
-    Start-Sleep -Seconds 3
+    $null = Stop-ServiceBounded -Name $ServiceName-Sleep -Seconds 3
     Write-DebugLog "INFO" "$ServiceName stopped"
 }
 
@@ -282,7 +287,7 @@ Write-DebugLog "INFO" "Firewall rule added for Jellyfin port=$JfPort"
 # 6. Start service
 Write-Host "  -> Starting Jellyfin..." -ForegroundColor Yellow
 Write-DebugLog "INFO" "Starting $ServiceName..."
-Start-Service -Name $ServiceName
+$null = Start-ServiceBounded -Name $ServiceName
 Start-Sleep -Seconds 3
 $svc = Get-Service -Name $ServiceName
 Write-DebugLog "VAR $ServiceName status after start=$($svc.Status)"

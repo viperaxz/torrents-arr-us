@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 . (Join-Path $PSScriptRoot "choco_helpers.ps1")
@@ -830,7 +836,7 @@ if (-not $CaddyService) {
     Write-DebugLog "INFO" "Firewall rules added: ports 80 and 443"
 
     Write-DebugLog "INFO" "Starting Caddy service..."
-    Start-Service -Name "Caddy"
+    $null = Start-ServiceBounded -Name "Caddy"
     Start-Sleep -Seconds 3
     $svc = Get-Service -Name "Caddy"
     Write-DebugLog "VAR Caddy service status after start=$($svc.Status)"
@@ -853,7 +859,7 @@ if (-not $CaddyService) {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "  -> caddy reload failed; restarting service instead."
         Write-DebugLog "WARN" "caddy reload failed (exit=$LASTEXITCODE). Restarting service..."
-        Restart-Service -Name "Caddy"
+        $null = Restart-ServiceBounded -Name "Caddy"
         Write-DebugLog "INFO" "Caddy service restarted"
     } else {
         Write-DebugLog "INFO" "Caddy config reloaded successfully"

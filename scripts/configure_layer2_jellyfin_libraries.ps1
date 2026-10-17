@@ -13,6 +13,12 @@ if (-not $Config) {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer2_jellyfin_libraries.ps1 started"
 
@@ -62,7 +68,7 @@ if (-not $svc) {
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting $AppName..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting Jellyfin service '$($svc.Name)'..."
-    Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $svc.Name
     Start-Sleep -Seconds 10
 }
 
@@ -608,11 +614,11 @@ if ($needInstall) {
     Write-Host "  -> Restarting Jellyfin to load OpenSubtitles plugin..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Restarting Jellyfin to load plugin..."
     try {
-        Restart-Service -Name $svc.Name -Force -ErrorAction Stop
+        $null = Restart-ServiceBounded -Name $svc.Name
     } catch {
-        Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+        $null = Stop-ServiceBounded -Name $svc.Name
         Start-Sleep -Seconds 3
-        Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        $null = Start-ServiceBounded -Name $svc.Name
     }
     Start-Sleep -Seconds 8
 

@@ -58,7 +58,7 @@ if (-not $svc) {
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting $AppName..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting $AppName (was $($svc.Status))..."
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 5
     $svc = Get-Service -Name $AppName
     Write-DebugLog "VAR $AppName status after start=$($svc.Status)"
@@ -182,7 +182,7 @@ Write-Host "  -> Restarting $AppName..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Restarting $AppName..."
 $null = Stop-ServiceBounded -Name $AppName
 Start-Sleep -Seconds 3
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 
 # -- 9. Verify -----------------------------------------------------------------
 Write-Host "  -> Verifying..." -ForegroundColor Gray
@@ -247,7 +247,7 @@ if (-not $rolledBack -and (Test-Path $ConfigBak)) {
 }
 $svcFinal = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 if ($svcFinal -and $svcFinal.Status -ne "Running") {
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
 }
 Remove-Item $ConfigBak -Force -ErrorAction SilentlyContinue

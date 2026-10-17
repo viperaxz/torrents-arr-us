@@ -115,10 +115,11 @@ function Stop-ServiceBounded {
 }
 
 function Start-ServiceBounded {
-    # Returns $true when the service reaches Running.
+    # Returns $true when the service reaches Running. The default bound is generous
+    # because some services (Jellyfin, Jellyseerr) do real first-start work.
     param(
         [Parameter(Mandatory = $true)][string]$Name,
-        [int]$TimeoutSeconds = 90
+        [int]$TimeoutSeconds = 120
     )
     $svc = Get-SvcState -Name $Name
     if (-not $svc) { return $false }

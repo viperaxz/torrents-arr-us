@@ -1,10 +1,16 @@
-﻿param(
+param(
     [Parameter(Mandatory=$true)]
     [object]$Config
 )
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 # Shared choco plumbing: PATH-safe resolution plus retry-on-transient-feed-failure.
 # Invoke-Native below still serves cscli; choco calls go through Invoke-Choco.
@@ -255,7 +261,7 @@ try {
     if ($csSvc -and $csSvc.Status -ne "Running") {
         Write-Host "     Starting CrowdSec service to generate default config..." -ForegroundColor DarkGray
         Write-DebugLog "INFO" "Starting $CrowdSecSvc service"
-        Start-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
+        $null = Start-ServiceBounded -Name $CrowdSecSvc
     }
     # cscli reads config.yaml, which the service only creates on its first start.
     # Wait whenever the file is absent -- not just when *we* started the service:
@@ -505,14 +511,14 @@ on_success: break
     }
 
     # -- 1i. Restart so acquisition + collections take effect ------------------
-    # Restart-Service errors out on a stopped service, so fall back to
-    # Start-Service; a first start also runs DB migrations, which can take
-    # considerably longer than the few seconds a plain restart needs.
+    # A first start also runs DB migrations, which can take considerably longer than
+    # the few seconds a plain restart needs, so the not-running case takes the
+    # start path (with its own, longer bound).
     $svc = Get-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
     if ($svc -and $svc.Status -eq "Running") {
-        Restart-Service -Name $CrowdSecSvc -Force -ErrorAction SilentlyContinue
+        $null = Restart-ServiceBounded -Name $CrowdSecSvc
     } else {
-        Start-Service -Name $CrowdSecSvc -ErrorAction SilentlyContinue
+        $null = Start-ServiceBounded -Name $CrowdSecSvc
     }
     $svcDeadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $svcDeadline) {
@@ -636,7 +642,7 @@ fw_profiles:
         # nothing is being enforced.  So restart unconditionally, not only when
         # the service happens to be stopped.
         Write-DebugLog "INFO" "Restarting $BouncerSvc to load the new API key"
-        Restart-Service -Name $BouncerSvc -Force -ErrorAction SilentlyContinue
+        $null = Restart-ServiceBounded -Name $BouncerSvc
 
         # Bouncer may need multiple start attempts and more time to come up.
         $bouncerRetries = 0
@@ -649,9 +655,9 @@ fw_profiles:
                 break
             }
             if ($bsvc -and $bsvc.Status -eq "Stopped") {
-                Start-Service -Name $BouncerSvc -ErrorAction SilentlyContinue
+                $null = Start-ServiceBounded -Name $BouncerSvc
             } else {
-                Restart-Service -Name $BouncerSvc -Force -ErrorAction SilentlyContinue
+                $null = Restart-ServiceBounded -Name $BouncerSvc
             }
             $bouncerRetries++
             if ($bouncerRetries -lt $bouncerMaxRetries) {

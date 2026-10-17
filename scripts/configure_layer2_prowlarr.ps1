@@ -83,7 +83,7 @@ if (-not $svc) {
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting $AppName..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting $AppName..."
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 5
 }
 
@@ -554,7 +554,7 @@ print(f"Enabled {changed}/{len(ids)} CF-protected indexer(s)")
         Write-Host "     OK $result" -ForegroundColor Green
         Write-DebugLog "INFO" "SQLite update result: $result"
 
-        Start-Service -Name Prowlarr -ErrorAction SilentlyContinue
+        $null = Start-ServiceBounded -Name Prowlarr
         $startDeadline = (Get-Date).AddSeconds(30)
         $apiBack = $false
         $restartWaited = 0
@@ -715,7 +715,7 @@ db.commit(); db.close(); print(n)
                     $ErrorActionPreference = $savedEAP
                 }
                 Remove-Item $tmpPy -Force -EA SilentlyContinue
-                Start-Service $app.Name -ErrorAction SilentlyContinue
+                $null = Start-ServiceBounded -Name $app.Name
                 $startDl = (Get-Date).AddSeconds(20)
                 while ((Get-Service $app.Name -EA SilentlyContinue).Status -ne "Running" -and (Get-Date) -lt $startDl) {
                     Start-Sleep -Seconds 1

@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "05_prowlarr.ps1 started"
 
@@ -149,7 +155,7 @@ Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 
 Write-Host "  -> Starting $AppName (waiting for first-run config)..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName. Waiting up to 90s for config.xml..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 $ConfigXml = Join-Path $DataDir "config.xml"
 $deadline  = (Get-Date).AddSeconds(90)
 $waited    = 0
@@ -158,7 +164,7 @@ Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s
 
 if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
     Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     Start-Sleep -Seconds 3
     try {
         [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
@@ -176,7 +182,7 @@ if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
         Write-Warning "  -> Could not set UrlBase: $_"
         Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
     }
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
 } elseif (-not (Test-Path $ConfigXml)) {
     Write-Warning "  -> config.xml not found after 90s."

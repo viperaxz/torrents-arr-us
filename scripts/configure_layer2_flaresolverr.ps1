@@ -13,6 +13,12 @@ if (-not $Config) {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer2_flaresolverr.ps1 started"
 
@@ -65,7 +71,7 @@ if (-not $svc) {
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting Prowlarr..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Starting Prowlarr..."
-    Start-Service -Name "Prowlarr" -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name "Prowlarr"
     Start-Sleep -Seconds 5
 }
 

@@ -4,6 +4,12 @@ param(
 )
 
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "14_grafana.ps1 started"
 
@@ -936,7 +942,7 @@ if (-not (Get-Service "Grafana" -ErrorAction SilentlyContinue)) {
 foreach ($svcName in @("Loki", "Alloy", "Grafana")) {
     $svc = Get-Service $svcName -ErrorAction SilentlyContinue
     if ($svc) {
-        Start-Service $svcName -ErrorAction SilentlyContinue
+        $null = Start-ServiceBounded -Name $svcName
         Write-DebugLog "INFO" "Started service: $svcName"
     }
 }

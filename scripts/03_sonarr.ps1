@@ -5,6 +5,12 @@ param (
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See service_helpers.ps1.
+if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "03_sonarr.ps1 started"
 
@@ -213,7 +219,7 @@ Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 # 7. Start + wait for config.xml creation
 Write-Host "  -> Starting $AppName (waiting for first-run config)..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName service. Waiting up to 90s for config.xml..."
-Start-Service -Name $AppName -ErrorAction SilentlyContinue
+$null = Start-ServiceBounded -Name $AppName
 $ConfigXml = Join-Path $DataDir "config.xml"
 $deadline  = (Get-Date).AddSeconds(90)
 $waited    = 0
@@ -226,8 +232,9 @@ Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s
 # 8. Set UrlBase for DuckDNS path mode
 if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
     Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
-    # Stop-Service can return before the NSSM-managed process has actually exited,
+    $null = Stop-ServiceBounded -Name $AppName
+    # Stop-ServiceBounded returns as soon as the SCM reports Stopped, which can be
+    # before the NSSM-managed process has actually released its files.
     # and a process that is still shutting down rewrites config.xml on its way out,
     # discarding the edit made below. Wait for the service to report Stopped, the
     # same way configure_layer1_sonarr.ps1 waits before restoring its config backup.
@@ -255,7 +262,7 @@ if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
         Write-Warning "  -> Could not set UrlBase: $_"
         Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
     }
-    Start-Service -Name $AppName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $AppName
     Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
 
     # Verify the edit survived the restart. Without UrlBase Sonarr answers only on
