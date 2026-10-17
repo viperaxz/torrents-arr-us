@@ -388,9 +388,23 @@ statics:
         -Action $evtAction -Trigger $evtTrigger `
         -Principal $evtPrincipal -Settings $evtSettings -Force | Out-Null
 
+    # Verify what was just registered. This block (and 1f.5 below) announced success
+    # with Write-Host only, so when a registration did not stick there was no trace in
+    # the debug log at all -- the install reported success and nobody could tell
+    # afterwards whether the line had run. That is exactly how the missing
+    # Seedbox_CrowdSecWhitelistRefresh on this box stayed invisible.
+    $evtRegistered = Get-ScheduledTask -TaskName "Seedbox_SecurityEventExport" -ErrorAction SilentlyContinue
+    if ($evtRegistered) {
+        Write-DebugLog "INFO" "Seedbox_SecurityEventExport registered (state=$($evtRegistered.State), every 5 min)"
+    } else {
+        Write-Warning "     Seedbox_SecurityEventExport did NOT register -- CrowdSec gets no event-log feed."
+        Write-DebugLog "ERROR" "Seedbox_SecurityEventExport registration did not take effect (Get-ScheduledTask found nothing)"
+    }
+
     # Run once immediately so CrowdSec has data on first start.
     try { & $exportScriptDst -LogDir $logDir } catch { Write-DebugLog "WARN" "Initial event log export failed: $_" }
-    Write-Host "     Event log export task registered (Seedbox_SecurityEventExport, every 5 min)." -ForegroundColor DarkGray
+    Write-Host "     Event log export task: $(if ($evtRegistered) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_SecurityEventExport, every 5 min)." `
+        -ForegroundColor $(if ($evtRegistered) { 'DarkGray' } else { 'Yellow' })
 
     # -- 1f. Whitelist: the anti-lockout guarantee -----------------------------
     # Split into single IPs and CIDRs, because CrowdSec rejects a CIDR in the
@@ -480,9 +494,21 @@ $wlCidrYaml
         -Action $wlAction -Trigger $wlTrigger `
         -Principal $wlPrincipal -Settings $wlSettings -Force | Out-Null
 
+    # Verify, for the same reason as 1e: "registered" used to be a Write-Host claim
+    # that left no evidence. This task is the anti-lockout guard -- without it a WAN
+    # IP rotation leaves the operator's old IP whitelisted and the new one bannable.
+    $wlRegistered = Get-ScheduledTask -TaskName "Seedbox_CrowdSecWhitelistRefresh" -ErrorAction SilentlyContinue
+    if ($wlRegistered) {
+        Write-DebugLog "INFO" "Seedbox_CrowdSecWhitelistRefresh registered (state=$($wlRegistered.State), every 5 min)"
+    } else {
+        Write-Warning "     Seedbox_CrowdSecWhitelistRefresh did NOT register -- a WAN IP change can lock the operator out."
+        Write-DebugLog "ERROR" "Seedbox_CrowdSecWhitelistRefresh registration did not take effect (Get-ScheduledTask found nothing)"
+    }
+
     # Run once immediately so an IP change right after install is caught.
     try { & $refreshDst } catch { Write-DebugLog "WARN" "Initial whitelist refresh failed: $_" }
-    Write-Host "     Operator-IP whitelist refresh task registered (Seedbox_CrowdSecWhitelistRefresh, every 5 min)." -ForegroundColor DarkGray
+    Write-Host "     Operator-IP whitelist refresh task: $(if ($wlRegistered) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_CrowdSecWhitelistRefresh, every 5 min)." `
+        -ForegroundColor $(if ($wlRegistered) { 'DarkGray' } else { 'Yellow' })
 
     # -- 1g. Ban duration profile ---------------------------------------------
     $profiles = @"
@@ -749,6 +775,22 @@ if ($crowdsecOk) {
     Write-Host "      & '$CsCli' metrics" -ForegroundColor DarkGray
     Write-Host "      & '$CsCli' decisions list" -ForegroundColor DarkGray
     Write-Host "      & '$CsCli' alerts list" -ForegroundColor DarkGray
+}
+
+# -- Verify the scheduled tasks this script owns -------------------------------
+# A registration that silently does not stick was invisible before: the success
+# messages were Write-Host only. Record the real state at the end of every run so
+# the next install cycle is diagnosable from the debug log alone.
+$ownedTasks = @("Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh")
+if ($DoBlocklists) { $ownedTasks += "Seedbox_Blocklist_Update" }
+foreach ($ownedTask in $ownedTasks) {
+    $found = Get-ScheduledTask -TaskName $ownedTask -ErrorAction SilentlyContinue
+    if ($found) {
+        Write-DebugLog "VAR task '$ownedTask' registered=True state=$($found.State)"
+    } else {
+        Write-Host "    WARNING: scheduled task '$ownedTask' is not registered." -ForegroundColor Yellow
+        Write-DebugLog "ERROR" "Scheduled task '$ownedTask' is not registered"
+    }
 }
 
 # -- Write lock file (only when detection actually came up) --------------------
