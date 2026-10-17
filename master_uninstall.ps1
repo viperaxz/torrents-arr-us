@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 param(
     [switch]$Force
 )
@@ -100,6 +100,44 @@ function Remove-MachinePathEntry {
     $type = if ($kind -eq 'ExpandString') { 'ExpandString' } else { 'String' }
     Set-ItemProperty -Path $key -Name Path -Value ($kept -join ';') -Type $type -ErrorAction Stop
     return $true
+}
+
+# -- Schedule a locked path for deletion at the next boot ----------------------
+# A profile whose registry hives are still mapped cannot be deleted in-session:
+# UsrClass.dat stays open until the hive is unloaded, which only happens on
+# reboot. PendingFileRenameOperations is processed before services start, so
+# queue files first and then directories deepest-first; each directory is empty
+# by the time its own delete entry runs.
+function Register-PathForDeletionAtReboot {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $items = @()
+    $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+                Sort-Object -Property @{ Expression = { $_.FullName.Length } } -Descending)
+    $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue |
+                Sort-Object -Property @{ Expression = { $_.FullName.Length } } -Descending)
+    $items += @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($items.Count -eq 0) { return 0 }
+
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    $existing = (Get-ItemProperty -Path $key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+    # Keep every existing entry verbatim: the value is a flat list of
+    # source/destination pairs and an empty destination means "delete".
+    $entries = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $existing) {
+        foreach ($e in @($existing)) { $entries.Add([string]$e) }
+    }
+
+    $queued = 0
+    foreach ($item in $items) {
+        $full = $item.FullName
+        if ($full.StartsWith('\\?\')) { $full = $full.Substring(4) }
+        $entries.Add('\??\' + $full)
+        $entries.Add('')
+        $queued++
+    }
+    Set-ItemProperty -Path $key -Name PendingFileRenameOperations -Value ([string[]]$entries.ToArray()) -Type MultiString -ErrorAction Stop
+    return $queued
 }
 
 # -- 1. Stop any stray processes -----------------------------------------------
@@ -275,8 +313,9 @@ if (Test-Path $csProgDir) {
     Write-DebugLog "INFO" "Removing CrowdSec Program Files: $csProgDir"
     Remove-Item -Path $csProgDir -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path $csProgDir) {
-        Write-Warning "  -> CrowdSec : could not fully remove $csProgDir (may be locked)"
-        Write-DebugLog "WARN" "CrowdSec program files still present after removal attempt"
+        # The MSI files are often still mapped by the just-stopped services.
+        # Phase 7 (choco uninstall) usually clears them, so warn only then.
+        Write-DebugLog "INFO" "CrowdSec program files still present after direct removal; phase 7 will retry"
     } else {
         Write-Host "  -> CrowdSec : program files removed." -ForegroundColor Yellow
         Write-DebugLog "INFO" "CrowdSec program files removed"
@@ -420,24 +459,34 @@ foreach ($dir in $dataDirs) {
     }
 }
 
-# Recyclarr keeps its configuration under %APPDATA%. The generated config only
-# references the keys symbolically ("api_key: !secret sonarr_api_key"), so
-# secrets.yml is the one file that holds them in the clear -- and it holds LIVE
-# Sonarr/Radarr keys, which must not outlive the install.
-$RecyclarrSecrets = Join-Path $env:APPDATA "recyclarr\secrets.yml"
-Write-DebugLog "VAR recyclarr secrets=$RecyclarrSecrets (exists=$(Test-Path $RecyclarrSecrets))"
-if (Test-Path $RecyclarrSecrets) {
-    Remove-Item -Path $RecyclarrSecrets -Force -ErrorAction SilentlyContinue
-    if (Test-Path $RecyclarrSecrets) {
-        Write-Warning "  -> Could not remove $RecyclarrSecrets -- it holds live Sonarr/Radarr API keys."
-        Write-DebugLog "WARN" "recyclarr secrets.yml could not be removed"
+# Recyclarr keeps its generated config, state and CLI logs under %APPDATA%.
+# secrets.yml holds the LIVE Sonarr/Radarr keys in the clear and win-seedbox.yml
+# is the generated config that references them, so the whole tree goes: leaving
+# the directory behind also left stale state for the next install to trip over.
+$RecyclarrAppData = Join-Path $env:APPDATA "recyclarr"
+Write-DebugLog "VAR recyclarr appdata=$RecyclarrAppData (exists=$(Test-Path $RecyclarrAppData))"
+if (Test-Path $RecyclarrAppData) {
+    Remove-Item -Path $RecyclarrAppData -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $RecyclarrAppData) {
+        Write-Warning "  -> Could not remove $RecyclarrAppData -- it holds live Sonarr/Radarr API keys."
+        Write-DebugLog "WARN" "recyclarr appdata could not be removed"
     } else {
-        Write-Host "  -> Removed recyclarr API keys: $RecyclarrSecrets" -ForegroundColor Yellow
-        Write-DebugLog "INFO" "Removed recyclarr secrets.yml (live Sonarr/Radarr API keys)"
+        Write-Host "  -> Removed recyclarr config/state/API keys: $RecyclarrAppData" -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Removed recyclarr appdata (generated config, state, live Sonarr/Radarr API keys)"
     }
 }
 
 # -- 6. Remove InstallDir contents ---------------------------------------------
+# The debug log lives in <InstallDir>\logs, which this phase deletes. Move it
+# somewhere durable first, otherwise everything from here on (PATH, choco
+# packages, service account) is lost and the uninstall leaves no log at all.
+if ($global:SeedboxDebugLogFile) {
+    $DebugLogArchiveDir = Join-Path $env:LOCALAPPDATA "win-seedbox\logs"
+    $relocated = Move-SeedboxDebugLog -DestinationDir $DebugLogArchiveDir
+    if ($relocated) {
+        Write-Host "  -> Debug log preserved: $relocated" -ForegroundColor DarkGray
+    }
+}
 Write-Host "[6/8] Removing installation files from $InstallDir..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 6: Remove InstallDir contents from $InstallDir ==="
 foreach ($sub in @("Caddy", "caddy-data", "Sonarr", "Radarr", "Prowlarr", "Bazarr", "ffmpeg", ".ffmpeg-staging", "Deluge-data", "Flaresolverr", "Jellyseerr", "Grafana", "Grafana-data", "Loki", "Loki-data", "Alloy", "Alloy-data", "Zurg", "rclone", "dashboard", "scripts", "secrets", ".locks", "logs")) {
@@ -538,6 +587,15 @@ foreach ($pkg in @("caddy", "jellyfin", "deluge", "ffmpeg",
     }
 }
 
+# Phase 2's direct removal can fail while the CrowdSec services are still
+# winding down; the MSI removal above normally finishes the job. Warn only if
+# the tree survived both attempts.
+$csProgDir = "C:\Program Files\CrowdSec"
+if (Test-Path $csProgDir) {
+    Write-Warning "  -> CrowdSec : $csProgDir still present after package removal  --  remove manually."
+    Write-DebugLog "WARN" "CrowdSec program files still present after package removal: $csProgDir"
+}
+
 # -- 8. Remove service account -------------------------------------------------
 Write-Host "[8/8] Removing service account..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 8: Remove service account ==="
@@ -550,19 +608,44 @@ if ($svcExists) {
                   [System.Security.Principal.SecurityIdentifier]).Value
     Write-DebugLog "VAR SID for $svcUser = $svcSid"
 
-    # Try to unload the registry hive (services are already stopped so it may be free).
-    reg unload "HKU\$svcSid"               2>$null | Out-Null
-    reg unload "HKU\${svcSid}_Classes"     2>$null | Out-Null
-    Write-DebugLog "INFO" "Registry hive unload attempted for SID $svcSid"
+    # Try to unload the registry hives (services are already stopped so they may be
+    # free). A still-loaded hive keeps UsrClass.dat open, which is what stops the
+    # profile directory from being deleted -- so report the failure instead of
+    # hiding it and then blaming a generic "kernel lock" later.
+    foreach ($hive in @("HKU\$svcSid", "HKU\${svcSid}_Classes")) {
+        $unloaded = $false
+        for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
+            $output = & reg unload $hive 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $unloaded = $true
+            } else {
+                Write-DebugLog "VAR reg unload $hive attempt $attempt failed: $($output -join ' ')"
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        if ($unloaded) {
+            Write-DebugLog "INFO" "Registry hive unloaded: $hive"
+        } else {
+            Write-DebugLog "WARN" "Registry hive $hive is still loaded and cannot be unloaded until reboot"
+        }
+    }
 
     # Remove Win32_UserProfile (profile folder + WMI entry).
     $svcProfile = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
                   Where-Object { $_.LocalPath -like "*$svcUser*" }
-    Write-DebugLog "VAR $svcUser profile found: $($null -ne $svcProfile)"
+    $profileDir = if ($svcProfile) { $svcProfile.LocalPath } else { "C:\Users\$svcUser" }
+    Write-DebugLog "VAR $svcUser profile found: $($null -ne $svcProfile) path=$profileDir"
     if ($svcProfile) {
         $svcProfile | Remove-CimInstance -ErrorAction SilentlyContinue
-        Write-Host "  -> seedbox-svc profile removed (C:\Users\seedbox-svc)." -ForegroundColor Yellow
-        Write-DebugLog "INFO" "WMI profile removed for $svcUser"
+        $stillRegistered = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                           Where-Object { $_.LocalPath -like "*$svcUser*" }
+        if ($stillRegistered) {
+            Write-Warning "  -> seedbox-svc profile entry could not be removed from WMI."
+            Write-DebugLog "WARN" "Win32_UserProfile entry for $svcUser still present after Remove-CimInstance"
+        } else {
+            Write-Host "  -> seedbox-svc profile removed ($profileDir)." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "WMI profile removed for $svcUser"
+        }
     }
 
     # Remove ProfileList registry key (survives WMI removal on some Windows builds).
@@ -575,17 +658,30 @@ if ($svcExists) {
     }
 
     # Delete folder directly if still present (hive unload succeeded).
-    $profileDir = "C:\Users\$svcUser"
     Write-DebugLog "VAR profile dir $profileDir exists: $(Test-Path $profileDir)"
     if (Test-Path $profileDir) {
         Remove-Item -Path $profileDir -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path $profileDir) {
-            Write-Warning "  -> C:\Users\seedbox-svc still locked by kernel  --  reboot and delete manually."
-            Write-DebugLog "WARN" "$profileDir still locked after removal attempt"
-        } else {
-            Write-Host "  -> seedbox-svc profile folder deleted." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "Profile folder deleted: $profileDir"
+    }
+    if (Test-Path $profileDir) {
+        # UsrClass.dat stays mapped by the still-loaded hive until reboot. Queue
+        # the tree for deletion before services start rather than telling the
+        # operator to clean it up by hand after every uninstall.
+        $queued = 0
+        try {
+            $queued = Register-PathForDeletionAtReboot -Path $profileDir
+        } catch {
+            Write-DebugLog "ERROR" "Could not queue $profileDir for deletion at reboot: $_"
         }
+        if ($queued -gt 0) {
+            Write-Host "  -> $profileDir is locked until reboot; deletion queued for next boot ($queued entries)." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Queued $queued entries under $profileDir for deletion at next boot"
+        } else {
+            Write-Warning "  -> $profileDir is locked and could not be queued for deletion  --  remove it manually after reboot."
+            Write-DebugLog "WARN" "$profileDir still locked after removal attempt and could not be queued"
+        }
+    } else {
+        Write-Host "  -> seedbox-svc profile folder deleted." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Profile folder deleted: $profileDir"
     }
 
     Remove-LocalUser -Name $svcUser -ErrorAction SilentlyContinue
@@ -607,6 +703,9 @@ if ($Config) {
 }
 Write-Host "    - Sonarr / Radarr data -> $env:LOCALAPPDATA\win-seedbox\arr-backup (restored on reinstall)" -ForegroundColor Gray
 Write-Host "  Run master_install.ps1 to reinstall from scratch." -ForegroundColor Green
+if ($global:SeedboxDebugLogFile -and (Test-Path $global:SeedboxDebugLogFile)) {
+    Write-Host "  Debug log  : $global:SeedboxDebugLogFile" -ForegroundColor Gray
+}
 Write-Host "=============================================" -ForegroundColor Green
 
 # Explicit exit code so callers (box.ps1 / box.cmd) get a deterministic 0

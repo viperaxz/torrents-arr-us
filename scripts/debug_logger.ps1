@@ -83,6 +83,36 @@ function global:Initialize-DebugLog {
     Write-Host "[$now] [INFO ] [debug_logger] Debug logging ENABLED -> $($global:SeedboxDebugLogFile)" -ForegroundColor DarkCyan
 }
 
+function global:Move-SeedboxDebugLog {
+    # Relocates the active debug log to a directory that outlives the current
+    # run. The uninstaller deletes <InstallDir>\logs in phase 6; without this
+    # the last phases (PATH, packages, service account) are written to a file
+    # that no longer exists and the uninstall leaves no log behind at all.
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationDir
+    )
+
+    if (-not $global:SeedboxDebugEnabled -or -not $global:SeedboxDebugLogFile) { return $null }
+
+    try {
+        if (-not (Test-Path $DestinationDir)) {
+            New-Item -Path $DestinationDir -ItemType Directory -Force | Out-Null
+        }
+        $srcName = Split-Path -Leaf $global:SeedboxDebugLogFile
+        $dest    = Join-Path $DestinationDir $srcName
+        if (Test-Path $global:SeedboxDebugLogFile) {
+            Move-Item -Path $global:SeedboxDebugLogFile -Destination $dest -Force -ErrorAction Stop
+        }
+        $global:SeedboxDebugLogFile = $dest
+        Write-DebugLog "INFO" "[debug_logger] Debug log relocated to $dest"
+        return $dest
+    } catch {
+        Write-Warning "Could not relocate the debug log to $DestinationDir : $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function global:Write-DebugLog {
     # Accepts two calling conventions:
     #   1. Write-DebugLog "LEVEL" "message text"    --  explicit level (INFO/WARN/ERROR/VAR/DEBUG)
