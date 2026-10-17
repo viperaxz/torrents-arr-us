@@ -47,7 +47,14 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
                         Where-Object { $_.Action -eq 'Allow' -and $_.Enabled -eq 'True' })
         $Script:Results.Add((New-TestResult $svc 1 'NoFirewallRule' $(if ($fwRules.Count -eq 0) { 'PASS' } else { 'FAIL' }) "$($fwRules.Count) enabled allow rule(s) named Flaresolverr"))
     } catch {
-        $Script:Results.Add((New-TestResult $svc 1 'NoFirewallRule' 'SKIP' "cannot query firewall: $($_.Exception.Message)"))
+        # Get-NetFirewallRule throws when nothing matches, so the state we WANT (no
+        # rule at all) landed in the catch and was reported SKIP. Only a genuine
+        # query failure -- no permission, firewall service down -- deserves a SKIP.
+        if ($_.Exception.Message -match 'No MSFT_NetFirewallRule objects found') {
+            $Script:Results.Add((New-TestResult $svc 1 'NoFirewallRule' 'PASS' 'no inbound allow rule for Flaresolverr (it listens on loopback only)'))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 1 'NoFirewallRule' 'SKIP' "cannot query firewall: $($_.Exception.Message)"))
+        }
     }
 }
 
