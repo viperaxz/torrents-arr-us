@@ -28,10 +28,12 @@ Two things show up in the *arr UIs right after an install and are worth recognis
 **Silent-success / health-check gaps (still open)**
 
 - **The service-state check cannot prove the *new* image is loaded.** `Restart-Service -Force` can silently no-op on a failed stop, which `update_crowdsec.ps1` / `update_crowdsecbouncer.ps1` now verify around — so they confirm the service is `Running`, not which binary it is running.
+- **`Seedbox_CrowdSecWhitelistRefresh` and `Seedbox_SecurityEventExport` were missing on a live box** while `Seedbox_Blocklist_Update` (registered later in the same `12_security.ps1` run) was present. The suite's `WhitelistRefreshTask` check caught it; the whitelist parser and the operator-IP marker were correct, so only the auto-refresh was gone — meaning a WAN-IP rotation could lock the operator out until someone updates the whitelist by hand. Why the two registrations were skipped is unresolved: it needs a full uninstall/install cycle with `12_security.ps1` logging to see whether `Copy-Item` of `update_crowdsec_whitelist.ps1` threw or the block was never reached. **Do not hand-register the task to silence the warning** — that hides the installer bug the check exists to find.
+- **Layer 2/3 checks must assert values, not counts.** Two real outages (every synced indexer on a dead `baseUrl`, and Deluge missing the `radarr`/`tv-sonarr` labels) both passed a green suite. `IndexersFromProwlarr` and `Deluge LabelsPresent` now validate the actual values; treat any new check that only counts as incomplete.
 
 **Feature / UX gaps (still open)**
 
-- **The dashboard still ignores part of what the collector publishes.** The `api_ok` dot and tooltip landed, but `consecutive_ok`, `port_open`, and the queue/indexer/wanted counts are still unrendered, and `test_results.json` and `update_notification.json` are written with no consumer. The `test-suite` results only reach Grafana today (via the Loki push).
+- **The dashboard still ignores part of what the collector publishes.** The `api_ok` dot and tooltip landed, but `consecutive_ok`, `port_open`, and the queue/indexer/wanted counts are still unrendered, and `test_results.json` and `update_notification.json` are written with no consumer. The `test-suite` results reach Grafana (via the Loki push, now on a 15-minute `Seedbox_TestSuite` timer), but the generated HTML dashboard still does not read `test_results.json`.
 - **`tests/test_llm_block.ps1` is not wired into `test-suite.ps1`** — it lacks a `-LayerFilter` parameter and asserts on `01_webserver.ps1`'s internal variable names, so it needs an adapter before it can join the suite.
 
 **Known-incorrect behaviour left as documented trade-offs (still open)**

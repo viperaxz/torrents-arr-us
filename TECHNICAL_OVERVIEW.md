@@ -872,10 +872,16 @@ Modules: Caddy, Jellyfin, Sonarr, Radarr, Prowlarr, Deluge, Bazarr, Flaresolverr
 Layers, consistent across modules:
 
 1. **Layer 1 — health**: service `Running`, port bound, API ping and log validation — this is what `-Quick` runs (`Test-Update.ps1` checks local files instead of a service).
-2. **Layer 2 — integration**: the wiring Layer 2 installed — Prowlarr↔Sonarr/Radarr registration and the FlareSolverr proxy, Deluge accepted by the *arr download clients plus root folders, Jellyfin libraries and users matching `config.json`, Bazarr base URLs/language profiles/enabled providers, Jellyseerr connections.
-3. **Layer 3 — behaviour**: a real action per service — an RSS Sync command, a paused magnet added and removed in Deluge, a live indexer search, provider credential status, a non-empty Real-Debrid mount, log lines in Loki.
+2. **Layer 2 — integration**: the wiring Layer 2 installed — Prowlarr↔Sonarr/Radarr registration and the FlareSolverr proxy, the Deluge download client plus root folders, **each synced indexer's `baseUrl` matching `<prowlarrUrl>/<id>/`**, **the Deluge labels the *arr clients hand over** (`tv-sonarr`, `radarr`), Jellyfin libraries and users matching `config.json`, Bazarr base URLs/language profiles/enabled providers, Jellyseerr connections.
+3. **Layer 3 — behaviour**: a real action per service — an RSS Sync command (polled to completion, 120s budget), a paused magnet added and removed in Deluge, a live indexer search, provider credential status, a non-empty Real-Debrid mount, log lines in Loki.
 
-An unknown `-Service` exits 1 rather than running zero modules. Results are written to `<InstallDir>\dashboard\test_results.json` and pushed to Loki when `Apps.Grafana = true`. Output uses `[PASS]` / `[FAIL]` / `[WARN]` / `[SKIP]` lines per check, with a final summary count.
+Layers 2 and 3 assert values rather than counts on purpose: an indexer count alone passed while every synced indexer pointed at a dead URL, and "a Deluge client is registered" passed while every grab died on a missing label.
+
+An unknown `-Service` exits 1 rather than running zero modules. Results are written to `<InstallDir>\dashboard\test_results.json` — including a `loki_push` field recording whether Loki accepted them — and pushed to Loki when `Apps.Grafana = true`. Output uses `[PASS]` / `[FAIL]` / `[WARN]` / `[SKIP]` lines per check, with a final summary count.
+
+**It runs on a schedule.** `master_install.ps1` registers `Seedbox_TestSuite` (SYSTEM, every 15 minutes) to run `-Quick` — Layer 1 across every service, 52 probes in ~3 s — and runs it once at install time. That is what feeds the *Test Suite Results* Grafana dashboard, which queries `{job="test-suite"}` over a 15-minute window; without the task the panel is permanently empty. `master_uninstall.ps1` unregisters it.
+
+`-Layer 2` and `-Layer 3` can be run in isolation, but the per-app modules authenticate for themselves (Deluge's session used to be created only by its Layer 1 block, so isolated runs reported every RPC as a failure).
 
 ---
 
