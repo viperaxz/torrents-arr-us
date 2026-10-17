@@ -372,29 +372,58 @@ foreach ($idx in $Layer2Config.Indexers) {
         Write-DebugLog "VAR indexer '$idxName' SeedRules ratio=$($idx.SeedRules.Ratio) seedTime=$($idx.SeedRules.SeedTimeMinutes)m"
     }
 
+    $schemaEntry = $schemas | Where-Object { $_.definitionName -eq $idxDef } | Select-Object -First 1
+
+    # Some indexers sit behind Cloudflare but Prowlarr's schema does not flag them,
+    # so info_flaresolverr alone under-detects. torrentdownloads answers with a real
+    # CloudFlareProtectionException while its schema says False.
+    $knownCFDefs = @("RuTracker.org", "torrentdownloads")
+    $needsFlare = $false
+    if ($schemaEntry) {
+        $needsFlare = @($schemaEntry.fields | Where-Object { $_.name -eq "info_flaresolverr" }).Count -gt 0
+        if (-not $needsFlare -and $knownCFDefs -contains $idxDef) {
+            $needsFlare = $true
+            Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=TRUE (hardcoded fallback)"
+        }
+    }
+    Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=$needsFlare"
+
     $exists = $existingIndexers | Where-Object { $_.definitionName -eq $idxDef -or $_.name -eq $idxName }
     if ($exists) {
         Write-Host "     ~ Already configured: $idxName" -ForegroundColor DarkGray
         Write-DebugLog "INFO" "Indexer '$idxName' already exists  --  skip"
+        # Reinstalls reuse the indexer created by the first install, so the FlareSolverr
+        # tag has to be re-checked here: a Cloudflare-blocked indexer without the tag
+        # stays unsearchable, and Prowlarr then answers its feed with 429 while it backs
+        # off, which makes the *arr reject the indexer with 400 and the install look
+        # healthy while every search from that indexer fails.
+        if ($needsFlare -and $flareTagId -and ($exists.tags -notcontains [int]$flareTagId)) {
+            $existsHdrs = @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"}
+            $existsTags = New-Object System.Collections.Generic.List[int]
+            foreach ($t in @($exists.tags)) { if ($null -ne $t) { $existsTags.Add([int]$t) } }
+            $existsTags.Add([int]$flareTagId)
+            if ($exists.PSObject.Properties['tags']) { $exists.tags = @($existsTags) }
+            else { $exists | Add-Member -MemberType NoteProperty -Name 'tags' -Value @($existsTags) -Force }
+            try {
+                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($exists.id)" `
+                    -Method Put -Headers $existsHdrs `
+                    -Body ($exists | ConvertTo-Json -Depth 20 -Compress) `
+                    -UseBasicParsing -ErrorAction Stop | Out-Null
+                Write-Host "     [CF] Tagged existing indexer $idxName for FlareSolverr." -ForegroundColor Cyan
+                Write-DebugLog "INFO" "Attached FlareSolverr tag $flareTagId to existing indexer '$idxName' (id=$($exists.id))"
+            } catch {
+                Write-Warning "     Could not tag existing indexer '$idxName' for FlareSolverr: $_"
+                Write-DebugLog "WARN" "FlareSolverr tag on existing indexer '$idxName' failed: $_"
+            }
+        }
         continue
     }
 
-    $schemaEntry = $schemas | Where-Object { $_.definitionName -eq $idxDef } | Select-Object -First 1
     if (-not $schemaEntry) {
         Write-Warning "     Indexer definition '$idxDef' not found in Prowlarr schema. Skipping."
         Write-DebugLog "WARN" "Indexer definition '$idxDef' not in schema"
         continue
     }
-
-    $needsFlare = @($schemaEntry.fields | Where-Object { $_.name -eq "info_flaresolverr" }).Count -gt 0
-    # Some indexers are behind Cloudflare but Prowlarr's schema doesn't flag them.
-    # Hardcoded fallback: these definitions always need FlareSolverr regardless of schema.
-    $knownCFDefs = @("RuTracker.org")
-    if (-not $needsFlare -and $knownCFDefs -contains $idxDef) {
-        $needsFlare = $true
-        Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=TRUE (hardcoded fallback)"
-    }
-    Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=$needsFlare"
 
     $clone = $schemaEntry | ConvertTo-Json -Depth 10 | ConvertFrom-Json
     $payload = @{}
@@ -793,6 +822,191 @@ if ($seedRulesMap.Count -gt 0) {
             Write-Warning "     Could not apply seed rules to $($app.Name): $_"
             Write-DebugLog "WARN" "$($app.Name) seed rules update failed: $_"
         }
+    }
+}
+
+# --- 8. Make Prowlarr the source of truth for the synced indexers ------------
+# Prowlarr derives each synced indexer's baseUrl from the application entry's
+# "prowlarrUrl" field and it forwards its own torrentBaseSettings seed values --
+# but only during a fullSync, which it runs on a schedule, never because the
+# application entry changed. Two failures follow, both silent:
+#
+#  1. Changing DomainMode (DuckDNS <-> Cloudflare) or the Prowlarr port leaves
+#     already-synced indexers pointing at a path Prowlarr no longer serves.
+#     Prowlarr answers those requests with its login page and the *arr reports an
+#     XML parse error that names neither Prowlarr nor the URL:
+#       Unable to connect to indexer: '/' is an unexpected token. The expected
+#       token is '='. Line 54, position 5.
+#     (Line 54 of that login page is "    />", so position 5 is its '/'.)
+#  2. The seed criteria sections 6/7 write straight into Sonarr/Radarr are
+#     reverted to Prowlarr's empty torrentBaseSettings on the next sync, so they
+#     disappear hours after the installer reported success.
+#
+# Both *arr also validate an indexer when it is PUT, so while a baseUrl is stale
+# every write to it fails too -- that is the "seed rules PUT failed: 400 Bad
+# Request" and the minimumSeeders SQLite fallback, not a CF/FlareSolverr problem.
+#
+# Writing the values into Prowlarr and forcing one sync fixes both at the source
+# and keeps them fixed across every scheduled sync that follows.
+$syncTargets = @()
+if ($Config.Apps.Sonarr -eq $true -and (Test-Path "C:\ProgramData\Sonarr\config.xml")) {
+    $syncTargets += @{ Name="Sonarr"; Port=$Config.Ports.Sonarr; UrlBase=$SonarrUrlBase
+                       Xml="C:\ProgramData\Sonarr\config.xml" }
+}
+if ($Config.Apps.Radarr -eq $true -and (Test-Path "C:\ProgramData\Radarr\config.xml")) {
+    $syncTargets += @{ Name="Radarr"; Port=$Config.Ports.Radarr; UrlBase=$RadarrUrlBase
+                       Xml="C:\ProgramData\Radarr\config.xml" }
+}
+
+if ($syncTargets.Count -gt 0) {
+    Write-Host "  -> Making Prowlarr the source of truth for synced indexers..." -ForegroundColor Gray
+
+    $plUpdated = 0
+    $plEnabled = 0
+    try {
+        $plIndexers = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer" `
+            -Headers @{"X-Api-Key"=$ApiKey} -UseBasicParsing -ErrorAction Stop
+        foreach ($plIdx in $plIndexers) {
+            if ($plIdx.enable -ne $true) { continue }
+            $plEnabled++
+            $changed = $false
+
+            if ($minSeeders -gt 1) {
+                $f = $plIdx.fields | Where-Object { $_.name -eq "torrentBaseSettings.appMinimumSeeders" } | Select-Object -First 1
+                if ($f -and [int]$f.value -ne [int]$minSeeders) { Set-ApiFieldValue -Field $f -Value $minSeeders; $changed = $true }
+            }
+            if ($seedRulesMap.ContainsKey($plIdx.name)) {
+                $rules = $seedRulesMap[$plIdx.name]
+                if ($null -ne $rules.Ratio) {
+                    $f = $plIdx.fields | Where-Object { $_.name -eq "torrentBaseSettings.seedRatio" } | Select-Object -First 1
+                    if ($f -and [double]$f.value -ne [double]$rules.Ratio) { Set-ApiFieldValue -Field $f -Value $rules.Ratio; $changed = $true }
+                }
+                if ($null -ne $rules.SeedTimeMinutes) {
+                    $f = $plIdx.fields | Where-Object { $_.name -eq "torrentBaseSettings.seedTime" } | Select-Object -First 1
+                    if ($f -and [int]$f.value -ne [int]$rules.SeedTimeMinutes) { Set-ApiFieldValue -Field $f -Value $rules.SeedTimeMinutes; $changed = $true }
+                }
+            }
+            if (-not $changed) { continue }
+
+            try {
+                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($plIdx.id)" `
+                    -Method Put `
+                    -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+                    -Body ($plIdx | ConvertTo-Json -Depth 20 -Compress) `
+                    -UseBasicParsing -ErrorAction Stop | Out-Null
+                $plUpdated++
+            } catch {
+                Write-Warning "     Prowlarr indexer '$($plIdx.name)' seed settings update failed: $_"
+                Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' seed settings PUT failed: $_"
+            }
+            Start-Sleep -Milliseconds 300
+        }
+        if ($plUpdated -gt 0) {
+            Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plEnabled indexer(s)" -ForegroundColor Green
+        }
+        Write-DebugLog "INFO" "Prowlarr seed criteria stored on $plUpdated/$plEnabled indexers"
+    } catch {
+        Write-Warning "     Could not store seed criteria in Prowlarr: $_"
+        Write-DebugLog "WARN" "Prowlarr seed criteria update failed: $_"
+    }
+
+    $syncCmd = $null
+    try {
+        $syncCmd = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/command" `
+            -Method Post `
+            -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+            -Body '{"name":"ApplicationIndexerSync"}' `
+            -UseBasicParsing -ErrorAction Stop
+        Write-DebugLog "INFO" "ApplicationIndexerSync queued (id=$($syncCmd.id))"
+    } catch {
+        Write-Warning "     Could not trigger a Prowlarr sync: $_"
+        Write-DebugLog "WARN" "ApplicationIndexerSync trigger failed: $_"
+    }
+
+    # Wait for the sync to push corrected baseUrls, bounded: it walks Sonarr and
+    # Radarr one indexer at a time, which took ~65s on a 12-indexer install. With
+    # no sync queued there is nothing to wait for, so probe once and fall through
+    # to the direct repair below.
+    $wantPattern = '^' + [regex]::Escape($ProwlarrSelfUrl) + '/\d+/$'
+    $syncDeadline = if ($syncCmd) { (Get-Date).AddSeconds(150) } else { Get-Date }
+    $stale = @()
+    while ($true) {
+        $stale = @()
+        $probed = 0
+        foreach ($t in $syncTargets) {
+            $tKey  = ([xml](Get-Content $t.Xml -Encoding UTF8)).Config.ApiKey
+            $tBase = "http://127.0.0.1:$($t.Port)$($t.UrlBase)"
+            try {
+                $tIdx = Invoke-RestMethod "$tBase/api/v3/indexer" `
+                    -Headers @{"X-Api-Key"=$tKey} -UseBasicParsing -ErrorAction Stop
+                foreach ($e in $tIdx) {
+                    if ($e.name -notmatch '\(Prowlarr\)\s*$') { continue }
+                    $probed++
+                    $u = ($e.fields | Where-Object { $_.name -eq "baseUrl" } | Select-Object -First 1).value
+                    if ($u -notmatch $wantPattern) { $stale += "$($t.Name)/$($e.name)=$u" }
+                }
+            } catch { }
+        }
+        if ($probed -gt 0 -and $stale.Count -eq 0) { break }
+        if ((Get-Date) -ge $syncDeadline) { break }
+        Start-Sleep -Seconds 5
+    }
+
+    # The scheduled sync gets it right on its own; if it was rate-limited or still
+    # queued, write the URL the *arr should use directly rather than leave the
+    # install in a state where every search fails.
+    if ($stale.Count -gt 0) {
+        Write-DebugLog "WARN" "$($stale.Count) indexer(s) still on a stale baseUrl after sync: $($stale -join ', ')"
+        foreach ($t in $syncTargets) {
+            $tKey  = ([xml](Get-Content $t.Xml -Encoding UTF8)).Config.ApiKey
+            $tBase = "http://127.0.0.1:$($t.Port)$($t.UrlBase)"
+            $tHdrs = @{"X-Api-Key"=$tKey; "Content-Type"="application/json"}
+            try {
+                $tIdx = Invoke-RestMethod "$tBase/api/v3/indexer" -Headers $tHdrs -UseBasicParsing -ErrorAction Stop
+                foreach ($e in $tIdx) {
+                    if ($e.name -notmatch '\(Prowlarr\)\s*$') { continue }
+                    $f = $e.fields | Where-Object { $_.name -eq "baseUrl" } | Select-Object -First 1
+                    if (-not $f -or $f.value -match $wantPattern) { continue }
+                    # Keep the feed id already in the URL -- Prowlarr ids are stable
+                    # and match the trailing "/<id>/" segment of the existing baseUrl.
+                    if ($f.value -notmatch '/(\d+)/?$') { continue }
+                    Set-ApiFieldValue -Field $f -Value "$ProwlarrSelfUrl/$($Matches[1])/"
+                    try {
+                        Invoke-RestMethod "$tBase/api/v3/indexer/$($e.id)" `
+                            -Method Put -Headers $tHdrs `
+                            -Body ($e | ConvertTo-Json -Depth 20 -Compress) `
+                            -UseBasicParsing -ErrorAction Stop | Out-Null
+                        Write-DebugLog "INFO" "$($t.Name) indexer '$($e.name)' baseUrl repaired directly to $($f.value)"
+                    } catch {
+                        Write-DebugLog "WARN" "$($t.Name) indexer '$($e.name)' baseUrl repair PUT failed: $_"
+                    }
+                    Start-Sleep -Milliseconds 300
+                }
+            } catch { }
+        }
+
+        $stale = @()
+        foreach ($t in $syncTargets) {
+            $tKey  = ([xml](Get-Content $t.Xml -Encoding UTF8)).Config.ApiKey
+            $tBase = "http://127.0.0.1:$($t.Port)$($t.UrlBase)"
+            try {
+                $tIdx = Invoke-RestMethod "$tBase/api/v3/indexer" `
+                    -Headers @{"X-Api-Key"=$tKey} -UseBasicParsing -ErrorAction Stop
+                foreach ($e in $tIdx) {
+                    if ($e.name -notmatch '\(Prowlarr\)\s*$') { continue }
+                    $u = ($e.fields | Where-Object { $_.name -eq "baseUrl" } | Select-Object -First 1).value
+                    if ($u -notmatch $wantPattern) { $stale += "$($t.Name)/$($e.name)=$u" }
+                }
+            } catch { }
+        }
+    }
+
+    if ($stale.Count -eq 0) {
+        Write-Host "     OK Indexer URLs point at $ProwlarrSelfUrl/<id>/ in all *arr apps" -ForegroundColor Green
+        Write-DebugLog "INFO" "All synced indexer baseUrls match $ProwlarrSelfUrl/<id>/"
+    } else {
+        Write-Warning "     $($stale.Count) indexer(s) still use a stale URL: $($stale -join ', ')"
+        Write-DebugLog "ERROR" "Stale indexer baseUrls remain: $($stale -join ', ')"
     }
 }
 
