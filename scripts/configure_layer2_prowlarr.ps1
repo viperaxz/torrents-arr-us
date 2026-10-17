@@ -947,6 +947,7 @@ if ($syncTargets.Count -gt 0) {
     $plUpdated = 0
     $plEnabled = 0
     $plUnavailable = [System.Collections.Generic.List[string]]::new()
+    $plDeferred = [System.Collections.Generic.List[object]]::new()
     try {
         $plIndexers = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer" `
             -Headers @{"X-Api-Key"=$ApiKey} -UseBasicParsing -ErrorAction Stop
@@ -973,10 +974,14 @@ if ($syncTargets.Count -gt 0) {
             if (-not $changed) { continue }
 
             # Prowlarr validates the indexer on PUT too, so a solver-warmed indexer
-            # can answer 400 on the first attempt (seen on RuTracker right after a
-            # fresh install, then fine on re-run). Retry once before warning.
+            # can answer 400 on the first attempt -- seen on RuTracker right after a
+            # fresh install and then fine on the very next run, because Prowlarr is
+            # still validating the other 32 indexers it just received. Retrying in
+            # place cannot win that race, so defer the failures to a second pass at
+            # the end of this loop, by which time Prowlarr is idle.
             $plPutOk = $false
             $plPutErr = $null
+            $plPutBody = ''
             $plPutUnavailable = $false
             for ($plAttempt = 1; $plAttempt -le 2; $plAttempt++) {
                 try {
@@ -992,20 +997,20 @@ if ($syncTargets.Count -gt 0) {
                     # Prowlarr validates the indexer on PUT. Reading the body is the only
                     # way to tell "this tracker is in its own backoff" (expected, nothing
                     # to fix) from a real configuration failure.
-                    $plBodyText = ''
+                    $plPutBody = ''
                     $plResp = $_.Exception.Response
                     if ($plResp) {
                         try {
                             $plSr = New-Object System.IO.StreamReader($plResp.GetResponseStream())
-                            $plBodyText = $plSr.ReadToEnd()
+                            $plPutBody = $plSr.ReadToEnd()
                         } catch { }
                     }
-                    if (Test-IndexerPermanentlyUnavailable -Body $plBodyText) {
+                    if (Test-IndexerPermanentlyUnavailable -Body $plPutBody) {
                         $plPutUnavailable = $true
                         break
                     }
                     if ($plAttempt -lt 2) {
-                        Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_"
+                        Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_ body=$plPutBody"
                         Start-Sleep -Seconds 5
                     }
                 }
@@ -1016,11 +1021,46 @@ if ($syncTargets.Count -gt 0) {
                 $plUnavailable += $plIdx.name
                 Write-DebugLog "INFO" "Prowlarr indexer '$($plIdx.name)' skipped: Prowlarr cannot validate it right now (429 backoff or no results)"
             } else {
-                Write-Warning "     Prowlarr indexer '$($plIdx.name)' seed settings update failed: $plPutErr"
-                Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' seed settings PUT failed after 2 attempts: $plPutErr"
+                $plDeferred += [pscustomobject]@{ Idx = $plIdx; Err = $plPutErr; Body = $plPutBody }
+                Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT deferred to the second pass: $plPutErr body=$plPutBody"
             }
             Start-Sleep -Milliseconds 300
         }
+
+        if ($plDeferred.Count -gt 0) {
+            Write-DebugLog "INFO" "Second pass: retrying $($plDeferred.Count) Prowlarr indexer(s) Prowlarr was too busy to validate"
+            Start-Sleep -Seconds 5
+            foreach ($d in $plDeferred) {
+                try {
+                    Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($d.Idx.id)" `
+                        -Method Put `
+                        -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+                        -Body ($d.Idx | ConvertTo-Json -Depth 20 -Compress) `
+                        -UseBasicParsing -ErrorAction Stop | Out-Null
+                    $plUpdated++
+                    Write-DebugLog "INFO" "Prowlarr indexer '$($d.Idx.name)' seed settings stored on the second pass"
+                } catch {
+                    $dErr = $_
+                    $dB = ''
+                    $dResp = $_.Exception.Response
+                    if ($dResp) {
+                        try {
+                            $dSr = New-Object System.IO.StreamReader($dResp.GetResponseStream())
+                            $dB = $dSr.ReadToEnd()
+                        } catch { }
+                    }
+                    if (Test-IndexerPermanentlyUnavailable -Body $dB) {
+                        $plUnavailable += $d.Idx.name
+                        Write-DebugLog "INFO" "Prowlarr indexer '$($d.Idx.name)' skipped: Prowlarr cannot validate it right now (429 backoff or no results)"
+                    } else {
+                        $dMsg = if ($dB -match 'message"\s*:\s*"([^"]+)') { $Matches[1] } elseif ($dB) { $dB } else { $dErr.Exception.Message }
+                        Write-Warning "     Prowlarr indexer '$($d.Idx.name)' seed settings update failed: $dMsg"
+                        Write-DebugLog "WARN" "Prowlarr indexer '$($d.Idx.name)' seed settings PUT failed on both passes: $dErr body=$dB"
+                    }
+                }
+            }
+        }
+
         if ($plUpdated -gt 0) {
             Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plEnabled indexer(s)" -ForegroundColor Green
         }
