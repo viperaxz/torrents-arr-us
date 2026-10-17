@@ -161,7 +161,8 @@ Write-DebugLog "VAR $ServiceName status before stop=$svcStatus"
 if ($svcStatus -eq "Running") {
     Write-Host "  -> Stopping service to configure..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Stopping $ServiceName to write network.xml..."
-    $null = Stop-ServiceBounded -Name $ServiceName-Sleep -Seconds 3
+    $null = Stop-ServiceBounded -Name $ServiceName
+    Start-Sleep -Seconds 3
     Write-DebugLog "INFO" "$ServiceName stopped"
 }
 
