@@ -600,6 +600,7 @@ if (Test-Path $csProgDir) {
 Write-Host "[8/8] Removing service account..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 8: Remove service account ==="
 $svcUser = "seedbox-svc"
+$profileDir = ''
 $svcExists = Get-LocalUser -Name $svcUser -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $svcUser exists: $($null -ne $svcExists)"
 if ($svcExists) {
@@ -687,6 +688,29 @@ if ($svcExists) {
     Remove-LocalUser -Name $svcUser -ErrorAction SilentlyContinue
     Write-Host "  -> seedbox-svc account removed." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Local user account removed: $svcUser"
+}
+
+# Every cycle leaves the previous profile behind: its hive stays mapped until the
+# next reboot, so Windows names the next one seedbox-svc.DESKTOP-XXXXXX.000, then
+# .001, and so on. Handling only the current profile therefore leaves one dead
+# 2.6 MB tree per cycle (measured: five of them after five cycles). Sweep every
+# one, including the ones earlier cycles created.
+$leftoverProfiles = @(Get-ChildItem -Path 'C:\Users' -Directory -Filter "$svcUser*" -Force -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -ne $profileDir -and $_.FullName -ne $env:USERPROFILE })
+if ($leftoverProfiles.Count -gt 0) {
+    $sweepDeleted = 0
+    $sweepQueued  = 0
+    foreach ($dir in $leftoverProfiles) {
+        if (-not (Test-Path -LiteralPath $dir.FullName)) { continue }
+        Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $dir.FullName) {
+            try { $sweepQueued += Register-PathForDeletionAtReboot -Path $dir.FullName } catch { }
+        } else {
+            $sweepDeleted++
+        }
+    }
+    Write-Host "  -> Removed $sweepDeleted stale $svcUser profile folder(s) from earlier cycles$(if ($sweepQueued -gt 0) { "; queued $sweepQueued entries for the remaining locked one(s)" })." -ForegroundColor Yellow
+    Write-DebugLog "INFO" "Stale $svcUser profile sweep: deleted=$sweepDeleted queuedEntries=$sweepQueued of $($leftoverProfiles.Count) folder(s)"
 }
 
 # -- Done ----------------------------------------------------------------------
