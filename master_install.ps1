@@ -37,7 +37,7 @@ if ($DomainMode -ne "cloudflare" -and $DomainMode -ne "duckdns") {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
-Initialize-DebugLog -Config $Config
+Initialize-DebugLog -Config $Config -NewRun
 # Shared choco plumbing: PATH-safe resolution (a shell opened before Chocolatey
 # was installed never sees chocolatey\bin) plus retry-on-transient-feed-failure
 # with the output captured instead of discarded.

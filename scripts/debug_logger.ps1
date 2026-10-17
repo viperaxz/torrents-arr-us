@@ -22,8 +22,16 @@
 function global:Initialize-DebugLog {
     param(
         [Parameter(Mandatory=$true)]
-        [object]$Config
+        [object]$Config,
+        # Top-level scripts pass this. An uninstall moves its log to
+        # %LOCALAPPDATA%\win-seedbox\logs and every child script it spawned shares
+        # $global:SeedboxDebugLogFile, so an install started from the same
+        # PowerShell session appended 200 KB of its own log to the moved uninstall
+        # log and left D:\MediaServer\logs with no debug log at all.
+        [switch]$NewRun
     )
+
+    if ($NewRun) { $global:SeedboxDebugLogFile = $null }
 
     $global:SeedboxDebugEnabled = ($Config.General.DebugLogging -eq $true)
     if (-not $global:SeedboxDebugEnabled) { return }

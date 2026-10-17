@@ -21,7 +21,7 @@ if (Test-Path $ConfigPath) {
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
 if ($Config) {
-    Initialize-DebugLog -Config $Config
+    Initialize-DebugLog -Config $Config -NewRun
     Write-DebugLog "INFO" "master_uninstall.ps1 started. Force=$Force"
     Write-DebugLog "VAR InstallDir = $InstallDir"
 } else {

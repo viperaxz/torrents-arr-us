@@ -38,7 +38,7 @@ $Config = Get-Content -Raw -Path $ConfigPath | ConvertFrom-Json
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
-Initialize-DebugLog -Config $Config
+Initialize-DebugLog -Config $Config -NewRun
 Write-DebugLog "INFO" "master_configure_layer2.ps1 started"
 Write-DebugLog "VAR DomainMode = $($Config.General.DomainMode)"
 Write-DebugLog "VAR Apps: Sonarr=$($Config.Apps.Sonarr) Radarr=$($Config.Apps.Radarr) Prowlarr=$($Config.Apps.Prowlarr) Jellyfin=$($Config.Apps.Jellyfin) Bazarr=$($Config.Apps.Bazarr) Jellyseerr=$($Config.Apps.Jellyseerr)"

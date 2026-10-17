@@ -23,7 +23,7 @@ $BinDir     = Join-Path $PSScriptRoot "bin"
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "scripts\debug_logger.ps1")
-Initialize-DebugLog -Config $Config
+Initialize-DebugLog -Config $Config -NewRun
 . (Join-Path $PSScriptRoot "scripts\update_common.ps1")
 Write-DebugLog "INFO" "master_update.ps1 started. AutoApprove=$AutoApprove App=$App WhatIf=$WhatIf"
 

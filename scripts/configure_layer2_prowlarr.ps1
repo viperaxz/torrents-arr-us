@@ -1022,7 +1022,7 @@ if ($syncTargets.Count -gt 0) {
                 $plUpdated++
             } elseif ($plPutUnavailable) {
                 $plUnavailable += $plIdx.name
-                Write-DebugLog "INFO" "Prowlarr indexer '$($plIdx.name)' skipped: Prowlarr cannot validate it right now (429 backoff or no results)"
+                Write-DebugLog "INFO" "Prowlarr indexer '$($plIdx.name)' skipped: Prowlarr cannot validate it right now (tracker unreachable, in backoff, or no results for these categories)"
             } else {
                 $plDeferred += [pscustomobject]@{ Idx = $plIdx; Err = $plPutErr; Body = $plPutBody }
                 Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT deferred to the second pass: $plPutErr body=$plPutBody"
@@ -1054,7 +1054,7 @@ if ($syncTargets.Count -gt 0) {
                     }
                     if (Test-IndexerPermanentlyUnavailable -Body $dB) {
                         $plUnavailable += $d.Idx.name
-                        Write-DebugLog "INFO" "Prowlarr indexer '$($d.Idx.name)' skipped: Prowlarr cannot validate it right now (429 backoff or no results)"
+                        Write-DebugLog "INFO" "Prowlarr indexer '$($d.Idx.name)' skipped: Prowlarr cannot validate it right now (tracker unreachable, in backoff, or no results for these categories)"
                     } else {
                         $dMsg = if ($dB -match 'message"\s*:\s*"([^"]+)') { $Matches[1] } elseif ($dB) { $dB } else { $dErr.Exception.Message }
                         Write-Warning "     Prowlarr indexer '$($d.Idx.name)' seed settings update failed: $dMsg"
@@ -1068,7 +1068,7 @@ if ($syncTargets.Count -gt 0) {
             Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plEnabled indexer(s)" -ForegroundColor Green
         }
         if ($plUnavailable.Count -gt 0) {
-            Write-Host "     $($plUnavailable.Count) indexer(s) not updated in Prowlarr: $($plUnavailable -join ', ') -- Prowlarr is in its own backoff for them, so the ratios stay on the app side only." -ForegroundColor DarkGray
+            Write-Host "     $($plUnavailable.Count) indexer(s) not updated in Prowlarr: $($plUnavailable -join ', ') -- Prowlarr cannot validate them right now, so the ratios are applied on the app side only." -ForegroundColor DarkGray
             Write-DebugLog "INFO" "Prowlarr seed criteria skipped for unavailable indexers: $($plUnavailable -join ', ')"
         }
         Write-DebugLog "INFO" "Prowlarr seed criteria stored on $plUpdated/$plEnabled indexers"
