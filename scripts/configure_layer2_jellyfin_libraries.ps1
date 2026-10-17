@@ -421,19 +421,29 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
     # rclone mounts that we know are ready right now but may not be at boot.
     if ($libPath -match '^[A-Za-z]:\\?$') {
         # Test-Path alone can be true while the mount root still cannot serve
-        # directory listings (rclone + Zurg warming up). Verify the drive really
-        # lists before scanning, otherwise Jellyfin records the library as empty
-        # and skips it until its next scheduled scan.
+        # directory listings, and an rclone+Zurg mount also lists successfully while
+        # it is still enumerating the remote -- returning an EMPTY listing. Scanning
+        # in that window makes Jellyfin record the library as having no media, which
+        # is what a fresh install then shows until something triggers another scan.
+        # Wait for the mount to produce at least one entry before scanning.
         $driveReady    = $false
-        $driveDeadline = (Get-Date).AddSeconds(60)
+        $driveDeadline = (Get-Date).AddSeconds(240)
+        $driveWaited   = 0
         while (-not $driveReady -and (Get-Date) -lt $driveDeadline) {
             try {
-                $null = Get-ChildItem -Path $libPath -ErrorAction Stop
-                $driveReady = $true
+                $children = @(Get-ChildItem -Path $libPath -ErrorAction Stop)
+                if ($children.Count -gt 0) {
+                    $driveReady = $true
+                } else {
+                    Start-Sleep -Seconds 10
+                    $driveWaited += 10
+                }
             } catch {
                 Start-Sleep -Seconds 3
+                $driveWaited += 3
             }
         }
+        Write-DebugLog "VAR mount '$libPath' ready=$driveReady waited=${driveWaited}s"
         if ($driveReady) {
             # Find the library ItemId from the current virtual folders list
             $vf = $currentLibs | Where-Object { $_.Name -eq $libName } | Select-Object -First 1
@@ -455,8 +465,13 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
                 Write-DebugLog "WARN" "drive-root library '$libName' not found in virtual folders -- cannot trigger scan"
             }
         } else {
-            Write-DebugLog "WARN" "drive-root library '$libName' path '$libPath' is NOT accessible -- skipping scan"
-            Write-Host "  [SKIP] Library '$libName' ($libPath) drive not accessible, scan deferred." -ForegroundColor DarkGray
+            # Two causes, both now covered by the wait above: the drive is not
+            # accessible yet, or it is mounted but still returning an empty listing
+            # because the rclone/Zurg mount is enumerating. Either way, scanning now
+            # would record the library as having no media.
+            Write-DebugLog "WARN" "drive-root library '$libName' path '$libPath' did not become ready within ${driveWaited}s (mounted but empty, or not accessible) -- scan deferred"
+            Write-Host "  [SKIP] Library '$libName' ($libPath) has no content yet (mount still warming up), scan deferred." -ForegroundColor DarkGray
+            Write-Host "         Re-run Layer 2 once '$libPath' lists files, or the next scheduled scan will pick it up." -ForegroundColor DarkGray
         }
     }
 }
