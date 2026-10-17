@@ -60,9 +60,19 @@ try {
     $Version = $Release.tag_name -replace '^v', ''
     Write-DebugLog "VAR Jellyseerr version=$Version"
 } catch {
-    Write-Error "[$AppName] Failed to query GitHub releases: $_"
-    Write-DebugLog "ERROR" "GitHub API query failed: $_"
-    exit 1
+    # GitHub's unauthenticated API allows 60 requests per hour, shared by every
+    # machine behind one NAT, and exhausting it must not break an install whose
+    # source archive is already cached in bin\.
+    $cachedSrc = @(Get-ChildItem -Path $BinDir -Filter "jellyseerr-v*-source.zip" -File -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    if ($cachedSrc.Count -eq 0) {
+        Write-Error "[$AppName] Failed to query GitHub releases: $_"
+        Write-DebugLog "ERROR" "GitHub API query failed and no cached source archive: $_"
+        exit 1
+    }
+    $Version = ($cachedSrc[0].Name -replace '^jellyseerr-v', '') -replace '-source\.zip$', ''
+    Write-Warning "  -> GitHub API unavailable; building from the cached source for v$Version."
+    Write-DebugLog "WARN" "GitHub API failed ($_); falling back to cached source archive v$Version"
 }
 
 # -- 2. Download portable Node.js 22 LTS ----------------------------------------

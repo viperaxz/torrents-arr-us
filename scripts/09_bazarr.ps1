@@ -274,6 +274,27 @@ if (-not $PythonExe) {
         exit 1
     }
 
+    # A Python can also be PRESENT but invisible to Find-ExistingPython: a per-user
+    # install whose MSI registration survived while its files were removed, or a
+    # half-uninstalled entry. `choco install python312` then fails with 1603 and the
+    # choco output does not explain why, so name the products up front.
+    $pyProducts = @()
+    foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+                        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+                        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        $pyProducts += @(Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($p.DisplayName -match '^Python 3\.') { $p.DisplayName }
+        })
+    }
+    $pyProducts = @($pyProducts | Select-Object -Unique)
+    if ($pyProducts.Count -gt 0) {
+        Write-Warning "[$AppName] A Python 3 product is registered but no usable interpreter was found:"
+        $pyProducts | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+        Write-Warning "  If the install below fails with 1603 / 0x80070643, remove that Python and re-run."
+        Write-DebugLog "WARN" "Registered Python products without a usable interpreter: $($pyProducts -join '; ')"
+    }
+
     Write-Host "  -> Python 3.12 not found. Installing via Chocolatey..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Python not found on system. Installing python312 via choco..."
     $pythonInstall = Invoke-Choco -Arguments @('install', 'python312', '-y', '--no-progress')
@@ -285,6 +306,12 @@ if (-not $PythonExe) {
     } elseif ($pythonInstall.ExitCode -ne 0 -or $pythonInstall.Transient) {
         Write-Warning "[Bazarr] choco install python312 returned exit code $($pythonInstall.ExitCode). Trying other Python locations..."
         Write-DebugLog "WARN" "choco install python312 non-zero exit (exit $($pythonInstall.ExitCode), transient=$($pythonInstall.Transient), attempts=$($pythonInstall.Attempts)): $pythonTail"
+        if ($pythonInstall.ExitCode -eq 1603) {
+            # 1603 is ERROR_INSTALL_FAILURE: an MSI-level conflict or a broken
+            # registration, not a transient feed problem -- retrying will not help.
+            Write-Warning "[Bazarr] 1603 is a fatal MSI error, usually a broken or partial Python 3.12 registration."
+            Write-Host "    Remove 'Python 3.12' (Settings > Apps), then re-run .\master_install.ps1" -ForegroundColor Gray
+        }
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")

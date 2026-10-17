@@ -40,7 +40,7 @@ Write-Host "=============================================" -ForegroundColor Red
 Write-Host "  SEEDBOX UNINSTALLER" -ForegroundColor Red
 Write-Host "  InstallDir : $InstallDir" -ForegroundColor Red
 Write-Host "  Removes    : services, tasks, app data, binaries" -ForegroundColor Red
-Write-Host "  Keeps      : Chocolatey, NSSM, vcredist, media files, Sonarr/Radarr backups" -ForegroundColor Red
+Write-Host "  Keeps      : Chocolatey, NSSM, vcredist, Python 3.12, media files, Sonarr/Radarr backups" -ForegroundColor Red
 Write-Host "=============================================" -ForegroundColor Red
 Write-Host ""
 
@@ -484,7 +484,13 @@ foreach ($pathEntry in @((Join-Path $InstallDir "ffmpeg"), $PSScriptRoot)) {
 }
 
 # -- 7. Remove Chocolatey app packages ----------------------------------------
-# Does NOT remove prerequisites: nssm, php, git, vcredist140, chocolatey itself
+# Does NOT remove prerequisites: nssm, php, git, vcredist140, python312, chocolatey
+# itself. Python stays for the same reason the others do -- Bazarr needs it -- and
+# because reinstalling it is the destructive step: `choco install python312`
+# performs an InstallAllUsers=1 install, and where a per-user Python 3.12 exists
+# the python.org bundle removes it and can leave orphaned MSI state that makes
+# every later attempt fail with 1603 / 0x80070643. Repeating that on every
+# uninstall cycle is how a working interpreter gets destroyed.
 Write-Host "[7/8] Uninstalling Chocolatey app packages..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 7: Uninstall Chocolatey packages ==="
 # Resolve choco up front (not via $env:Path) so this phase can never abort with
@@ -496,7 +502,7 @@ if (-not $ChocoExe) {
     Write-Warning "  -> Chocolatey not found -- skipping app package removal (prerequisites are kept anyway)."
     Write-DebugLog "ERROR" "choco.exe could not be located; skipping phase 7 package removal"
 }
-foreach ($pkg in @("caddy", "jellyfin", "deluge", "ffmpeg", "python312",
+foreach ($pkg in @("caddy", "jellyfin", "deluge", "ffmpeg",
                    "crowdsec-windows-firewall-bouncer", "crowdsec", "winfsp")) {
     if (-not $ChocoExe) { break }
     $installed = Get-ChocoInstalledVersion -Package $pkg
@@ -516,14 +522,6 @@ foreach ($pkg in @("caddy", "jellyfin", "deluge", "ffmpeg", "python312",
             Write-DebugLog "ERROR" "choco uninstall $($pkg): FAILED (exit $($uninstall.ExitCode), transient=$($uninstall.Transient), attempts=$($uninstall.Attempts)): $uninstallTail"
         }
     }
-}
-# Chocolatey leaves behind Python lib dirs even after package removal
-$py312Dir = "C:\Python312"
-Write-DebugLog "VAR $py312Dir exists: $(Test-Path $py312Dir)"
-if (Test-Path $py312Dir) {
-    Remove-Item -Path $py312Dir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "  -> Removed: C:\Python312 (leftover from python312)" -ForegroundColor Yellow
-    Write-DebugLog "INFO" "Removed Python312 leftover: $py312Dir"
 }
 
 # -- 8. Remove service account -------------------------------------------------
@@ -587,7 +585,7 @@ Write-Host ""
 Write-Host "=============================================" -ForegroundColor Green
 Write-Host "  Uninstall complete." -ForegroundColor Green
 Write-Host "  Kept intact:" -ForegroundColor Green
-Write-Host "    - Chocolatey, NSSM, vcredist (prerequisites)" -ForegroundColor Gray
+Write-Host "    - Chocolatey, NSSM, vcredist, Python 3.12 (prerequisites)" -ForegroundColor Gray
 if ($Config) {
     Write-Host "    - $($Config.Paths.Downloads) (downloads)" -ForegroundColor Gray
     Write-Host "    - $($Config.Paths.Movies) (movies)" -ForegroundColor Gray

@@ -353,20 +353,59 @@ function global:Install-FfmpegBuild {
     $stageDir  = Join-Path $InstallDir ".ffmpeg-staging"
     if (-not (Test-Path $BinDir)) { New-Item -Path $BinDir -ItemType Directory -Force | Out-Null }
 
-    $release = Get-FfmpegRelease -Repo $Repo -Tag $Tag
-    if ($Tag -and $release.tag_name -ine $Tag) {
-        Write-Host "  -> Pinned release $Tag is not available upstream; using $($release.tag_name)." -ForegroundColor Yellow
-        Write-DebugLog "WARN" "Pinned ffmpeg release $Tag missing; fell back to $($release.tag_name)"
+    # Cache first. The asset name encodes the upstream tag, so an archive already in
+    # bin\ needs no API call at all. GitHub's unauthenticated API allows 60 requests
+    # per hour, shared by every machine behind one NAT, and exhausting it used to
+    # fail a fully-cached reinstall for no reason.
+    $zipPath = $null
+    $asset   = $null
+    $patternFiles = @(Get-ChildItem -Path $BinDir -Filter $AssetPattern -File -ErrorAction SilentlyContinue)
+    if ($Tag) {
+        $tagNumeric = $Tag.TrimStart('v')
+        $cachedZip  = @($patternFiles | Where-Object { $_.Name -like "*$tagNumeric*" } |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+    } else {
+        $cachedZip  = @($patternFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
     }
-    $asset = Select-FfmpegAsset -Release $release -AssetPattern $AssetPattern
-    if (-not $asset) {
-        $result.Detail = "no Windows x64 portable asset in release $($release.tag_name) of $Repo"
-        Write-DebugLog "ERROR" $result.Detail
-        return $result
-    }
-    Write-DebugLog "VAR release=$($release.tag_name) asset=$($asset.name) bytes=$($asset.size)"
 
-    $zipPath = Join-Path $BinDir $asset.name
+    $release = $null
+    if ($cachedZip.Count -gt 0) {
+        $zipPath = $cachedZip[0].FullName
+        $asset   = [PSCustomObject]@{ name = $cachedZip[0].Name; size = $cachedZip[0].Length; browser_download_url = $null }
+        Write-DebugLog "INFO" "Cached archive matches the pin -- skipping the GitHub API: $zipPath"
+    } else {
+        try {
+            $release = Get-FfmpegRelease -Repo $Repo -Tag $Tag
+        } catch {
+            # Nothing matched the pin and the API refused. An older cached archive is
+            # still better than a failed install, and the warning says which one ran.
+            $fallback = @($patternFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+            if ($fallback.Count -eq 0) {
+                $result.Detail = "cannot resolve a release for $($Repo): $_"
+                Write-DebugLog "ERROR" $result.Detail
+                return $result
+            }
+            $zipPath = $fallback[0].FullName
+            $asset   = [PSCustomObject]@{ name = $fallback[0].Name; size = $fallback[0].Length; browser_download_url = $null }
+            Write-Warning "  -> GitHub API unavailable; using the cached archive $($asset.name) instead of the pinned $Tag."
+            Write-DebugLog "WARN" "GitHub API failed ($_); falling back to cached archive $zipPath"
+        }
+    }
+
+    if (-not $zipPath) {
+        if ($Tag -and $release.tag_name -ine $Tag) {
+            Write-Host "  -> Pinned release $Tag is not available upstream; using $($release.tag_name)." -ForegroundColor Yellow
+            Write-DebugLog "WARN" "Pinned ffmpeg release $Tag missing; fell back to $($release.tag_name)"
+        }
+        $asset = Select-FfmpegAsset -Release $release -AssetPattern $AssetPattern
+        if (-not $asset) {
+            $result.Detail = "no Windows x64 portable asset in release $($release.tag_name) of $Repo"
+            Write-DebugLog "ERROR" $result.Detail
+            return $result
+        }
+        $zipPath = Join-Path $BinDir $asset.name
+    }
+    Write-DebugLog "VAR asset=$($asset.name) bytes=$($asset.size) zipPath=$zipPath"
     $staged  = $null
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         if ($attempt -gt 1 -and (Test-Path -LiteralPath $zipPath)) {
