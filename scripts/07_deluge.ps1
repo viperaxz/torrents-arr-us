@@ -126,15 +126,25 @@ function Ensure-DelugeLabels {
     }
 
     # Read back rather than trusting label.add: a plugin that is not enabled accepts
-    # the RPC and silently does nothing.
-    $labelFinal = @()
-    try {
-        $verifyBody = @{ method = "label.get_labels"; params = @(); id = 4 } | ConvertTo-Json -Compress
-        $verifyRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $verifyBody `
-            -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
-        $labelFinal = @($verifyRes.result | Where-Object { $null -ne $_ })
-    } catch {
-        Write-DebugLog "WARN" "label.get_labels verify failed: $_"
+    # the RPC and silently does nothing. The daemon applies the add asynchronously,
+    # so poll instead of reading once -- a single immediate read returned the
+    # pre-change list on a fresh install, which turned a working setup into a red
+    # "labels still missing" error.
+    $labelFinal   = @()
+    $labelDeadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $labelDeadline) {
+        $labelFinal = @()
+        try {
+            $verifyBody = @{ method = "label.get_labels"; params = @(); id = 4 } | ConvertTo-Json -Compress
+            $verifyRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $verifyBody `
+                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+            $labelFinal = @($verifyRes.result | Where-Object { $null -ne $_ })
+        } catch {
+            Write-DebugLog "WARN" "label.get_labels verify failed: $_"
+        }
+        $labelMissing = @($Labels | Where-Object { $labelFinal -notcontains $_ })
+        if ($labelMissing.Count -eq 0) { break }
+        Start-Sleep -Seconds 2
     }
     $labelMissing = @($Labels | Where-Object { $labelFinal -notcontains $_ })
     if ($labelMissing.Count -eq 0) {

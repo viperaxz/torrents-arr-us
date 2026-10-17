@@ -977,17 +977,26 @@ if (Get-Service "Loki" -ErrorAction SilentlyContinue) {
     $lokiState = (Get-Service "Loki" -ErrorAction SilentlyContinue).Status
     $lokiReady = $false
     $lokiProbe = "no response"
-    try {
-        $lokiResponse = Invoke-WebRequest "http://127.0.0.1:$LokiPort/ready" `
-            -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        $lokiReady = $true
-        $lokiProbe = "HTTP $([int]$lokiResponse.StatusCode)"
-    } catch {
-        $lokiProbe = if ($_.Exception.Response) {
-            "HTTP $([int]$_.Exception.Response.StatusCode)"
-        } else {
-            $_.Exception.Message
+    # A 503 here is Loki's normal "ring not ready yet" answer, not a fault, so poll
+    # instead of probing once. A single 5s probe turned a healthy install into a
+    # warning on every run.
+    $lokiDeadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $lokiDeadline) {
+        $lokiProbe = "no response"
+        try {
+            $lokiResponse = Invoke-WebRequest "http://127.0.0.1:$LokiPort/ready" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $lokiReady = $true
+            $lokiProbe = "HTTP $([int]$lokiResponse.StatusCode)"
+        } catch {
+            $lokiProbe = if ($_.Exception.Response) {
+                "HTTP $([int]$_.Exception.Response.StatusCode)"
+            } else {
+                $_.Exception.Message
+            }
         }
+        if ($lokiReady) { break }
+        Start-Sleep -Seconds 3
     }
     Write-DebugLog "VAR Loki service=$lokiState ready=$lokiReady probe=$lokiProbe"
     if ($lokiReady -and $lokiState -eq "Running") {

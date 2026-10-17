@@ -897,16 +897,33 @@ if ($syncTargets.Count -gt 0) {
             }
             if (-not $changed) { continue }
 
-            try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($plIdx.id)" `
-                    -Method Put `
-                    -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
-                    -Body ($plIdx | ConvertTo-Json -Depth 20 -Compress) `
-                    -UseBasicParsing -ErrorAction Stop | Out-Null
+            # Prowlarr validates the indexer on PUT too, so a solver-warmed indexer
+            # can answer 400 on the first attempt (seen on RuTracker right after a
+            # fresh install, then fine on re-run). Retry once before warning.
+            $plPutOk = $false
+            $plPutErr = $null
+            for ($plAttempt = 1; $plAttempt -le 2; $plAttempt++) {
+                try {
+                    Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($plIdx.id)" `
+                        -Method Put `
+                        -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+                        -Body ($plIdx | ConvertTo-Json -Depth 20 -Compress) `
+                        -UseBasicParsing -ErrorAction Stop | Out-Null
+                    $plPutOk = $true
+                    break
+                } catch {
+                    $plPutErr = $_
+                    if ($plAttempt -lt 2) {
+                        Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_"
+                        Start-Sleep -Seconds 5
+                    }
+                }
+            }
+            if ($plPutOk) {
                 $plUpdated++
-            } catch {
-                Write-Warning "     Prowlarr indexer '$($plIdx.name)' seed settings update failed: $_"
-                Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' seed settings PUT failed: $_"
+            } else {
+                Write-Warning "     Prowlarr indexer '$($plIdx.name)' seed settings update failed: $plPutErr"
+                Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' seed settings PUT failed after 2 attempts: $plPutErr"
             }
             Start-Sleep -Milliseconds 300
         }

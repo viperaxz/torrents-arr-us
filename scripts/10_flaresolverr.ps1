@@ -58,30 +58,23 @@ $AssetName     = if ($Config._Versions -and $Config._Versions.Apps.Flaresolverr)
 Write-DebugLog "VAR PinnedVersion=$PinnedVersion AssetName=$AssetName"
 
 $CacheFile = if ($PinnedVersion) { Join-Path $BinDir "flaresolverr-$PinnedVersion.zip" } else { $null }
-$CachedZip = if ($CacheFile -and (Test-Path $CacheFile)) {
-    Get-Item $CacheFile
-} else {
-    Get-ChildItem $BinDir -Filter "flaresolverr-*.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
-}
-Write-DebugLog "VAR cached zip found=$($null -ne $CachedZip) name=$($CachedZip.Name)"
+# Any cached build, used only as an offline fallback below.
+$StaleZip = Get-ChildItem $BinDir -Filter "flaresolverr-*.zip" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+$PinnedCacheHit = [bool]($CacheFile -and (Test-Path $CacheFile))
+Write-DebugLog "VAR pinned cache hit=$PinnedCacheHit file=$CacheFile stale=$(if ($StaleZip) { $StaleZip.Name } else { 'none' })"
 
-if ($CachedZip) {
-    # A cache hit is not necessarily the pinned release - a zip left over from an
-    # older version is picked up by the wildcard below. Trust the file name over
-    # the pin, otherwise the lock file and the update ledger would advertise a
-    # version that is not on disk and the updater would skip the real upgrade.
-    if ($CachedZip.Name -match '-([vV]?\d[\w\.\-]*)\.zip$') {
-        $cachedVersion = $Matches[1]
-        if ($PinnedVersion -and $cachedVersion -ne $PinnedVersion) {
-            Write-Warning "  -> Cached $($CachedZip.Name) is not the pinned $PinnedVersion; installing $cachedVersion instead."
-            Write-DebugLog "WARN" "Cached zip version '$cachedVersion' != pinned '$PinnedVersion'"
-        }
-        if (-not $PinnedVersion) { $PinnedVersion = $cachedVersion }
-    }
-    Write-Host "  -> Using cached $($CachedZip.Name)..." -ForegroundColor Gray
-    $ZipPath = $CachedZip.FullName
-    Write-DebugLog "INFO" "Using cached zip: $ZipPath"
+if ($PinnedCacheHit) {
+    $ZipPath = $CacheFile
+    Write-Host "  -> Using cached $([System.IO.Path]::GetFileName($CacheFile)) (pinned)..." -ForegroundColor Gray
+    Write-DebugLog "INFO" "Using cached zip for the pinned release: $ZipPath"
 } else {
+    # The cache is consulted first to spare GitHub's 60-requests/hour limit, but a
+    # cached build that is NOT the pinned one must not win: the pin exists to hold a
+    # known-good version, and the wildcard used to install the leftover zip silently
+    # (observed: v3.5.0 installed while versions.json pinned v3.5.2). Try the pin
+    # first; fall back to the stale zip only when the API cannot be reached, which is
+    # what the cache-first rule was there to survive.
     $ApiUri = if ($PinnedVersion) {
         "https://api.github.com/repos/FlareSolverr/FlareSolverr/releases/tags/$PinnedVersion"
     } else {
@@ -90,29 +83,41 @@ if ($CachedZip) {
     $displayVer = if ($PinnedVersion) { $PinnedVersion } else { "latest" }
     Write-Host "  -> Fetching FlareSolverr release $displayVer..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Querying GitHub API: $ApiUri"
+    $Release = $null
     try {
-        $Release = Invoke-RestMethod -Uri $ApiUri -UseBasicParsing
+        $Release = Invoke-RestMethod -Uri $ApiUri -UseBasicParsing -ErrorAction Stop
         Write-DebugLog "VAR GitHub release tag=$($Release.tag_name) assets=$($Release.assets.Count)"
     } catch {
-        Write-Error "[$AppName] Failed to query GitHub releases: $_"
-        Write-DebugLog "ERROR" "GitHub API query failed: $_"
-        exit 1
+        Write-DebugLog "WARN" "GitHub API query failed for FlareSolverr ${displayVer}: $_"
+        if (-not $StaleZip) {
+            Write-Error "[$AppName] Failed to query GitHub releases and no cached archive is available: $_"
+            Write-DebugLog "ERROR" "GitHub API query failed and no cached zip: $_"
+            exit 1
+        }
+        $ZipPath = $StaleZip.FullName
+        $staleVer = if ($StaleZip.Name -match '-([vV]?\d[\w\.\-]*)\.zip$') { $Matches[1] } else { $null }
+        if ($staleVer) { $PinnedVersion = $staleVer }
+        Write-Warning "  -> API unreachable; installing cached $($StaleZip.Name)" +
+                      $(if ($staleVer) { " ($staleVer)" } else { "" }) + " instead of the pin -- re-run 'box update' to pick it up."
+        Write-DebugLog "WARN" "API unreachable, fell back to cached zip $($StaleZip.Name) (version=$staleVer)"
     }
-    $Version = $Release.tag_name
-    $Asset   = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
-    Write-DebugLog "VAR selected asset=$($Asset.name) url=$($Asset.browser_download_url)"
-    if (-not $Asset) {
-        Write-Error "[$AppName] Asset '$AssetName' not found in release $Version."
-        Write-DebugLog "ERROR" "Asset '$AssetName' not found in release $Version"
-        exit 1
+    if ($Release) {
+        $Version = $Release.tag_name
+        $Asset   = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+        Write-DebugLog "VAR selected asset=$($Asset.name) url=$($Asset.browser_download_url)"
+        if (-not $Asset) {
+            Write-Error "[$AppName] Asset '$AssetName' not found in release $Version."
+            Write-DebugLog "ERROR" "Asset '$AssetName' not found in release $Version"
+            exit 1
+        }
+        $ZipPath = Join-Path $BinDir "flaresolverr-$Version.zip"
+        Write-Host "  -> Downloading FlareSolverr $Version..." -ForegroundColor Gray
+        Write-DebugLog "INFO" "Downloading $($Asset.browser_download_url) -> $ZipPath"
+        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing
+        $zipSize = (Get-Item $ZipPath).Length
+        Write-DebugLog "INFO" "Download complete. ZipPath=$ZipPath size=$zipSize bytes"
+        if (-not $PinnedVersion) { $PinnedVersion = $Version }
     }
-    $ZipPath = Join-Path $BinDir "flaresolverr-$Version.zip"
-    Write-Host "  -> Downloading FlareSolverr $Version..." -ForegroundColor Gray
-    Write-DebugLog "INFO" "Downloading $($Asset.browser_download_url) -> $ZipPath"
-    Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing
-    $zipSize = (Get-Item $ZipPath).Length
-    Write-DebugLog "INFO" "Download complete. ZipPath=$ZipPath size=$zipSize bytes"
-    if (-not $PinnedVersion) { $PinnedVersion = $Version }
 }
 
 # -- 2. Extract ----------------------------------------------------------------
