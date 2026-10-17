@@ -360,8 +360,13 @@ if ($svc -and $svc.Status -eq "Running") {
     exit 1
 }
 
-New-Item -Path $LockFile -ItemType File -Force | Out-Null
-Write-DebugLog "INFO" "Lock file created: $LockFile"
+# Record the build that is actually installed, matching what Set-InstalledVersion
+# writes to the ledger below. An empty lock file is not harmless: Get-InstalledVersion
+# reads it as $null, and a zero-byte lock also makes "Test-Path $LockFile" report
+# "already installed" to the next install run.
+$LockRecord = if ($Version) { "v$Version" } else { "installed" }
+[System.IO.File]::WriteAllText($LockFile, $LockRecord, (New-Object System.Text.UTF8Encoding($false)))
+Write-DebugLog "INFO" "Lock file written: $LockFile ($LockRecord)"
 
 # Ledger entry for the updater (single source of truth for installed versions)
 if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {

@@ -632,7 +632,10 @@ Write-DebugLog "INFO" "hardware tone-mapping support verified (opencl + libplace
 # above), not the manifest pin: a box that already carried a different ffmpeg
 # build must show up as "update available" in the updater instead of being
 # reported as current.
-$LockVersion = $install.Tag
+$LockVersion = if ($install.Tag) { $install.Tag } else { 'installed' }
+if (-not $install.Tag) {
+    Write-DebugLog "WARN" "ffmpeg release tag unknown (resolved from cache?); writing '$LockVersion' to the lock so it is never zero-byte"
+}
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"
 

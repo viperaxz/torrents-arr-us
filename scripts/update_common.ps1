@@ -173,7 +173,13 @@ function Get-InstalledVersion {
     }
     $lockFile = Join-Path $InstallDir ".locks\.$($AppName.ToLower()).lock"
     if (Test-Path $lockFile) {
-        $v = (Get-Content $lockFile -Raw -ErrorAction SilentlyContinue).Trim()
+        # Get-Content -Raw yields $null for an empty file (11_jellyseerr.ps1 used to
+        # create a zero-byte lock, and WriteAllText of a null version produces one
+        # too). Calling .Trim() on that threw "You cannot call a method on a
+        # null-valued expression" out of Get-UpdatePlan, which broke "box check" and
+        # "box update" for every app, not just the affected one.
+        $rawLock = Get-Content $lockFile -Raw -ErrorAction SilentlyContinue
+        $v = if ($null -eq $rawLock) { '' } else { $rawLock.Trim() }
         if ($v) {
             if (Test-VersionLike -Value $v) { return $v }
             return "unknown"
