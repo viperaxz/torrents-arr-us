@@ -99,6 +99,30 @@ function Ensure-DelugeLabels {
         return
     }
 
+    # label.add only takes effect once the Web UI has a live connection to the
+    # daemon; before that the call is accepted and silently dropped. On a fresh
+    # install the labels block runs seconds after DelugeWeb starts, so wait for the
+    # host to report Connected first -- otherwise both labels vanish and the run
+    # ends with "labels still missing" even though nothing was reported as failing.
+    $hostDeadline = (Get-Date).AddSeconds(60)
+    $daemonReady  = $false
+    while (-not $daemonReady -and (Get-Date) -lt $hostDeadline) {
+        try {
+            $hostsBody = @{ method = "web.get_hosts"; params = @(); id = 5 } | ConvertTo-Json -Compress
+            $hostsRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $hostsBody `
+                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+            if ($hostsRes.result -and $hostsRes.result.Count -gt 0) {
+                $hId = $hostsRes.result[0][0]
+                $stBody = @{ method = "web.get_host_status"; params = @($hId); id = 6 } | ConvertTo-Json -Compress
+                $stRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $stBody `
+                    -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+                if ($stRes.result -and $stRes.result[1] -eq "Connected") { $daemonReady = $true; break }
+            }
+        } catch { }
+        Start-Sleep -Seconds 2
+    }
+    Write-DebugLog "VAR Deluge daemon connected before labels=$daemonReady"
+
     $labelExisting = @()
     try {
         $listBody = @{ method = "label.get_labels"; params = @(); id = 2 } | ConvertTo-Json -Compress
@@ -110,41 +134,44 @@ function Ensure-DelugeLabels {
     }
     Write-DebugLog "VAR Deluge labels before=$($labelExisting -join ',')"
 
+    # Add, then verify, and add again if the call was dropped: the loop below is the
+    # only thing that proves the labels exist.
     $labelAdded = 0
-    foreach ($labelName in $Labels) {
-        if ($labelExisting -contains $labelName) { continue }
-        try {
-            $addBody = @{ method = "label.add"; params = @($labelName); id = 3 } | ConvertTo-Json -Compress
-            Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $addBody `
-                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop | Out-Null
-            $labelAdded++
-            Write-DebugLog "INFO" "Deluge label '$labelName' created"
-        } catch {
-            Write-Warning "  -> Could not create Deluge label '$labelName': $_"
-            Write-DebugLog "WARN" "label.add '$labelName' failed: $_"
+    $labelFinal = @()
+    for ($labelRound = 1; $labelRound -le 3; $labelRound++) {
+        foreach ($labelName in $Labels) {
+            if ($labelExisting -contains $labelName) { continue }
+            try {
+                $addBody = @{ method = "label.add"; params = @($labelName); id = 3 } | ConvertTo-Json -Compress
+                Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $addBody `
+                    -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop | Out-Null
+                $labelAdded++
+                Write-DebugLog "INFO" "Deluge label '$labelName' created (round $labelRound)"
+            } catch {
+                Write-DebugLog "WARN" "label.add '$labelName' failed (round $labelRound): $_"
+            }
         }
-    }
 
-    # Read back rather than trusting label.add: a plugin that is not enabled accepts
-    # the RPC and silently does nothing. The daemon applies the add asynchronously,
-    # so poll instead of reading once -- a single immediate read returned the
-    # pre-change list on a fresh install, which turned a working setup into a red
-    # "labels still missing" error.
-    $labelFinal   = @()
-    $labelDeadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $labelDeadline) {
-        $labelFinal = @()
-        try {
-            $verifyBody = @{ method = "label.get_labels"; params = @(); id = 4 } | ConvertTo-Json -Compress
-            $verifyRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $verifyBody `
-                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
-            $labelFinal = @($verifyRes.result | Where-Object { $null -ne $_ })
-        } catch {
-            Write-DebugLog "WARN" "label.get_labels verify failed: $_"
+        # Read back rather than trusting label.add: a plugin that is not enabled, or a
+        # daemon that is not connected yet, accepts the RPC and does nothing.
+        $labelDeadline = (Get-Date).AddSeconds(15)
+        while ((Get-Date) -lt $labelDeadline) {
+            $labelFinal = @()
+            try {
+                $verifyBody = @{ method = "label.get_labels"; params = @(); id = 4 } | ConvertTo-Json -Compress
+                $verifyRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $verifyBody `
+                    -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+                $labelFinal = @($verifyRes.result | Where-Object { $null -ne $_ })
+            } catch {
+                Write-DebugLog "WARN" "label.get_labels verify failed: $_"
+            }
+            if (@($Labels | Where-Object { $labelFinal -notcontains $_ }).Count -eq 0) { break }
+            Start-Sleep -Seconds 2
         }
-        $labelMissing = @($Labels | Where-Object { $labelFinal -notcontains $_ })
-        if ($labelMissing.Count -eq 0) { break }
-        Start-Sleep -Seconds 2
+        $labelExisting = $labelFinal
+        if (@($Labels | Where-Object { $labelFinal -notcontains $_ }).Count -eq 0) { break }
+        Write-DebugLog "WARN" "Deluge labels still missing after round $labelRound -- retrying the add"
+        Start-Sleep -Seconds 3
     }
     $labelMissing = @($Labels | Where-Object { $labelFinal -notcontains $_ })
     if ($labelMissing.Count -eq 0) {
