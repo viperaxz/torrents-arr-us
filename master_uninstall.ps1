@@ -53,14 +53,50 @@ if ($confirm -ne "yes") { Write-Host "Aborted." -ForegroundColor Yellow; exit 0 
 Write-Host ""
 Write-DebugLog "INFO" "Uninstall confirmed by user"
 
+function Stop-ServiceBounded {
+    # Stop-Service waits for the service to report Stopped and has no timeout, so a
+    # service wedged in StopPending hangs the whole uninstall. Observed with Caddy:
+    # its supervised child had already exited while nssm never reported back, and
+    # "Waiting for service 'Caddy' to stop..." repeated until the run was killed.
+    # Send the stop request without blocking, poll briefly, then kill the supervisor.
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [int]$TimeoutSeconds = 20
+    )
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return $true }
+    $svc.Refresh()
+    if ($svc.Status -eq 'Stopped') { return $true }
+
+    # sc.exe returns as soon as the request is accepted; Stop-Service does not.
+    & sc.exe stop $Name 2>&1 | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $svc.Refresh()
+        if ($svc.Status -eq 'Stopped') { return $true }
+    }
+
+    $svc.Refresh()
+    Write-Warning "  -> $Name did not stop within ${TimeoutSeconds}s (status=$($svc.Status)); killing its supervisor."
+    Write-DebugLog "WARN" "$Name stuck in $($svc.Status) after ${TimeoutSeconds}s; stopping the supervising process"
+    $wmiSvc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+    if ($wmiSvc -and $wmiSvc.ProcessId -gt 0) {
+        Stop-Process -Id $wmiSvc.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 4
+    }
+    $svc.Refresh()
+    Write-DebugLog "VAR $Name status after kill=$($svc.Status)"
+    return ($svc.Status -eq 'Stopped')
+}
+
 function Remove-NssmService {
     param([string]$Name)
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if ($svc) {
         Write-Host "  -> $Name : stopping..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Stopping service: $Name (current status: $($svc.Status))"
-        Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+        $null = Stop-ServiceBounded -Name $Name
         & nssm remove $Name confirm 2>$null | Out-Null
         Write-Host "  -> $Name : removed." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Service removed: $Name"
@@ -126,8 +162,7 @@ if ($Config -and (Test-Path $CaddyDataDir) -and
     Write-DebugLog "INFO" "Backing up Caddy cert cache from $CaddyDataDir"
     # Stop Caddy first so the store is quiescent -- an ACME renewal writing into
     # caddy-data/ while the tree is being zipped would corrupt the archive.
-    Stop-Service -Name "Caddy" -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    $null = Stop-ServiceBounded -Name "Caddy"
     Write-DebugLog "INFO" "Caddy service stopped for cert cache backup"
     try {
         . (Join-Path $PSScriptRoot "scripts\cert_cache_helpers.ps1")
@@ -158,8 +193,8 @@ if (Test-Path $DelugeStateDir) {
     Write-Host "  -> Backing up Deluge torrent state..." -ForegroundColor Yellow
     Write-DebugLog "INFO" "Backing up Deluge state to $DelugeBackupDir"
     # Stop Deluge services before copying state to avoid file locks
-    Stop-Service -Name "DelugeDaemon" -Force -ErrorAction SilentlyContinue
-    Stop-Service -Name "DelugeWeb"    -Force -ErrorAction SilentlyContinue
+    Stop-ServiceBounded -Name "DelugeDaemon" | Out-Null
+    Stop-ServiceBounded -Name "DelugeWeb"    | Out-Null
     Start-Sleep -Seconds 3
     Write-DebugLog "INFO" "Deluge services stopped for state backup"
     if (Test-Path $DelugeBackupDir) { Remove-Item -Recurse -Force $DelugeBackupDir -ErrorAction SilentlyContinue }
@@ -241,7 +276,7 @@ foreach ($csName in @("cs-windows-firewall-bouncer", "crowdsec")) {
     if ($svc) {
         Write-Host "  -> CrowdSec ($csName) : stopping..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Stopping CrowdSec service: $csName (status: $($svc.Status))"
-        Stop-Service -Name $csName -Force -ErrorAction SilentlyContinue
+        $null = Stop-ServiceBounded -Name $csName
     } else {
         Write-DebugLog "VAR CrowdSec service '$csName' not present"
     }
@@ -283,8 +318,7 @@ foreach ($jfName in @("JellyfinServer", "jellyfin", "Jellyfin")) {
     if ($svc) {
         Write-Host "  -> Jellyfin ($jfName) : stopping..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Stopping Jellyfin service: $jfName (status: $($svc.Status))"
-        Stop-Service -Name $jfName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
+        $null = Stop-ServiceBounded -Name $jfName
         break
     }
 }
