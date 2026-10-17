@@ -379,7 +379,7 @@ statics:
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$exportScriptDst`" -LogDir `"$logDir`""
     $evtTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Minutes 5) `
-        -RepetitionDuration ([TimeSpan]::MaxValue)
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     $evtPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
         -LogonType ServiceAccount -RunLevel Highest
     $evtSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
@@ -485,7 +485,7 @@ $wlCidrYaml
         -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$refreshDst`""
     $wlTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Minutes 5) `
-        -RepetitionDuration ([TimeSpan]::MaxValue)
+        -RepetitionDuration (New-TimeSpan -Days 3650)
     $wlPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
         -LogonType ServiceAccount -RunLevel Highest
     $wlSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
