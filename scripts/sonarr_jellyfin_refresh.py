@@ -103,10 +103,10 @@ def main():
     if sidecar:
         # API key + admin user id resolved by the installer: no login round-trip.
         base_url, api_key, user_id = sidecar
-        auth_hdr = {
-            "X-Emby-Token": api_key,
-            "X-Emby-Authorization": f'{_EMBY_HEADER}, Token="{api_key}"',
-        }
+        # Jellyfin 12.x answers 401 for X-Emby-Token / X-Emby-Authorization carrying
+        # an API key. Only the Authorization header with the MediaBrowser client
+        # string plus Token= is accepted, so every request below uses this form.
+        auth_hdr = {"Authorization": f'{_EMBY_HEADER}, Token="{api_key}"'}
     else:
         # Legacy: authenticate with the admin credentials from config.json.
         base_url, admin_user, admin_pass = legacy
@@ -114,7 +114,7 @@ def main():
             r = requests.post(
                 f"{base_url}/Users/AuthenticateByName",
                 json={"Username": admin_user, "Pw": admin_pass},
-                headers={"X-Emby-Authorization": _EMBY_HEADER,
+                headers={"Authorization": _EMBY_HEADER,
                          "Content-Type": "application/json"},
                 timeout=10,
             )
@@ -125,7 +125,7 @@ def main():
             sys.exit(0)
         if not token or not user_id:
             sys.exit(0)
-        auth_hdr = {"X-Emby-Authorization": f'{_EMBY_HEADER}, Token="{token}"'}
+        auth_hdr = {"Authorization": f'{_EMBY_HEADER}, Token="{token}"'}
 
     # Find the series in Jellyfin by title
     try:

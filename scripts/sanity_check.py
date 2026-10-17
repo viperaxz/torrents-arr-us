@@ -416,7 +416,7 @@ def step0_infrastructure(cfg: Dict, keys: Dict) -> bool:
         auth_r = requests.post(
             _url(cfg, "Jellyfin", "/Users/AuthenticateByName"),
             json={"Username": cfg["admin_user"], "Pw": cfg["admin_pass"]},
-            headers={"X-Emby-Authorization": emby_hdr,
+            headers={"Authorization": emby_hdr,
                      "Content-Type": "application/json"},
             timeout=10,
         )
@@ -424,7 +424,7 @@ def step0_infrastructure(cfg: Dict, keys: Dict) -> bool:
             token = auth_r.json().get("AccessToken", "")
             lib_r = requests.get(
                 _url(cfg, "Jellyfin", "/Library/VirtualFolders"),
-                headers={"X-Emby-Authorization":
+                headers={"Authorization":
                          f'{emby_hdr}, Token="{token}"'},
                 timeout=10,
             )
@@ -1157,7 +1157,7 @@ def step4_jellyfin(cfg: Dict, added: Dict) -> bool:
         r = requests.post(
             f"{base}/Users/AuthenticateByName",
             json={"Username": cfg["admin_user"], "Pw": cfg["admin_pass"]},
-            headers={"X-Emby-Authorization": emby_hdr,
+            headers={"Authorization": emby_hdr,
                      "Content-Type": "application/json"},
             timeout=15,
         )
@@ -1171,7 +1171,7 @@ def step4_jellyfin(cfg: Dict, added: Dict) -> bool:
         return False
 
     auth_hdr = {
-        "X-Emby-Authorization": (
+        "Authorization": (
             f'MediaBrowser Client="win-seedbox-sanity", Device="Python", '
             f'DeviceId="sanity-check-001", Version="1.0.0", Token="{token}"'
         )

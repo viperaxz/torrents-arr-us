@@ -301,11 +301,30 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
             $idx.PSObject.Properties | ForEach-Object { $payload[$_.Name] = $_.Value }
             $body = $payload | ConvertTo-Json -Depth 10 -Compress
 
-            try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/indexer/$($idx.id)" `
-                    -Method Put `
-                    -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
-                    -Body $body -UseBasicParsing -ErrorAction Stop | Out-Null
+            # The *arr validates the indexer on PUT by fetching its caps, so an
+            # indexer behind FlareSolverr can refuse the first attempt with 400 while
+            # its solver/browser is still warming up -- observed on exactly 2 of 33
+            # indexers right after a fresh install, both of which succeeded seconds
+            # later. Retry once instead of leaving the ratio unset.
+            $putOk = $false
+            $putErr = $null
+            for ($putAttempt = 1; $putAttempt -le 2; $putAttempt++) {
+                try {
+                    Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/indexer/$($idx.id)" `
+                        -Method Put `
+                        -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
+                        -Body $body -UseBasicParsing -ErrorAction Stop | Out-Null
+                    $putOk = $true
+                    break
+                } catch {
+                    $putErr = $_
+                    if ($putAttempt -lt 2) {
+                        Write-DebugLog "WARN" "Indexer '$($idx.name)' PUT failed (attempt $putAttempt), retrying: $_"
+                        Start-Sleep -Seconds 5
+                    }
+                }
+            }
+            if ($putOk) {
                 if ($isPublic) {
                     Write-Host "     [OK] $($idx.name): seed ratio set to $SeedRatio" -ForegroundColor Green
                     Write-DebugLog "INFO" "Indexer '$($idx.name)' seed ratio set to $SeedRatio"
@@ -313,9 +332,9 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
                     Write-Host "     [OK] $($idx.name): seed ratio cleared (private  --  unlimited)" -ForegroundColor Green
                     Write-DebugLog "INFO" "Indexer '$($idx.name)' seed ratio cleared (private)"
                 }
-            } catch {
-                Write-Warning "     Failed to update seed ratio for '$($idx.name)': $_"
-                Write-DebugLog "WARN" "Failed to update seed ratio for '$($idx.name)': $_"
+            } else {
+                Write-Warning "     Failed to update seed ratio for '$($idx.name)': $putErr"
+                Write-DebugLog "WARN" "Failed to update seed ratio for '$($idx.name)' after 2 attempts: $putErr"
             }
         }
     } catch {
@@ -562,11 +581,18 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
             # no-op'ing on every future download.
             $JellyfinUserId = $null
             try {
+                # Jellyfin 12.x answers 401 for X-Emby-Authorization and X-Emby-Token
+                # with an API key, so the admin user could never be resolved and this
+                # hook was silently skipped on every install. Only the Authorization
+                # header carrying the MediaBrowser client string plus Token= works
+                # (verified against /Users, /Library/VirtualFolders and
+                # /System/Configuration/encoding: 200 for this form, 401 for the rest).
+                $jfClient = 'MediaBrowser Client="seedbox-install", Device="configure", DeviceId="seedbox-install", Version="1.0.0"'
                 # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the
                 # response array into a single element, so the loop below would receive the
                 # array rather than a user and [string]$u.Id would become "id1 id2 id3".
                 $jfUsers = Invoke-RestMethod -Uri "$JellyfinBase/Users" `
-                    -Headers @{"X-Emby-Authorization" = "MediaBrowser Token=`"$JellyfinApiKey`""} `
+                    -Headers @{"Authorization" = ($jfClient + ', Token="' + $JellyfinApiKey + '"')} `
                     -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
                 foreach ($u in $jfUsers) {
                     if ($u.Policy -and $u.Policy.IsAdministrator -eq $true) { $JellyfinUserId = [string]$u.Id; break }
