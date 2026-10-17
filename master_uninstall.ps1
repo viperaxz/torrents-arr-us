@@ -53,12 +53,58 @@ if ($confirm -ne "yes") { Write-Host "Aborted." -ForegroundColor Yellow; exit 0 
 Write-Host ""
 Write-DebugLog "INFO" "Uninstall confirmed by user"
 
+function Stop-ServicesBounded {
+    # Stops a set of services concurrently. Stopping them one at a time costs the
+    # full timeout per service: a measured uninstall spent 7 x 60s waiting on eight
+    # services that all needed escalation, which alone was most of a 10-minute run.
+    # Issuing every stop request first and then polling them together makes that one
+    # bounded wait instead of one per service.
+    param(
+        [string[]]$Names,
+        [int]$TimeoutSeconds = 60
+    )
+    $targets = @()
+    foreach ($n in @($Names)) {
+        $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
+        if (-not $svc) { continue }
+        $svc.Refresh()
+        if ($svc.Status -eq 'Stopped') { continue }
+        # sc.exe returns as soon as the request is accepted; Stop-Service waits.
+        & sc.exe stop $n 2>&1 | Out-Null
+        $targets += $svc
+    }
+    if ($targets.Count -eq 0) { return }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        $still = 0
+        foreach ($svc in $targets) {
+            $svc.Refresh()
+            if ($svc.Status -ne 'Stopped') { $still++ }
+        }
+        if ($still -eq 0) { break }
+    }
+
+    foreach ($svc in $targets) {
+        $svc.Refresh()
+        if ($svc.Status -eq 'Stopped') { continue }
+        Write-Warning "  -> $($svc.ServiceName) did not stop within ${TimeoutSeconds}s (status=$($svc.Status)); killing its supervisor."
+        Write-DebugLog "WARN" "$($svc.ServiceName) stuck in $($svc.Status) after ${TimeoutSeconds}s; stopping the supervising process"
+        $wmiSvc = Get-CimInstance Win32_Service -Filter "Name='$($svc.ServiceName)'" -ErrorAction SilentlyContinue
+        if ($wmiSvc -and $wmiSvc.ProcessId -gt 0) {
+            Stop-Process -Id $wmiSvc.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($targets.Count -gt 0) { Start-Sleep -Seconds 3 }
+    foreach ($svc in $targets) {
+        $svc.Refresh()
+        Write-DebugLog "VAR $($svc.ServiceName) final status=$($svc.Status)"
+    }
+}
+
 function Stop-ServiceBounded {
-    # Stop-Service waits for the service to report Stopped and has no timeout, so a
-    # service wedged in StopPending hangs the whole uninstall. Observed with Caddy:
-    # its supervised child had already exited while nssm never reported back, and
-    # "Waiting for service 'Caddy' to stop..." repeated until the run was killed.
-    # Send the stop request without blocking, poll briefly, then kill the supervisor.
+    # Single-service form; delegates so there is one implementation.
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         # Measured on this class of box: a healthy nssm service can take 25-42s to
@@ -66,30 +112,10 @@ function Stop-ServiceBounded {
         # 60s clears that comfortably while still bounding a genuine wedge.
         [int]$TimeoutSeconds = 60
     )
+    Stop-ServicesBounded -Names @($Name) -TimeoutSeconds $TimeoutSeconds
     $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
     if (-not $svc) { return $true }
     $svc.Refresh()
-    if ($svc.Status -eq 'Stopped') { return $true }
-
-    # sc.exe returns as soon as the request is accepted; Stop-Service does not.
-    & sc.exe stop $Name 2>&1 | Out-Null
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $svc.Refresh()
-        if ($svc.Status -eq 'Stopped') { return $true }
-    }
-
-    $svc.Refresh()
-    Write-Warning "  -> $Name did not stop within ${TimeoutSeconds}s (status=$($svc.Status)); killing its supervisor."
-    Write-DebugLog "WARN" "$Name stuck in $($svc.Status) after ${TimeoutSeconds}s; stopping the supervising process"
-    $wmiSvc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
-    if ($wmiSvc -and $wmiSvc.ProcessId -gt 0) {
-        Stop-Process -Id $wmiSvc.ProcessId -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 4
-    }
-    $svc.Refresh()
-    Write-DebugLog "VAR $Name status after kill=$($svc.Status)"
     return ($svc.Status -eq 'Stopped')
 }
 
@@ -209,6 +235,17 @@ if (Test-Path $DelugeStateDir) {
 }
 
 # IPBan was replaced by CrowdSec; this clears the service on upgrades from older installs.
+# Stop everything in one concurrent pass before any service is removed. Doing it
+# inside the removal loop meant every wedged service cost its own full timeout.
+$AllServices = @(
+    "IPBan", "Caddy", "php-cgi", "Sonarr", "Radarr", "Prowlarr", "Bazarr",
+    "DelugeDaemon", "DelugeWeb", "Flaresolverr", "Jellyseerr",
+    "Grafana", "Loki", "Alloy", "rclone-rd-movies", "rclone-rd", "Zurg"
+)
+Write-Host "  -> Stopping all services in parallel..." -ForegroundColor Yellow
+Stop-ServicesBounded -Names $AllServices
+Write-DebugLog "INFO" "Concurrent stop pass complete for: $($AllServices -join ', ')"
+
 Remove-NssmService "IPBan"
 Remove-NssmService "Caddy"
 Remove-NssmService "php-cgi"
