@@ -1,4 +1,4 @@
-﻿param (
+param (
     [Parameter(Mandatory=$true)]
     [object]$Config
 )
@@ -814,11 +814,8 @@ if (-not $CaddyService) {
     nssm set Caddy Start SERVICE_AUTO_START | Out-Null
     nssm set Caddy AppStdout (Join-Path $CaddyDir "caddy.log") | Out-Null
     nssm set Caddy AppStderr (Join-Path $CaddyDir "caddy.log") | Out-Null
-    # Rotate the log in place. nssm only rotates at service restart without
-    # AppRotateOnline, which a long-running service never reaches.
     nssm set Caddy AppRotateFiles 1 | Out-Null
     nssm set Caddy AppRotateBytes 5242880 | Out-Null
-    nssm set Caddy AppRotateOnline 1 | Out-Null
     nssm set Caddy ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set Caddy AppExit Default Restart | Out-Null
     nssm set Caddy AppRestartDelay 5000 | Out-Null

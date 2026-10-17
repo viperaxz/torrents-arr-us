@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -13,6 +13,12 @@ if (-not $Config) {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# nssm services can sit in Stop Pending indefinitely and the built-in cmdlets wait
+# on that forever. These helpers are bounded. See service_helpers.ps1.
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer1_deluge.ps1 started"
 
@@ -194,7 +200,7 @@ if ($webSvc) {
                                     [System.IO.File]::WriteAllText($WebConf, ($wcHeader + ($wcBody | ConvertTo-Json -Depth 10)), (New-Object System.Text.UTF8Encoding($false)))
                                     Write-DebugLog "INFO" "web.conf updated -- restarting DelugeWeb so Deluge re-reads it"
 
-                                    Restart-Service -Name "DelugeWeb" -Force -ErrorAction SilentlyContinue
+                                    $null = Restart-ServiceBounded -Name "DelugeWeb"
                                     $webBack = $false
                                     $deadline = (Get-Date).AddSeconds(20)
                                     while (-not $webBack -and (Get-Date) -lt $deadline) {

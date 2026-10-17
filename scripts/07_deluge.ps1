@@ -1,4 +1,4 @@
-﻿param (
+param (
     [Parameter(Mandatory=$true)]
     [object]$Config
 )
@@ -816,11 +816,8 @@ if (-not $existingDaemon) {
     nssm set DelugeDaemon Start SERVICE_AUTO_START | Out-Null
     nssm set DelugeDaemon AppStdout $DaemonLog | Out-Null
     nssm set DelugeDaemon AppStderr $DaemonLog | Out-Null
-    # Rotate the log in place. nssm only rotates at service restart without
-    # AppRotateOnline, which a long-running service never reaches.
     nssm set DelugeDaemon AppRotateFiles 1 | Out-Null
     nssm set DelugeDaemon AppRotateBytes 5242880 | Out-Null
-    nssm set DelugeDaemon AppRotateOnline 1 | Out-Null
     nssm set DelugeDaemon ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set DelugeDaemon AppExit Default Restart | Out-Null
     nssm set DelugeDaemon AppRestartDelay 5000 | Out-Null
@@ -854,11 +851,8 @@ if (-not $existingWeb -and $delugeWebPath) {
     nssm set DelugeWeb Start SERVICE_AUTO_START | Out-Null
     nssm set DelugeWeb AppStdout $WebLog | Out-Null
     nssm set DelugeWeb AppStderr $WebLog | Out-Null
-    # Rotate the log in place. nssm only rotates at service restart without
-    # AppRotateOnline, which a long-running service never reaches.
     nssm set DelugeWeb AppRotateFiles 1 | Out-Null
     nssm set DelugeWeb AppRotateBytes 5242880 | Out-Null
-    nssm set DelugeWeb AppRotateOnline 1 | Out-Null
     nssm set DelugeWeb ObjectName ".\$SvcUser" $SvcPass | Out-Null
     nssm set DelugeWeb AppExit Default Restart | Out-Null
     nssm set DelugeWeb AppRestartDelay 5000 | Out-Null

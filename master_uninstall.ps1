@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 param(
     [switch]$Force
 )
@@ -53,70 +53,10 @@ if ($confirm -ne "yes") { Write-Host "Aborted." -ForegroundColor Yellow; exit 0 
 Write-Host ""
 Write-DebugLog "INFO" "Uninstall confirmed by user"
 
-function Stop-ServicesBounded {
-    # Stops a set of services concurrently. Stopping them one at a time costs the
-    # full timeout per service: a measured uninstall spent 7 x 60s waiting on eight
-    # services that all needed escalation, which alone was most of a 10-minute run.
-    # Issuing every stop request first and then polling them together makes that one
-    # bounded wait instead of one per service.
-    param(
-        [string[]]$Names,
-        [int]$TimeoutSeconds = 60
-    )
-    $targets = @()
-    foreach ($n in @($Names)) {
-        $svc = Get-Service -Name $n -ErrorAction SilentlyContinue
-        if (-not $svc) { continue }
-        $svc.Refresh()
-        if ($svc.Status -eq 'Stopped') { continue }
-        # sc.exe returns as soon as the request is accepted; Stop-Service waits.
-        & sc.exe stop $n 2>&1 | Out-Null
-        $targets += $svc
-    }
-    if ($targets.Count -eq 0) { return }
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-        $still = 0
-        foreach ($svc in $targets) {
-            $svc.Refresh()
-            if ($svc.Status -ne 'Stopped') { $still++ }
-        }
-        if ($still -eq 0) { break }
-    }
-
-    foreach ($svc in $targets) {
-        $svc.Refresh()
-        if ($svc.Status -eq 'Stopped') { continue }
-        Write-Warning "  -> $($svc.ServiceName) did not stop within ${TimeoutSeconds}s (status=$($svc.Status)); killing its supervisor."
-        Write-DebugLog "WARN" "$($svc.ServiceName) stuck in $($svc.Status) after ${TimeoutSeconds}s; stopping the supervising process"
-        $wmiSvc = Get-CimInstance Win32_Service -Filter "Name='$($svc.ServiceName)'" -ErrorAction SilentlyContinue
-        if ($wmiSvc -and $wmiSvc.ProcessId -gt 0) {
-            Stop-Process -Id $wmiSvc.ProcessId -Force -ErrorAction SilentlyContinue
-        }
-    }
-    if ($targets.Count -gt 0) { Start-Sleep -Seconds 3 }
-    foreach ($svc in $targets) {
-        $svc.Refresh()
-        Write-DebugLog "VAR $($svc.ServiceName) final status=$($svc.Status)"
-    }
-}
-
-function Stop-ServiceBounded {
-    # Single-service form; delegates so there is one implementation.
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        # Measured on this class of box: a healthy nssm service can take 25-42s to
-        # report Stopped, so a short bound kills services that were about to stop.
-        # 60s clears that comfortably while still bounding a genuine wedge.
-        [int]$TimeoutSeconds = 60
-    )
-    Stop-ServicesBounded -Names @($Name) -TimeoutSeconds $TimeoutSeconds
-    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $svc) { return $true }
-    $svc.Refresh()
-    return ($svc.Status -eq 'Stopped')
+# Bounded service stops live in service_helpers.ps1 so the installer, the
+# uninstaller and the configure scripts all share one implementation.
+if (-not (Get-Command Stop-ServicesBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "scripts\service_helpers.ps1")
 }
 
 function Remove-NssmService {

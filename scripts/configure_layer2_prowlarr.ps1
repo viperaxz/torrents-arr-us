@@ -13,6 +13,12 @@ if (-not $Config) {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# nssm services can sit in Stop Pending indefinitely and the built-in cmdlets wait
+# on that forever. These helpers are bounded. See service_helpers.ps1.
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer2_prowlarr.ps1 started"
 
@@ -511,7 +517,7 @@ if ($cfIndexerIds.Count -gt 0) {
     Write-DebugLog "VAR pythonExe=$pythonExe"
 
     if ($pythonExe) {
-        Stop-Service -Name Prowlarr -Force -ErrorAction SilentlyContinue
+        $null = Stop-ServiceBounded -Name Prowlarr
         $stopDeadline = (Get-Date).AddSeconds(15)
         while ((Get-Service Prowlarr -ErrorAction SilentlyContinue).Status -eq "Running" `
                -and (Get-Date) -lt $stopDeadline) {
@@ -679,7 +685,7 @@ if ($minSeeders -gt 1) {
 
             # SQLite fallback for indexers whose API PUT was rejected
             if ($apiFail.Count -gt 0 -and $pythonExe -and (Test-Path $app.Db)) {
-                Stop-Service $app.Name -Force -ErrorAction SilentlyContinue
+                $null = Stop-ServiceBounded -Name $app.Name
                 $stopDl = (Get-Date).AddSeconds(15)
                 while ((Get-Service $app.Name -EA SilentlyContinue).Status -eq "Running" -and (Get-Date) -lt $stopDl) {
                     Start-Sleep -Seconds 1

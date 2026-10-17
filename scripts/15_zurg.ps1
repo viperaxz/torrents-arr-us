@@ -1,4 +1,4 @@
-﻿param (
+param (
     [Parameter(Mandatory=$true)]
     [object]$Config
 )
@@ -212,7 +212,6 @@ nssm set $AppName AppStdout (Join-Path $LogDir "zurg.log") | Out-Null
 nssm set $AppName AppStderr (Join-Path $LogDir "zurg-error.log") | Out-Null
 nssm set $AppName AppRotateFiles 1 | Out-Null
 nssm set $AppName AppRotateBytes 5242880 | Out-Null
-nssm set $AppName AppRotateOnline 1 | Out-Null
 nssm set $AppName Start SERVICE_AUTO_START | Out-Null
 nssm set $AppName ObjectName ".\$SvcUser" $SvcPass | Out-Null
 nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" | Out-Null

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$SkipLayer2,                # pass -SkipLayer2 to stop after Layer 1 (install + auth)
     [string]$Force = ""                 # pass -Force <AppName> to wipe and reinstall a single app
 )
@@ -42,6 +42,10 @@ Initialize-DebugLog -Config $Config
 # was installed never sees chocolatey\bin) plus retry-on-transient-feed-failure
 # with the output captured instead of discarded.
 . (Join-Path $PSScriptRoot "scripts\choco_helpers.ps1")
+
+# Bounded service stop/start. nssm services can sit in Stop Pending indefinitely and
+# the built-in cmdlets wait on that forever; see service_helpers.ps1.
+. (Join-Path $PSScriptRoot "scripts\service_helpers.ps1")
 Write-DebugLog "INFO" "master_install.ps1 started. SkipLayer2=$SkipLayer2"
 Write-DebugLog "INFO" "Config loaded from: $ConfigPath"
 Write-DebugLog "VAR DomainMode = $DomainMode"
@@ -134,7 +138,7 @@ if ($Force -ne "") {
     }
     if ($forceSvc -and $forceSvc.Status -eq "Running") {
         Write-Host "[Force] Stopping $($forceSvc.Name) service..." -ForegroundColor Yellow
-        Stop-Service -Name $forceSvc.Name -Force -ErrorAction SilentlyContinue
+        $null = Stop-ServiceBounded -Name $forceSvc.Name
         Start-Sleep -Seconds 3
     } elseif (-not $forceSvc) {
         Write-Host "[Force] No running service found for '$Force' (may be CLI-only or task-based)." -ForegroundColor DarkGray
@@ -369,7 +373,7 @@ if ($Config.Apps.Grafana -eq $true) {
     $alloySvc = Get-Service -Name "Alloy" -ErrorAction SilentlyContinue
     if ($alloySvc -and $alloySvc.Status -eq "Running") {
         Write-Host "  Restarting Alloy so it picks up all log files..." -ForegroundColor DarkGray
-        Restart-Service -Name "Alloy" -ErrorAction SilentlyContinue
+        $null = Restart-ServiceBounded -Name "Alloy"
         Start-Sleep -Seconds 5
         $alloySvc = Get-Service -Name "Alloy" -ErrorAction SilentlyContinue
         if ($alloySvc -and $alloySvc.Status -eq "Running") {

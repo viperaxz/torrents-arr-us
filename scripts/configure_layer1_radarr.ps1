@@ -1,4 +1,4 @@
-﻿param(
+param(
     [object]$Config = $null
 )
 
@@ -13,6 +13,12 @@ if (-not $Config) {
 
 # -- Debug logging -------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+
+# nssm services can sit in Stop Pending indefinitely and the built-in cmdlets wait
+# on that forever. These helpers are bounded. See service_helpers.ps1.
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "configure_layer1_radarr.ps1 started"
 
@@ -173,7 +179,7 @@ if (-not $putOk) {
 # -- 8. Restart service --------------------------------------------------------
 Write-Host "  -> Restarting $AppName..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Restarting $AppName..."
-Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+$null = Stop-ServiceBounded -Name $AppName
 Start-Sleep -Seconds 3
 Start-Service -Name $AppName -ErrorAction SilentlyContinue
 
@@ -224,7 +230,7 @@ if ($svcNow -and $svcNow.Status -eq "Running") {
     } catch { Write-DebugLog "ERROR" "API rollback failed: $_" }
 }
 if (-not $rolledBack -and (Test-Path $ConfigBak)) {
-    Stop-Service -Name $AppName -Force -ErrorAction SilentlyContinue
+    $null = Stop-ServiceBounded -Name $AppName
     # Wait up to 15s for the service to actually stop before overwriting
     # its config file, otherwise the running process may undo the rollback
     # on its next periodic config save.
