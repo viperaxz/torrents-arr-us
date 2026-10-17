@@ -369,9 +369,15 @@ function global:Install-FfmpegBuild {
     }
 
     $release = $null
+    $cacheMatchedPin = $false
     if ($cachedZip.Count -gt 0) {
         $zipPath = $cachedZip[0].FullName
         $asset   = [PSCustomObject]@{ name = $cachedZip[0].Name; size = $cachedZip[0].Length; browser_download_url = $null }
+        # Only a pin-matched archive may be recorded under the pin. The selection
+        # above already filtered on the pin when $Tag was set, so a non-empty $Tag
+        # here means the archive really is that release; without $Tag it is whatever
+        # was newest in bin\ and must not be recorded as the pin.
+        $cacheMatchedPin = [bool]$Tag
         Write-DebugLog "INFO" "Cached archive matches the pin -- skipping the GitHub API: $zipPath"
     } else {
         try {
@@ -406,6 +412,21 @@ function global:Install-FfmpegBuild {
         $zipPath = Join-Path $BinDir $asset.name
     }
     Write-DebugLog "VAR asset=$($asset.name) bytes=$($asset.size) zipPath=$zipPath"
+
+    # The tag of the archive that is about to be installed. The cache branch
+    # skips the GitHub API, so $release is null there; without this fallback the
+    # lock file and the ledger got the non-version sentinel 'installed' and the
+    # updater could never tell whether ffmpeg was current.
+    $resolvedTag = if ($release -and $release.tag_name) {
+        $release.tag_name
+    } elseif ($cacheMatchedPin -and $Tag) {
+        $Tag
+    } elseif ($asset -and $asset.name -match '(\d+\.\d+\.\d+(?:-\d+)?)') {
+        "v" + $Matches[1]
+    } else {
+        $null
+    }
+    Write-DebugLog "VAR resolvedTag=$resolvedTag"
     $staged  = $null
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         if ($attempt -gt 1 -and (Test-Path -LiteralPath $zipPath)) {
@@ -456,9 +477,9 @@ function global:Install-FfmpegBuild {
         Write-DebugLog "ERROR" $result.Detail
         return $result
     }
-    $expectedVersion = Get-FfmpegTagVersion -Tag $release.tag_name
+    $expectedVersion = Get-FfmpegTagVersion -Tag $resolvedTag
     if ($expectedVersion -and ($info.Version -notlike "$expectedVersion*")) {
-        $result.Detail = "binary reports '$($info.Version)' but release $($release.tag_name) should be '$expectedVersion'"
+        $result.Detail = "binary reports '$($info.Version)' but release $resolvedTag should be '$expectedVersion'"
         Write-DebugLog "ERROR" $result.Detail
         return $result
     }
@@ -546,11 +567,11 @@ function global:Install-FfmpegBuild {
     if (Test-Path -LiteralPath $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
 
     $result.Ok = $true
-    $result.Tag = $release.tag_name
+    $result.Tag = $resolvedTag
     $result.Version = $info.Version
     $result.Banner = $info.Banner
     $result.ExePath = $resolved
-    $result.Detail = "installed $($release.tag_name) ($($info.Version)) at $resolved"
+    $result.Detail = "installed $resolvedTag ($($info.Version)) at $resolved"
     return $result
 }
 
