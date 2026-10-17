@@ -52,6 +52,100 @@ if (-not (Get-Command Grant-SeedboxDirAccess -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot "00_service_account.ps1") -Config $Config
 }
 
+# Deluge's Label plugin resolves an incoming label with self.labels[label_id] and
+# raises KeyError when it has never seen it, so every grab carrying an unknown label
+# fails on the *arr side (Radarr logs
+#   DelugeException: ... File "deluge_label\core.py", line 307, in get_options
+#   KeyError: 'radarr'
+# ). configure_layer2_sonarr.ps1 sets tvCategory "tv-sonarr" and
+# configure_layer2_radarr.ps1 sets movieCategory "radarr", but nothing ever created
+# those labels, so keep the two in step here. Deluge owns label.conf -- it rewrites
+# the file from memory -- so the labels are created through its own API instead.
+$DelugeLabels = @("tv-sonarr", "radarr")
+function Ensure-DelugeLabels {
+    param([int]$Port, [string[]]$Labels)
+
+    $labelAuthFile = Join-Path $SecretsDir "deluge_auth.txt"
+    $labelPassword = if (Test-Path $labelAuthFile) {
+        (Get-Content -Path $labelAuthFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
+    } else {
+        $Config.General.AdminPassword
+    }
+    if (-not $labelPassword) {
+        Write-DebugLog "WARN" "Deluge label setup skipped: no password available"
+        return
+    }
+
+    Write-Host "  -> Ensuring Deluge labels exist ($($Labels -join ', '))..." -ForegroundColor Gray
+    Write-DebugLog "INFO" "Ensuring Deluge labels: $($Labels -join ',')"
+
+    $labelSess    = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $labelJsonUrl = "http://127.0.0.1:$Port/json"
+    $labelDeadline = (Get-Date).AddSeconds(45)
+    $labelAuth    = $false
+    while (-not $labelAuth -and (Get-Date) -lt $labelDeadline) {
+        try {
+            $authBody = @{ method = "auth.login"; params = @($labelPassword); id = 1 } | ConvertTo-Json -Compress
+            $authRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $authBody `
+                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+            if ($authRes.result -eq $true) { $labelAuth = $true } else { Start-Sleep -Seconds 3 }
+        } catch {
+            Start-Sleep -Seconds 3
+        }
+    }
+    if (-not $labelAuth) {
+        Write-Warning "  -> Deluge Web UI did not accept the admin password -- labels not created."
+        Write-DebugLog "WARN" "Deluge label setup skipped: auth.login never succeeded"
+        return
+    }
+
+    $labelExisting = @()
+    try {
+        $listBody = @{ method = "label.get_labels"; params = @(); id = 2 } | ConvertTo-Json -Compress
+        $listRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $listBody `
+            -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+        $labelExisting = @($listRes.result | Where-Object { $null -ne $_ })
+    } catch {
+        Write-DebugLog "WARN" "label.get_labels failed: $_"
+    }
+    Write-DebugLog "VAR Deluge labels before=$($labelExisting -join ',')"
+
+    $labelAdded = 0
+    foreach ($labelName in $Labels) {
+        if ($labelExisting -contains $labelName) { continue }
+        try {
+            $addBody = @{ method = "label.add"; params = @($labelName); id = 3 } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $addBody `
+                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop | Out-Null
+            $labelAdded++
+            Write-DebugLog "INFO" "Deluge label '$labelName' created"
+        } catch {
+            Write-Warning "  -> Could not create Deluge label '$labelName': $_"
+            Write-DebugLog "WARN" "label.add '$labelName' failed: $_"
+        }
+    }
+
+    # Read back rather than trusting label.add: a plugin that is not enabled accepts
+    # the RPC and silently does nothing.
+    $labelFinal = @()
+    try {
+        $verifyBody = @{ method = "label.get_labels"; params = @(); id = 4 } | ConvertTo-Json -Compress
+        $verifyRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $verifyBody `
+            -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+        $labelFinal = @($verifyRes.result | Where-Object { $null -ne $_ })
+    } catch {
+        Write-DebugLog "WARN" "label.get_labels verify failed: $_"
+    }
+    $labelMissing = @($Labels | Where-Object { $labelFinal -notcontains $_ })
+    if ($labelMissing.Count -eq 0) {
+        Write-Host "  -> Deluge labels ready: $($labelFinal -join ', ')" -ForegroundColor Green
+        Write-DebugLog "INFO" "Deluge labels ready (added=$labelAdded): $($labelFinal -join ',')"
+    } else {
+        Write-Warning "  -> Deluge is missing label(s): $($labelMissing -join ', ') -- downloads from those categories will fail."
+        Write-DebugLog "ERROR" "Deluge labels still missing: $($labelMissing -join ',')"
+    }
+}
+
 if ($Config.Apps.Deluge -ne $true) {
     Write-Host "[$AppName] Skipped per configuration." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "$AppName skipped (Apps.Deluge != true)"
@@ -60,6 +154,14 @@ if ($Config.Apps.Deluge -ne $true) {
 if (Test-Path $LockFile) {
     Write-Host "[$AppName] Already installed. Skipping." -ForegroundColor Green
     Write-DebugLog "INFO" "$AppName already installed (lock file present)"
+    # A Deluge installed before the label step existed still has no labels, so heal
+    # it on every run rather than only when the lock file is absent.
+    $svcWebInstalled = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
+    if ($svcWebInstalled -and $svcWebInstalled.Status -eq "Running") {
+        Ensure-DelugeLabels -Port $WebPort -Labels $DelugeLabels
+    } else {
+        Write-DebugLog "WARN" "Deluge labels not checked: DelugeWeb is not running"
+    }
     return
 }
 
@@ -972,6 +1074,13 @@ if ($delugeWebPath) {
         Write-Warning "  -> DelugeWeb may not have started. Check $WebLog"
         Write-DebugLog "WARN" "DelugeWeb may not be running. Check $WebLog"
     }
+}
+
+# -- 9. Ensure the labels the *arr download clients hand to Deluge --------------
+if ($svcWeb -and $svcWeb.Status -eq "Running") {
+    Ensure-DelugeLabels -Port $WebPort -Labels $DelugeLabels
+} else {
+    Write-DebugLog "WARN" "Deluge labels not created: DelugeWeb is not running"
 }
 
 # Record the version of the build that is on disk (read from the installed
