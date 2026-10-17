@@ -317,7 +317,15 @@ if ($SkipLayer2) {
     $layer2Script = Join-Path $PSScriptRoot "master_configure_layer2.ps1"
     try {
         $global:LASTEXITCODE = 0
-        & $layer2Script
+        # master_configure_layer2.ps1 is also runnable on its own, so it asks the
+        # logger for a fresh file. Invoked from here it must NOT: doing so split
+        # the install log in two at the Layer 2 boundary.
+        $env:SEEDBOX_LOG_CHILD = '1'
+        try {
+            & $layer2Script
+        } finally {
+            Remove-Item Env:\SEEDBOX_LOG_CHILD -ErrorAction SilentlyContinue
+        }
         if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
             Write-Warning "Layer 2 configuration finished with errors (see above)."
             Write-DebugLog "WARN" "Layer 2 exited with code $LASTEXITCODE"

@@ -28,10 +28,13 @@ function global:Initialize-DebugLog {
         # $global:SeedboxDebugLogFile, so an install started from the same
         # PowerShell session appended 200 KB of its own log to the moved uninstall
         # log and left D:\MediaServer\logs with no debug log at all.
+        # master_install.ps1 also runs master_configure_layer2.ps1, which is itself
+        # a top-level script -- it sets SEEDBOX_LOG_CHILD so the nested call keeps
+        # its parent's file instead of starting a second one.
         [switch]$NewRun
     )
 
-    if ($NewRun) { $global:SeedboxDebugLogFile = $null }
+    if ($NewRun -and $env:SEEDBOX_LOG_CHILD -ne '1') { $global:SeedboxDebugLogFile = $null }
 
     $global:SeedboxDebugEnabled = ($Config.General.DebugLogging -eq $true)
     if (-not $global:SeedboxDebugEnabled) { return }
