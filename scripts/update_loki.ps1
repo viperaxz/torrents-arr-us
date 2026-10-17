@@ -43,8 +43,22 @@ try {
     $newExe = Get-ChildItem $tmpDir -Filter "loki-windows-amd64.exe" | Select-Object -First 1
     if (-not $newExe) { throw "loki-windows-amd64.exe not found in archive" }
 
+    $healthCheck = {
+        # NSSM restarts a crash-looping build every 5s and the service keeps
+        # reporting Running, so poll Loki's own readiness endpoint instead.
+        $deadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $r = Invoke-WebRequest 'http://127.0.0.1:3100/ready' -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                if ($r.StatusCode -eq 200) { return $true }
+            } catch { }
+            Start-Sleep -Seconds 2
+        }
+        return $false
+    }
     $swap = Swap-SingleExeWithRollback -AppName $AppName -ExePath $ExePath `
-                -NewExePath $newExe.FullName -ServiceNames @($ServiceName) -HealthSeconds 10
+                -NewExePath $newExe.FullName -ServiceNames @($ServiceName) -HealthSeconds 10 `
+                -PostHealthCheck $healthCheck
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 

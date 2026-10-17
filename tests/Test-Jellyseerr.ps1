@@ -72,18 +72,50 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
             $Script:Results.Add((New-TestResult $svc 2 'ApplicationUrl' 'FAIL' $settings.error))
         }
 
+        # Prefix quirk: in DuckDNS mode Sonarr/Radarr answer only on /sonarr and
+        # /radarr, and Jellyseerr stores that prefix in DVRSettings.baseUrl -- the
+        # `urlBase` field is ignored by the server.  Counting instances alone let a
+        # connection without a prefix pass this test, so baseUrl is asserted too.
+        $expectedSonarrBase = if ($Config.General.DomainMode -eq 'duckdns') { '/sonarr' } else { '' }
         $services = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/sonarr" $hdr -TimeoutSec 8
         if ($services.ok) {
-            $sonarrCount = if ($services.data -is [array]) { $services.data.Count } else { 0 }
-            $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' $(if ($sonarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$sonarrCount Sonarr instance(s) in Jellyseerr"))
+            $sonarrInstances = @(@($services.data) | Where-Object { $null -ne $_ })
+            if ($sonarrInstances.Count -eq 0) {
+                $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' 'FAIL' '0 Sonarr instance(s) in Jellyseerr'))
+            } else {
+                $defaultSonarr = $sonarrInstances | Where-Object { $_.isDefault } | Select-Object -First 1
+                if (-not $defaultSonarr) { $defaultSonarr = $sonarrInstances[0] }
+                $sonarrBase = [string]$defaultSonarr.baseUrl
+                $sonarrOk   = $true
+                $sonarrMsg  = "$($sonarrInstances.Count) Sonarr instance(s), baseUrl='$sonarrBase'"
+                if ($expectedSonarrBase -and $sonarrBase.TrimEnd('/') -ne $expectedSonarrBase) {
+                    $sonarrOk  = $false
+                    $sonarrMsg = "Sonarr baseUrl expected '$expectedSonarrBase', got '$sonarrBase'"
+                }
+                $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' $(if ($sonarrOk) { 'PASS' } else { 'FAIL' }) $sonarrMsg))
+            }
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'SonarrLinked' 'FAIL' $services.error))
         }
 
+        $expectedRadarrBase = if ($Config.General.DomainMode -eq 'duckdns') { '/radarr' } else { '' }
         $radarrSvc = Invoke-ApiCheck "http://127.0.0.1:$port/api/v1/settings/radarr" $hdr -TimeoutSec 8
         if ($radarrSvc.ok) {
-            $radarrCount = if ($radarrSvc.data -is [array]) { $radarrSvc.data.Count } else { 0 }
-            $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' $(if ($radarrCount -gt 0) { 'PASS' } else { 'FAIL' }) "$radarrCount Radarr instance(s) in Jellyseerr"))
+            $radarrInstances = @(@($radarrSvc.data) | Where-Object { $null -ne $_ })
+            if ($radarrInstances.Count -eq 0) {
+                $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' 'FAIL' '0 Radarr instance(s) in Jellyseerr'))
+            } else {
+                $defaultRadarr = $radarrInstances | Where-Object { $_.isDefault } | Select-Object -First 1
+                if (-not $defaultRadarr) { $defaultRadarr = $radarrInstances[0] }
+                $radarrBase = [string]$defaultRadarr.baseUrl
+                $radarrOk   = $true
+                $radarrMsg  = "$($radarrInstances.Count) Radarr instance(s), baseUrl='$radarrBase'"
+                if ($expectedRadarrBase -and $radarrBase.TrimEnd('/') -ne $expectedRadarrBase) {
+                    $radarrOk  = $false
+                    $radarrMsg = "Radarr baseUrl expected '$expectedRadarrBase', got '$radarrBase'"
+                }
+                $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' $(if ($radarrOk) { 'PASS' } else { 'FAIL' }) $radarrMsg))
+            }
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'RadarrLinked' 'FAIL' $radarrSvc.error))
         }

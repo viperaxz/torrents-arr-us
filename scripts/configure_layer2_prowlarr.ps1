@@ -409,7 +409,7 @@ foreach ($idx in $Layer2Config.Indexers) {
     }
     Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=$needsFlare"
 
-    $exists = $existingIndexers | Where-Object { $_.definitionName -eq $idxDef -or $_.name -eq $idxName }
+    $exists = $existingIndexers | Where-Object { $_.definitionName -eq $idxDef -or $_.name -eq $idxName } | Select-Object -First 1
     if ($exists) {
         Write-Host "     ~ Already configured: $idxName" -ForegroundColor DarkGray
         Write-DebugLog "INFO" "Indexer '$idxName' already exists  --  skip"
@@ -420,18 +420,30 @@ foreach ($idx in $Layer2Config.Indexers) {
         # healthy while every search from that indexer fails.
         if ($needsFlare -and $flareTagId -and ($exists.tags -notcontains [int]$flareTagId)) {
             $existsHdrs = @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"}
-            $existsTags = New-Object System.Collections.Generic.List[int]
-            foreach ($t in @($exists.tags)) { if ($null -ne $t) { $existsTags.Add([int]$t) } }
-            $existsTags.Add([int]$flareTagId)
-            if ($exists.PSObject.Properties['tags']) { $exists.tags = @($existsTags) }
-            else { $exists | Add-Member -MemberType NoteProperty -Name 'tags' -Value @($existsTags) -Force }
+            # Tag through the bulk endpoint instead of a full indexer PUT. Prowlarr
+            # validates an enabled indexer on PUT by asking the tracker for its
+            # capabilities, and the only indexers this branch exists for are the
+            # Cloudflare-blocked ones -- that fetch answers 403/429/CF, so the PUT
+            # would be rejected and the tag would never land exactly where it is
+            # needed. The bulk call rewrites only the tag list (applyTags=add keeps
+            # the tags already present) and runs no capability test.
+            $bulkBody = @{ ids = @([int]$exists.id); tags = @([int]$flareTagId); applyTags = "add" } |
+                ConvertTo-Json -Depth 5 -Compress
             try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($exists.id)" `
-                    -Method Put -Headers $existsHdrs `
-                    -Body ($exists | ConvertTo-Json -Depth 20 -Compress) `
+                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/bulk" `
+                    -Method Put -Headers $existsHdrs -Body $bulkBody `
                     -UseBasicParsing -ErrorAction Stop | Out-Null
-                Write-Host "     [CF] Tagged existing indexer $idxName for FlareSolverr." -ForegroundColor Cyan
-                Write-DebugLog "INFO" "Attached FlareSolverr tag $flareTagId to existing indexer '$idxName' (id=$($exists.id))"
+                # Read the tag back: the bulk call reports success even when the id
+                # list matches nothing, and an untagged CF indexer is silently dead.
+                $tagged = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$ProwlarrUrlBase/api/v1/indexer/$($exists.id)" `
+                    -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+                if (@($tagged.tags) -contains [int]$flareTagId) {
+                    Write-Host "     [CF] Tagged existing indexer $idxName for FlareSolverr." -ForegroundColor Cyan
+                    Write-DebugLog "INFO" "Attached FlareSolverr tag $flareTagId to existing indexer '$idxName' (id=$($exists.id))"
+                } else {
+                    Write-Warning "     Indexer '$idxName' did not keep the FlareSolverr tag (tags=[$(@($tagged.tags) -join ',')])."
+                    Write-DebugLog "WARN" "FlareSolverr tag on existing indexer '$idxName' did not persist (tags=[$(@($tagged.tags) -join ',')])"
+                }
             } catch {
                 Write-Warning "     Could not tag existing indexer '$idxName' for FlareSolverr: $_"
                 Write-DebugLog "WARN" "FlareSolverr tag on existing indexer '$idxName' failed: $_"
@@ -544,30 +556,35 @@ foreach ($idx in $Layer2Config.Indexers) {
 }
 
 # --- 5d. Enable CF-protected indexers via SQLite ----------------------------
+# Python is resolved here, before the CF block guards it, because sections 6-8
+# need the same interpreter: the *arr-side minimumSeeders fallback and the stale
+# apiKey read/write only run when it is known. Resolving it inside
+# "if ($cfIndexerIds.Count -gt 0)" left it $null on every re-run (all indexers
+# already exist, so no CF id is pending) and silently dropped both fallbacks.
+$pythonExe = $null
+if (Test-Path "C:\Python312\python.exe") {
+    $pythonExe = "C:\Python312\python.exe"
+} else {
+    Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | ForEach-Object {
+            if ($pythonExe) { return }
+            $p = Join-Path $_.FullName "python.exe"
+            if (Test-Path $p) { $pythonExe = $p }
+        }
+}
+if (-not $pythonExe) {
+    # Skip the Microsoft Store app-execution alias: it exists but exits with
+    # "Python was not found", unlike the real interpreter.
+    $gcResult = Get-Command python -ErrorAction SilentlyContinue |
+        Where-Object { $_.Source -notlike '*\WindowsApps\*' }
+    if ($gcResult) { $pythonExe = $gcResult.Source }
+}
+Write-DebugLog "VAR pythonExe=$pythonExe"
+
 Write-DebugLog "VAR CF-protected indexers pending enable=$($cfIndexerIds.Count) ids=$($cfIndexerIds -join ',')"
 if ($cfIndexerIds.Count -gt 0) {
     Write-Host "  -> Enabling $($cfIndexerIds.Count) CF-protected indexer(s) via database..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Enabling $($cfIndexerIds.Count) CF indexers via SQLite..."
-
-    $pythonExe = $null
-    if (Test-Path "C:\Python312\python.exe") {
-        $pythonExe = "C:\Python312\python.exe"
-    } else {
-        Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | ForEach-Object {
-                if ($pythonExe) { return }
-                $p = Join-Path $_.FullName "python.exe"
-                if (Test-Path $p) { $pythonExe = $p }
-            }
-    }
-    if (-not $pythonExe) {
-        # Skip the Microsoft Store app-execution alias: it exists but exits with
-        # "Python was not found", unlike the real interpreter.
-        $gcResult = Get-Command python -ErrorAction SilentlyContinue |
-            Where-Object { $_.Source -notlike '*\WindowsApps\*' }
-        if ($gcResult) { $pythonExe = $gcResult.Source }
-    }
-    Write-DebugLog "VAR pythonExe=$pythonExe"
 
     if ($pythonExe) {
         $null = Stop-ServiceBounded -Name Prowlarr
@@ -600,12 +617,21 @@ print(f"Enabled {changed}/{len(ids)} CF-protected indexer(s)")
         try {
             $ErrorActionPreference = "Continue"
             $result = & $pythonExe $tmpPy $dbPath $idsList 2>&1 | Out-String
+            $pyExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $savedEAP
         }
         Remove-Item $tmpPy -Force -ErrorAction SilentlyContinue
-        Write-Host "     OK $result" -ForegroundColor Green
-        Write-DebugLog "INFO" "SQLite update result: $result"
+        if ($pyExit -eq 0) {
+            Write-Host "     OK $result" -ForegroundColor Green
+            Write-DebugLog "INFO" "SQLite update result: $result"
+        } else {
+            # The read-back below still decides the outcome, but a green "OK" over a
+            # traceback (database locked, wrong schema) is exactly the silent failure
+            # this step exists to prevent.
+            Write-Warning "     Enabling CF-protected indexers failed (python exit $pyExit): $($result.Trim())"
+            Write-DebugLog "ERROR" "SQLite update failed (python exit $pyExit): $($result.Trim())"
+        }
 
         $null = Start-ServiceBounded -Name Prowlarr
         $startDeadline = (Get-Date).AddSeconds(30)
@@ -719,7 +745,7 @@ if ($minSeeders -gt 1) {
             $apiOk   = 0; $apiFail = @()
 
             foreach ($idx in $idxList) {
-                $f = $idx.fields | Where-Object { $_.name -eq "minimumSeeders" }
+                $f = $idx.fields | Where-Object { $_.name -eq "minimumSeeders" } | Select-Object -First 1
                 if (-not $f -or [int]$f.value -eq $minSeeders) { continue }
                 Set-ApiFieldValue -Field $f -Value $minSeeders
                 try {
@@ -737,6 +763,7 @@ if ($minSeeders -gt 1) {
             }
 
             # SQLite fallback for indexers whose API PUT was rejected
+            $sqlOk = 0
             if ($apiFail.Count -gt 0 -and $pythonExe -and (Test-Path $app.Db)) {
                 $null = Stop-ServiceBounded -Name $app.Name
                 $stopDl = (Get-Date).AddSeconds(15)
@@ -764,22 +791,41 @@ db.commit(); db.close(); print(n)
                 try {
                     $ErrorActionPreference = "Continue"
                     $sqlResult = & $pythonExe $tmpPy $app.Db $idsList $minSeeders 2>&1 | Out-String
+                    $sqlExit = $LASTEXITCODE
                 } finally {
                     $ErrorActionPreference = $savedEAP
                 }
                 Remove-Item $tmpPy -Force -EA SilentlyContinue
+                if ($sqlExit -eq 0 -and $sqlResult.Trim() -match '^\d+$') {
+                    $sqlOk = [int]$sqlResult.Trim()
+                } else {
+                    # The row loop only counts rows that actually carry the key, so a
+                    # python failure and a "no matching rows" both end up here -- either
+                    # way the values below did NOT reach the database.
+                    Write-Warning "     $($app.Name): SQLite fallback wrote nothing (python exit $sqlExit): $($sqlResult.Trim())"
+                    Write-DebugLog "ERROR" "$($app.Name) SQLite fallback failed (python exit $sqlExit): $($sqlResult.Trim())"
+                }
                 $null = Start-ServiceBounded -Name $app.Name
                 $startDl = (Get-Date).AddSeconds(20)
                 while ((Get-Service $app.Name -EA SilentlyContinue).Status -ne "Running" -and (Get-Date) -lt $startDl) {
                     Start-Sleep -Seconds 1
                 }
-                Write-Host "     OK $($app.Name): SQLite fallback updated $sqlResult indexer(s) (CF-protected)" -ForegroundColor Green
-                Write-DebugLog "INFO" "$($app.Name) SQLite fallback: $sqlResult CF indexers updated"
+                Write-Host "     OK $($app.Name): SQLite fallback updated $sqlOk indexer(s) (CF-protected)" -ForegroundColor Green
+                Write-DebugLog "INFO" "$($app.Name) SQLite fallback: $sqlOk CF indexers updated"
+            } elseif ($apiFail.Count -gt 0) {
+                Write-Warning "     $($app.Name): $($apiFail.Count) indexer(s) rejected the minimumSeeders update and the SQLite fallback is unavailable (python='$pythonExe', db=$(Test-Path $app.Db))."
+                Write-DebugLog "WARN" "$($app.Name) minimumSeeders fallback unavailable (python='$pythonExe' db=$(Test-Path $app.Db)); $($apiFail.Count) indexer(s) not updated"
             }
 
-            $total = $apiOk + $apiFail.Count
-            Write-Host "     OK $($app.Name): minimumSeeders=$minSeeders applied to $total/$($idxList.Count) indexers" -ForegroundColor Green
-            Write-DebugLog "INFO" "$($app.Name) minimumSeeders=$($minSeeders) API=$apiOk SQLite=$($apiFail.Count) of $($idxList.Count)"
+            # Report what actually landed: counting every rejected PUT as applied made
+            # a 33/33 "OK" line while the CF-protected indexers kept minimumSeeders=0.
+            $total = $apiOk + $sqlOk
+            if ($total -ge $idxList.Count) {
+                Write-Host "     OK $($app.Name): minimumSeeders=$minSeeders applied to $total/$($idxList.Count) indexers" -ForegroundColor Green
+            } else {
+                Write-Warning "     $($app.Name): minimumSeeders=$minSeeders applied to $total/$($idxList.Count) indexers (API=$apiOk, SQLite=$sqlOk, rejected=$($apiFail.Count))."
+            }
+            Write-DebugLog "INFO" "$($app.Name) minimumSeeders=$($minSeeders) API=$apiOk SQLite=$sqlOk rejected=$($apiFail.Count) of $($idxList.Count)"
         } catch {
             Write-Warning "     Could not update $($app.Name) indexers: $_"
             Write-DebugLog "WARN" "$($app.Name) minimumSeeders update failed: $_"
@@ -889,20 +935,9 @@ if ($Config.Apps.Radarr -eq $true -and (Test-Path "C:\ProgramData\Radarr\config.
 # probing a few indexers only proves those few are fine. The Settings JSON in each
 # app's own database holds the real value, and reading it needs no admin rights the
 # installer lacks. Returns Ok=$false when the answer is unknown (no python, no db).
-# Section 5d only resolves Python when it has CF indexers to enable, so resolve it
-# once here: both the DB read below and the repair write need it.
+# Python was resolved before section 5d, so the same interpreter serves the DB read
+# below and the repair write.
 $prowlarrPythonExe = $pythonExe
-if (-not $prowlarrPythonExe) {
-    if (Test-Path "C:\Python312\python.exe") {
-        $prowlarrPythonExe = "C:\Python312\python.exe"
-    } else {
-        # Skip the Microsoft Store app-execution alias: it exists but exits with
-        # "Python was not found", unlike the real interpreter.
-        $gcPy = Get-Command python -ErrorAction SilentlyContinue |
-            Where-Object { $_.Source -notlike '*\WindowsApps\*' }
-        if ($gcPy) { $prowlarrPythonExe = $gcPy.Source }
-    }
-}
 Write-DebugLog "VAR apiKey repair python=$(if ($prowlarrPythonExe) { $prowlarrPythonExe } else { 'not found' })"
 
 function Get-StaleProwlarrIndexerIds {
@@ -935,6 +970,13 @@ for rid in stale:
             $ErrorActionPreference = 'Continue'
             $raw = & $prowlarrPythonExe $tmpPy $DbPath $ProwlarrKey 2>&1 | Out-String
         } finally { $ErrorActionPreference = $savedEAP }
+        # A python that failed (locked database, traceback) prints no id lines, which
+        # is indistinguishable from "nothing is stale" -- the caller would then report
+        # every key as correct. Treat a non-zero exit as "unknown", never as "clean".
+        if ($LASTEXITCODE -ne 0) {
+            Write-DebugLog "WARN" "Reading stored indexer keys from $DbPath failed (python exit $LASTEXITCODE): $($raw.Trim())"
+            return [pscustomobject]@{ Ok = $false; Ids = @() }
+        }
         return [pscustomobject]@{ Ok = $true; Ids = @($raw -split "`r?`n" | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ }) }
     } catch {
         Write-DebugLog "WARN" "Could not read stored indexer keys from $DbPath : $_"
@@ -949,6 +991,7 @@ if ($syncTargets.Count -gt 0) {
 
     $plUpdated = 0
     $plEnabled = 0
+    $plCandidates = 0
     $plUnavailable = [System.Collections.Generic.List[string]]::new()
     $plDeferred = [System.Collections.Generic.List[object]]::new()
     try {
@@ -975,6 +1018,7 @@ if ($syncTargets.Count -gt 0) {
                 }
             }
             if (-not $changed) { continue }
+            $plCandidates++
 
             # Prowlarr validates the indexer on PUT too, so a solver-warmed indexer
             # can answer 400 on the first attempt -- seen on RuTracker right after a
@@ -1065,13 +1109,17 @@ if ($syncTargets.Count -gt 0) {
         }
 
         if ($plUpdated -gt 0) {
-            Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plEnabled indexer(s)" -ForegroundColor Green
+            # Report against the indexers that actually needed a write, not every
+            # enabled indexer: only entries carrying SeedRules / a minimumSeeders
+            # change are candidates, so "3/33" (normal on a 33-indexer install with
+            # four private trackers) read like a failure.
+            Write-Host "     OK Prowlarr: seed criteria stored on $plUpdated/$plCandidates indexer(s) that needed it ($plEnabled enabled)." -ForegroundColor Green
         }
         if ($plUnavailable.Count -gt 0) {
             Write-Host "     $($plUnavailable.Count) indexer(s) not updated in Prowlarr: $($plUnavailable -join ', ') -- Prowlarr cannot validate them right now, so the ratios are applied on the app side only." -ForegroundColor DarkGray
             Write-DebugLog "INFO" "Prowlarr seed criteria skipped for unavailable indexers: $($plUnavailable -join ', ')"
         }
-        Write-DebugLog "INFO" "Prowlarr seed criteria stored on $plUpdated/$plEnabled indexers"
+        Write-DebugLog "INFO" "Prowlarr seed criteria stored on $plUpdated/$plCandidates candidate indexers ($plEnabled enabled)"
     } catch {
         Write-Warning "     Could not store seed criteria in Prowlarr: $_"
         Write-DebugLog "WARN" "Prowlarr seed criteria update failed: $_"
@@ -1187,8 +1235,12 @@ if ($syncTargets.Count -gt 0) {
             try {
                 $ErrorActionPreference = 'Continue'
                 $sqlKeyResult = & $prowlarrPythonExe $tmpKeyPy $t.Db $idsList $ApiKey 2>&1 | Out-String
+                $sqlKeyExit = $LASTEXITCODE
             } finally { $ErrorActionPreference = $savedEAP }
             Remove-Item $tmpKeyPy -Force -ErrorAction SilentlyContinue
+            # Fail loudly instead of casting a traceback to [int]; the read-back below
+            # is still what decides, but this message says *why* nothing was written.
+            if ($sqlKeyExit -ne 0) { throw "python exit ${sqlKeyExit}: $($sqlKeyResult.Trim())" }
             $keyRepaired += [int]($sqlKeyResult.Trim())
             Write-DebugLog "INFO" "$($t.Name) apiKey written to $($sqlKeyResult.Trim()) indexer row(s)"
         } catch {

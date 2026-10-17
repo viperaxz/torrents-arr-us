@@ -41,7 +41,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     $acquisPath = Join-Path $CsConfigDir 'acquis.yaml'
     if (Test-Path $acquisPath) {
         $acquis = Get-Content $acquisPath -Raw -ErrorAction SilentlyContinue
-        $hasCaddy = $acquis -match 'caddy-access\.log'
+        $hasCaddy = $acquis -match 'caddy-access(-relay)?\.log'
         $hasEvtLog = $acquis -match 'security-4625\.xml'
         $Script:Results.Add((New-TestResult $svc 2 'CaddyAcquisition' `
             $(if ($hasCaddy) { 'PASS' } else { 'FAIL' }) 'Caddy access log registered as a CrowdSec datasource'))
@@ -52,6 +52,58 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         $Script:Results.Add((New-TestResult $svc 2 'EventLogAcquisition' 'SKIP' 'acquis.yaml not found'))
     }
 
+    # Configured is not the same as consuming. The Caddy access log is the only
+    # source covering HTTP (every proxied app sits behind it), and a file tail can
+    # start cleanly ("Adding file ... to datasources") and then never read a line,
+    # in which case HTTP attacks are invisible while acquis.yaml, the collection and
+    # the parsers all look correct. If the log has been written since the engine
+    # started but cscli reports zero reads for it, that source is dead.
+    $caddyLogPath = $null
+    if ($acquis) {
+        $mCaddy = [regex]::Match($acquis, "-\s*'([^']*caddy-access(?:-relay)?\.log)'")
+        if ($mCaddy.Success) { $caddyLogPath = $mCaddy.Groups[1].Value }
+    }
+    if (-not $caddyLogPath -or -not (Test-Path -LiteralPath $caddyLogPath) -or -not (Test-Path $CsCli)) {
+        $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'SKIP' 'Caddy access log or cscli not available'))
+    } else {
+        $csReads    = -1
+        $engineStart = $null
+        try {
+            $metrics = ((& $CsCli metrics -o json 2>$null | Out-String) | ConvertFrom-Json)
+            $mKey    = "file:$caddyLogPath"
+            if ($metrics.acquisition -and $metrics.acquisition.PSObject.Properties[$mKey]) {
+                $csReads = [int]$metrics.acquisition.$mKey.reads
+            } else {
+                $csReads = 0
+            }
+        } catch { $csReads = -1 }
+        try {
+            $csSvcObj = Get-Service 'crowdsec' -ErrorAction SilentlyContinue
+            if ($csSvcObj) {
+                $csProcId = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$($csSvcObj.Name)'" -ErrorAction Stop).ProcessId
+                if ($csProcId) { $engineStart = (Get-Process -Id $csProcId -ErrorAction Stop).StartTime }
+            }
+        } catch { $engineStart = $null }
+        $caddyWritten = (Get-Item -LiteralPath $caddyLogPath).LastWriteTime
+        # The engine anchors the tail at EOF on startup, so lines written before it
+        # started are deliberately skipped. Judging "log newer than the engine" with
+        # no margin turned a sub-second ordering into a false FAIL immediately after
+        # the post-install restart. Only call it dead once the file has been written
+        # well past the engine's start and CrowdSec still has not read anything.
+        $missedTraffic = ($engineStart -and $caddyWritten -gt $engineStart.AddSeconds(60) -and $csReads -eq 0)
+        if ($csReads -lt 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'WARN' 'cscli metrics could not be read'))
+        } elseif ($missedTraffic) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'FAIL' `
+                "Caddy log written $($caddyWritten.ToString('HH:mm:ss')) (engine started $($engineStart.ToString('HH:mm:ss'))) but CrowdSec read 0 lines -- the tail is stuck, HTTP detection is dead"))
+        } elseif ($csReads -eq 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'WARN' `
+                'No Caddy lines consumed yet (no matching HTTP traffic since the engine started)'))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'PASS' "$csReads line(s) consumed from the Caddy access log"))
+        }
+    }
+
     # Whitelist -- the guard against banning yourself.
     $wlPath = Join-Path $CsConfigDir 'parsers\s02-enrich\seedbox-whitelist.yaml'
     $Script:Results.Add((New-TestResult $svc 2 'TrustedWhitelist' `
@@ -59,12 +111,55 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
 
     # Operator-IP auto-refresh -- keeps the WAN IP entry current on dynamic IPs
     # (DuckDNS lines rotate), so a stale whitelist can never lock the operator out.
+    # Present-but-Disabled is not armed: the task shows up in every query and never
+    # runs, which is exactly how the missing tasks went unnoticed for a whole cycle.
     $wlTask = Get-ScheduledTask -TaskName 'Seedbox_CrowdSecWhitelistRefresh' -ErrorAction SilentlyContinue
+    $wlArmed = [bool]($wlTask -and ($wlTask.State -in @('Ready', 'Running')))
     $Script:Results.Add((New-TestResult $svc 2 'WhitelistRefreshTask' `
-        $(if ($wlTask) { 'PASS' } else { 'WARN' }) 'Scheduled task keeps the operator WAN IP whitelisted'))
+        $(if ($wlArmed) { 'PASS' } else { 'WARN' }) `
+        "Scheduled task keeps the operator WAN IP whitelisted (state: $(if ($wlTask) { $wlTask.State } else { 'not registered' }))"))
     $wlContent = if (Test-Path $wlPath) { Get-Content $wlPath -Raw -ErrorAction SilentlyContinue } else { '' }
     $Script:Results.Add((New-TestResult $svc 2 'WhitelistOperatorMarker' `
         $(if ($wlContent -match 'seedbox-operator-wan-ip') { 'PASS' } else { 'WARN' }) 'Operator WAN IP entry marked for auto-refresh'))
+
+    # Event-log export task: without it security-4625.xml never grows and the windows
+    # collection sees nothing, while acquis.yaml still looks perfectly configured.
+    $evtTask = Get-ScheduledTask -TaskName 'Seedbox_SecurityEventExport' -ErrorAction SilentlyContinue
+    $evtArmed = [bool]($evtTask -and ($evtTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'EventExportTask' `
+        $(if ($evtArmed) { 'PASS' } else { 'WARN' }) `
+        "4625 export task registered (state: $(if ($evtTask) { $evtTask.State } else { 'not registered' }))"))
+
+    # 6-hourly blocklist refresh. A missing task is WARN, not FAIL: the blocklists
+    # may be deliberately disabled via Security.AbuseBlocklists.
+    $blTask = Get-ScheduledTask -TaskName 'Seedbox_Blocklist_Update' -ErrorAction SilentlyContinue
+    $blArmed = [bool]($blTask -and ($blTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'BlocklistTask' `
+        $(if ($blArmed) { 'PASS' } else { 'WARN' }) `
+        "Blocklist refresh task registered (state: $(if ($blTask) { $blTask.State } else { 'not registered' }))"))
+
+    # Every task helper must live in the install tree. A task pointing back at the
+    # source clone keeps working until that clone is moved or deleted, and then
+    # fails forever with nothing left in the install tree to run by hand.
+    # Seedbox_CaddyLogRelay is included because a dead relay silently stops all
+    # HTTP attack detection: acquis.yaml stays valid, the engine looks healthy.
+    $relayTask = Get-ScheduledTask -TaskName 'Seedbox_CaddyLogRelay' -ErrorAction SilentlyContinue
+    $relayArmed = [bool]($relayTask -and ($relayTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'CaddyLogRelayTask' `
+        $(if ($relayArmed) { 'PASS' } else { 'FAIL' }) `
+        "Caddy log relay task armed (state: $(if ($relayTask) { $relayTask.State } else { 'not registered' }))"))
+
+    $taskScripts = @()
+    foreach ($t in @($evtTask, $wlTask, $blTask, $relayTask)) {
+        if (-not $t) { continue }
+        $taskArgs = ($t.Actions | ForEach-Object { $_.Arguments }) -join ' '
+        $m = [regex]::Match($taskArgs, '-File\s+"?([^"]+\.ps1)"?')
+        if ($m.Success) { $taskScripts += [pscustomobject]@{ Task = $t.TaskName; Path = $m.Groups[1].Value } }
+    }
+    $missingScripts = @($taskScripts | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
+    $Script:Results.Add((New-TestResult $svc 2 'TaskScriptsPresent' `
+        $(if ($missingScripts.Count -gt 0) { 'FAIL' } elseif ($taskScripts.Count -gt 0) { 'PASS' } else { 'SKIP' }) `
+        $(if ($missingScripts.Count -gt 0) { "Missing: $($missingScripts.Path -join '; ')" } else { "$($taskScripts.Count) scheduled-task script(s) present on disk" })))
 
     # Bouncer must be registered against the local LAPI with a real key.
     $bouncerPath = if (Test-Path $BouncerYaml) { $BouncerYaml } elseif (Test-Path $BouncerYamlLegacy) { $BouncerYamlLegacy } else { $null }
@@ -120,13 +215,18 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         }
 
         # Active decisions -- informational, zero is normal on a fresh install.
+        # Deliberately the local list only: the Community Blocklist (origin CAPI) is
+        # thousands of entries and is counted by security_unban.ps1 instead.  Say
+        # "locally-sourced" so a healthy but quiet box does not read as "nothing is
+        # blocked" while the bouncer enforces the central list.
         try {
             $draw = (& $CsCli decisions list -o json 2>$null | Out-String).Trim()
             $banCount = 0
-            if ($draw -and $draw -ne 'null') {
+            if ($draw -and $draw -ne 'null' -and $draw -ne '[]') {
                 foreach ($a in @($draw | ConvertFrom-Json)) { if ($a.decisions) { $banCount += @($a.decisions).Count } }
             }
-            $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'PASS' "$banCount IP(s) currently banned by CrowdSec"))
+            $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'PASS' `
+                "$banCount locally-sourced ban(s); Community Blocklist decisions not counted here"))
         } catch {
             $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'WARN' "cscli decisions list failed: $_"))
         }

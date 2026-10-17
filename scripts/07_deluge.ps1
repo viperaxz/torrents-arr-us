@@ -20,6 +20,7 @@ $AppName       = "Deluge"
 $AppLower      = "deluge"
 $DaemonPort    = $Config.Ports.Deluge
 $WebPort       = $Config.Ports.DelugeWeb
+$DomainMode    = $Config.General.DomainMode
 # BitTorrent peer port -- must be forwarded on your router.
 # Default 56881 avoids ISP throttling on well-known ports like 6881.
 $BTPort        = if ($Config.Ports.PSObject.Properties['DelugeBT'] -and $Config.Ports.DelugeBT) {
@@ -104,19 +105,40 @@ function Ensure-DelugeLabels {
     # install the labels block runs seconds after DelugeWeb starts, so wait for the
     # host to report Connected first -- otherwise both labels vanish and the run
     # ends with "labels still missing" even though nothing was reported as failing.
+    # 'Connected' is only reported once this Web UI process holds a session with the
+    # daemon; until then get_host_status says 'Online' (the daemon answers a throwaway
+    # probe, the Web UI is not attached to it).  A fresh install has no
+    # default_daemon yet -- configure_layer1_deluge.ps1 writes that later in the run --
+    # so nothing would ever attach, every label.* call would fail, and the labels
+    # would only appear on the *next* install run.  web.connect is the same call the
+    # browser issues on Connect; both it and the host calls above are local to the
+    # Web UI, so this works before the daemon is reachable.
     $hostDeadline = (Get-Date).AddSeconds(60)
     $daemonReady  = $false
     while (-not $daemonReady -and (Get-Date) -lt $hostDeadline) {
         try {
             $hostsBody = @{ method = "web.get_hosts"; params = @(); id = 5 } | ConvertTo-Json -Compress
             $hostsRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $hostsBody `
-                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+                -ContentType "application/json" -WebSession $labelSess -TimeoutSec 10 -ErrorAction Stop
             if ($hostsRes.result -and $hostsRes.result.Count -gt 0) {
                 $hId = $hostsRes.result[0][0]
                 $stBody = @{ method = "web.get_host_status"; params = @($hId); id = 6 } | ConvertTo-Json -Compress
                 $stRes  = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $stBody `
-                    -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
-                if ($stRes.result -and $stRes.result[1] -eq "Connected") { $daemonReady = $true; break }
+                    -ContentType "application/json" -WebSession $labelSess -TimeoutSec 10 -ErrorAction Stop
+                $hostState = if ($stRes.result -and $stRes.result.Count -ge 2) { [string]$stRes.result[1] } else { "" }
+                if ($hostState -eq "Connected") { $daemonReady = $true; break }
+                if ($hostState -eq "Online") {
+                    $connectBody = @{ method = "web.connect"; params = @($hId); id = 7 } | ConvertTo-Json -Compress
+                    try {
+                        $connectRes = Invoke-RestMethod -Uri $labelJsonUrl -Method Post -Body $connectBody `
+                            -ContentType "application/json" -WebSession $labelSess -TimeoutSec 20 -ErrorAction Stop
+                        if ($connectRes.error) {
+                            Write-DebugLog "VAR web.connect error: $($connectRes.error.message)"
+                        }
+                    } catch {
+                        Write-DebugLog "VAR web.connect failed: $_"
+                    }
+                }
             }
         } catch { }
         Start-Sleep -Seconds 2
@@ -183,6 +205,48 @@ function Ensure-DelugeLabels {
     }
 }
 
+function Sync-DelugeWebBaseArg {
+    # deluge-web reads --base only at startup, and the Caddy route is generated from
+    # the current DomainMode (/deluge* in DuckDNS, a bare subdomain otherwise).  The
+    # lock file short-circuits the NSSM block further down, so a box that switched
+    # mode between runs would keep the old base path: the Web UI would answer at the
+    # wrong URLs and /deluge would 404 with no failing step to point at.  NSSM keeps
+    # the arguments it was given, so compare them and re-apply only on a mismatch.
+    $svcParams = "HKLM:\SYSTEM\CurrentControlSet\Services\DelugeWeb\Parameters"
+    $app       = (Get-ItemProperty -Path $svcParams -Name Application   -ErrorAction SilentlyContinue).Application
+    $current   = (Get-ItemProperty -Path $svcParams -Name AppParameters -ErrorAction SilentlyContinue).AppParameters
+    if (-not $app) {
+        Write-DebugLog "WARN" "DelugeWeb service parameters not readable -- base path not verified"
+        return
+    }
+
+    $baseArg  = if ($DomainMode -eq 'duckdns') { '--base /deluge' } else { '' }
+    $hasBase  = ($current -match '--base\s+/deluge')
+    $wantBase = [bool]$baseArg
+    if ($null -ne $current -and $hasBase -eq $wantBase) {
+        Write-DebugLog "INFO" "DelugeWeb base path already matches DomainMode=$DomainMode"
+        return
+    }
+
+    $desired = "--config `"$DataDir`" $baseArg --loglevel info --logfile `"$WebLog`""
+    if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
+        Write-DebugLog "WARN" "nssm not found -- DelugeWeb base path cannot be re-applied"
+        return
+    }
+    Write-Host "  -> Re-applying DelugeWeb base path for DomainMode=$DomainMode..." -ForegroundColor Gray
+    nssm set DelugeWeb AppParameters $desired 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-DebugLog "WARN" "nssm set DelugeWeb AppParameters failed (exit $LASTEXITCODE)"
+        return
+    }
+    Write-DebugLog "INFO" "DelugeWeb AppParameters re-applied (base='$baseArg')"
+    $svcWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
+    if ($svcWeb -and $svcWeb.Status -eq "Running") {
+        $null = Restart-ServiceBounded -Name "DelugeWeb"
+        Write-DebugLog "INFO" "DelugeWeb restarted so the base path takes effect"
+    }
+}
+
 if ($Config.Apps.Deluge -ne $true) {
     Write-Host "[$AppName] Skipped per configuration." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "$AppName skipped (Apps.Deluge != true)"
@@ -191,6 +255,9 @@ if ($Config.Apps.Deluge -ne $true) {
 if (Test-Path $LockFile) {
     Write-Host "[$AppName] Already installed. Skipping." -ForegroundColor Green
     Write-DebugLog "INFO" "$AppName already installed (lock file present)"
+    # The NSSM block below is skipped by this early return, so reconcile the one
+    # setting that depends on config.json and only takes effect at process start.
+    Sync-DelugeWebBaseArg
     # A Deluge installed before the label step existed still has no labels, so heal
     # it on every run rather than only when the lock file is absent.
     $svcWebInstalled = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
@@ -786,10 +853,17 @@ if ((Test-Path $DelugeBackupStateDir) -and -not (Test-Path (Join-Path $DataDir "
     Write-Host "  -> Restoring Deluge torrent state from previous install..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Restoring Deluge state from $DelugeBackupStateDir to $DataDir\state"
     Copy-Item -Recurse -Force $DelugeBackupStateDir "$DataDir\state" -ErrorAction SilentlyContinue
-    Write-DebugLog "INFO" "Deluge state restored successfully"
-    # Clean up backup to avoid stale restores on future reinstalls
-    Remove-Item -Recurse -Force $DelugeBackupDir -ErrorAction SilentlyContinue
-    Write-DebugLog "INFO" "Deluge backup cleaned up after successful restore"
+    # The copy above is best-effort, so the backup is only dropped once the restore
+    # is on disk: deleting it unconditionally would throw away the only copy of the
+    # torrent state when a single file could not be copied.
+    if (Test-Path (Join-Path $DataDir "state")) {
+        Write-DebugLog "INFO" "Deluge state restored successfully"
+        Remove-Item -Recurse -Force $DelugeBackupDir -ErrorAction SilentlyContinue
+        Write-DebugLog "INFO" "Deluge backup cleaned up after successful restore"
+    } else {
+        Write-Warning "  -> Deluge state restore failed; backup kept at $DelugeBackupDir"
+        Write-DebugLog "WARN" "Deluge state restore failed -- backup left in place at $DelugeBackupDir"
+    }
 } elseif (Test-Path $DelugeBackupDir) {
     Write-DebugLog "INFO" "Deluge backup found but DataDir\state already exists -- skip restore"
 } else {
@@ -984,7 +1058,6 @@ if (-not $existingDaemon) {
 # Web UI service
 $existingWeb = Get-Service -Name "DelugeWeb" -ErrorAction SilentlyContinue
 Write-DebugLog "VAR DelugeWeb service exists=$($null -ne $existingWeb)"
-$DomainMode  = $Config.General.DomainMode
 $webBaseArg  = if ($DomainMode -eq 'duckdns') { '--base /deluge' } else { '' }
 Write-DebugLog "VAR DelugeWeb DomainMode=$DomainMode baseArg='$webBaseArg'"
 if (-not $existingWeb -and $delugeWebPath) {
@@ -1033,6 +1106,14 @@ Get-NetFirewallRule -DisplayName "Deluge BT"     -ErrorAction SilentlyContinue |
 Get-NetFirewallRule -DisplayName "Deluge BT UDP" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName "Deluge BT"     -Direction Inbound -LocalPort $BTPort -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -DisplayName "Deluge BT UDP" -Direction Inbound -LocalPort $BTPort -Protocol UDP -Action Allow -ErrorAction SilentlyContinue | Out-Null
+# Both calls above are -ErrorAction SilentlyContinue: if the firewall provider
+# refuses them (policy, a wedged BFE) the install would otherwise report a working
+# peer port while nothing is reachable.  Read them back instead of trusting the call.
+$btRules = @(Get-NetFirewallRule -DisplayName "Deluge BT", "Deluge BT UDP" -ErrorAction SilentlyContinue)
+if ($btRules.Count -lt 2) {
+    Write-Warning "[$AppName] Only $($btRules.Count) of 2 BitTorrent firewall rules exist for port $BTPort -- peers cannot connect until both do."
+    Write-DebugLog "WARN" "BitTorrent firewall rules incomplete: found $($btRules.Count) of 2 for port $BTPort"
+}
 Write-DebugLog "INFO" "Firewall rules added for BitTorrent port $BTPort (TCP+UDP). Daemon port $DaemonPort is NOT opened (localhost-only)"
 Write-Host "   -> IMPORTANT: Forward TCP+UDP port $BTPort on your router for optimal speeds." -ForegroundColor Yellow
 

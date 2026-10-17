@@ -35,8 +35,15 @@ try {
         Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing -ErrorAction Stop
     }
 
+    # A service-state check alone is not proof Grafana came up: NSSM is installed
+    # with "AppExit Default Restart", so a build that crashes on startup keeps the
+    # service Running. Probe the API instead -- prefixed in DuckDNS mode, where
+    # Grafana runs with serve_from_sub_path. First start after an upgrade can run
+    # DB migrations, hence the generous budget.
+    $healthBase = if ($Config -and $Config.General.DomainMode -eq "duckdns") { "/grafana" } else { "" }
     $swap = Swap-AppDirectoryWithRollback -AppName $AppName -InstallDir $InstallDir `
-                -ZipPath $zipPath -ServiceNames @($ServiceName) -HealthSeconds 25
+                -ZipPath $zipPath -ServiceNames @($ServiceName) -HealthSeconds 90 `
+                -HealthUrl "http://127.0.0.1:3000$healthBase/api/health"
     if (-not $swap.Ok) { throw "binary swap failed: $($swap.Detail)" }
 
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version

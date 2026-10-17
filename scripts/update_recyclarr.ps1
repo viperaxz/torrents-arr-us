@@ -41,8 +41,41 @@ try {
     $newExe = Get-ChildItem $tmpDir -Recurse -Filter "recyclarr.exe" | Select-Object -First 1
     if (-not $newExe) { throw "recyclarr.exe not found in archive" }
 
+    # A CLI has no service to probe, so verify the swapped binary itself: it must
+    # be a complete executable (a truncated, blocked or quarantined file is
+    # rejected) and its version resource must be the release we asked for. Without
+    # this the swap always "succeeded" and a bad download was recorded in the
+    # ledger as an installed version.
+    $versionCheck = {
+        param()
+        try {
+            $item = Get-Item -LiteralPath $ExePath -ErrorAction Stop
+            if ($item.Length -lt 1MB) { return $false }
+            # Compare only major.minor.patch so "8.8.0.0" (PE) matches "v8.8.0".
+            $wantMatch = [regex]::Match([string]$Version, '(\d+)\.(\d+)\.(\d+)')
+            if (-not $wantMatch.Success) { return $true }
+            $want = "$($wantMatch.Groups[1].Value).$($wantMatch.Groups[2].Value).$($wantMatch.Groups[3].Value)"
+            foreach ($v in @($item.VersionInfo.FileVersion, $item.VersionInfo.ProductVersion)) {
+                if (-not $v) { continue }
+                $m = [regex]::Match([string]$v, '(\d+)\.(\d+)\.(\d+)')
+                if (-not $m.Success) { continue }
+                $got = "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value)"
+                if ($got -eq $want) { return $true }
+            }
+            # Version resource missing or unusable: ask the binary itself.
+            $cli = (& $ExePath --version 2>$null | Select-Object -First 1)
+            if ($cli) {
+                $m = [regex]::Match([string]$cli, '(\d+)\.(\d+)\.(\d+)')
+                if ($m.Success) {
+                    $got = "$($m.Groups[1].Value).$($m.Groups[2].Value).$($m.Groups[3].Value)"
+                    if ($got -eq $want) { return $true }
+                }
+            }
+            return $false
+        } catch { return $false }
+    }
     $swap = Swap-SingleExeWithRollback -AppName $AppName -ExePath $ExePath `
-                -NewExePath $newExe.FullName -ServiceNames @() -HealthSeconds 0
+                -NewExePath $newExe.FullName -ServiceNames @() -HealthSeconds 0 -PostHealthCheck $versionCheck
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 

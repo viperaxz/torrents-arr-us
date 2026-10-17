@@ -491,7 +491,38 @@ $JellyfinKeyFile = Join-Path $SecretsDir "jellyfin_api_key.txt"
 Write-DebugLog "VAR SecretsDir=$SecretsDir JellyfinKeyFile=$JellyfinKeyFile"
 
 Write-Host "  -> Creating Jellyfin API key for Sonarr/Radarr integration..." -ForegroundColor Gray
+# A stored key is only worth reusing if THIS Jellyfin still honours it. The file
+# outlives any Jellyfin data directory rebuilt without an uninstall, and a stale key
+# leaves the Sonarr/Radarr MediaBrowser notifications failing silently.
+$keyReusable = $false
 if (Test-Path $JellyfinKeyFile) {
+    $storedKey = ([System.IO.File]::ReadAllText($JellyfinKeyFile, [System.Text.Encoding]::UTF8)).TrimStart([char]0xFEFF).Trim()
+    if ($storedKey) {
+        $keyProbeStatus = 0
+        try {
+            $null = Invoke-RestMethod -Uri "$ApiBase/System/Info" `
+                -Headers @{"Authorization" = ($Client + ', Token="' + $storedKey + '"')} `
+                -UseBasicParsing -ErrorAction Stop
+            $keyProbeStatus = 200
+        } catch {
+            if ($_.Exception.Response) { $keyProbeStatus = [int]$_.Exception.Response.StatusCode }
+        }
+        Write-DebugLog "VAR stored Jellyfin API key probe status=$keyProbeStatus"
+        if ($keyProbeStatus -eq 200) {
+            $keyReusable = $true
+        } elseif ($keyProbeStatus -eq 401 -or $keyProbeStatus -eq 403) {
+            Write-Host "     Stored API key is no longer valid on this Jellyfin  --  regenerating." -ForegroundColor Yellow
+            Write-DebugLog "WARN" "Stored Jellyfin API key rejected (status $keyProbeStatus); regenerating it"
+            Remove-Item -Path $JellyfinKeyFile -Force -ErrorAction SilentlyContinue
+        } else {
+            # Unreachable or erroring: keep a key that cannot be proven bad.
+            Write-Host "     Could not validate the stored API key (status $keyProbeStatus)  --  reusing it." -ForegroundColor DarkYellow
+            Write-DebugLog "WARN" "Could not validate stored Jellyfin API key (status $keyProbeStatus); keeping it"
+            $keyReusable = $true
+        }
+    }
+}
+if ($keyReusable) {
     Write-Host "     API key file already exists  --  reusing." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "Jellyfin API key file already exists  --  skipping creation"
 } elseif (-not (Test-Path $SecretsDir)) {

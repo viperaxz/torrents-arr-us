@@ -155,13 +155,51 @@ if ($missing) {
 
 Write-DebugLog "INFO" "Writing patched secedit INF and applying..."
 [System.IO.File]::WriteAllLines($tmpInf, $newLines, [System.Text.Encoding]::Unicode)
-secedit /configure /db $tmpDb /cfg $tmpInf /quiet 2>$null
-Write-DebugLog "INFO" "secedit /configure exit code=$LASTEXITCODE"
+# Keep secedit's own message: redirecting it to $null is how an import failure
+# used to stay invisible behind an unconditional "granted" line.
+$seceditOut  = & secedit /configure /db $tmpDb /cfg $tmpInf /quiet 2>&1
+$seceditExit = $LASTEXITCODE
+Write-DebugLog "INFO" "secedit /configure exit code=$seceditExit output=$($seceditOut -join ' ')"
 Remove-Item $tmpInf, $tmpDb -Force -ErrorAction SilentlyContinue
 Write-DebugLog "INFO" "Temp secedit files removed"
 
-Write-Host "  -> SeServiceLogonRight and SeBatchLogonRight granted." -ForegroundColor Green
-Write-DebugLog "INFO" "SeServiceLogonRight + SeBatchLogonRight granted to $SvcUser (SID=$sid)"
+# Verified, not assumed: re-export the effective policy and confirm the SID is
+# really present in both rights. Without this the script printed "granted" even
+# when the import failed, and every service then failed to start for a reason
+# that pointed nowhere near the account.
+$rightsVerified = $false
+if ($seceditExit -eq 0) {
+    $verifyInf = [System.IO.Path]::Combine($env:TEMP, "seedbox_secedit_verify.inf")
+    try {
+        & secedit /export /cfg $verifyInf /quiet 2>&1 | Out-Null
+        if (Test-Path $verifyInf) {
+            $verifyLines = [System.IO.File]::ReadAllLines($verifyInf)
+            $svcRight    = ($verifyLines | Where-Object { $_ -match '^SeServiceLogonRight\s*=' }) -join ' '
+            $batchRight  = ($verifyLines | Where-Object { $_ -match '^SeBatchLogonRight\s*=' }) -join ' '
+            # secedit writes a resolvable account as its NAME ("seedbox-svc") and an
+            # orphaned SID as "*S-1-5-21-...". Looking only for the SID therefore
+            # reported "not verified" on every healthy install, because the account
+            # it had just granted the right to resolved to its name in the export.
+            $sidMatch   = ($svcRight -match [regex]::Escape($sid)) -and ($batchRight -match [regex]::Escape($sid))
+            $nameMatch  = ($svcRight -match "(^|,)\s*$([regex]::Escape($SvcUser))\s*(,|$)") -and
+                          ($batchRight -match "(^|,)\s*$([regex]::Escape($SvcUser))\s*(,|$)")
+            $rightsVerified = $sidMatch -or $nameMatch
+            Write-DebugLog "VAR rights verify: sidMatch=$sidMatch nameMatch=$nameMatch SeServiceLogonRight='$svcRight' SeBatchLogonRight='$batchRight'"
+        }
+    } catch {
+        Write-DebugLog "WARN" "Could not re-export the security policy to verify the logon rights: $_"
+    } finally {
+        Remove-Item $verifyInf -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($rightsVerified) {
+    Write-Host "  -> SeServiceLogonRight and SeBatchLogonRight granted." -ForegroundColor Green
+    Write-DebugLog "INFO" "SeServiceLogonRight + SeBatchLogonRight verified for $SvcUser (SID=$sid)"
+} else {
+    Write-Warning "  -> Could not verify SeServiceLogonRight/SeBatchLogonRight for '$SvcUser' (secedit exit $seceditExit). Services will fail to start with 'logon failure'."
+    Write-DebugLog "ERROR" "Logon rights NOT verified for $SvcUser (SID=$sid, secedit exit=$seceditExit): $($seceditOut -join ' ')"
+}
 
 # -- 3. ACL helper (exported for use by other scripts) ------------------------
 # Each app installer calls Grant-SeedboxDirAccess after creating its data dir.

@@ -66,9 +66,39 @@ function Remove-NssmService {
         Write-Host "  -> $Name : stopping..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Stopping service: $Name (current status: $($svc.Status))"
         $null = Stop-ServiceBounded -Name $Name
-        & nssm remove $Name confirm 2>$null | Out-Null
-        Write-Host "  -> $Name : removed." -ForegroundColor Yellow
-        Write-DebugLog "INFO" "Service removed: $Name"
+        if (-not $script:NssmExe) {
+            # The uninstaller's PATH is the one this shell started with; nssm is a
+            # Chocolatey shim that may not be on it. Removal used to fail silently
+            # (the error was redirected away) while the log still said "removed".
+            $script:NssmExe = (Get-Command nssm.exe -ErrorAction SilentlyContinue).Source
+            if (-not $script:NssmExe) {
+                $candidate = Join-Path $env:ProgramData "chocolatey\bin\nssm.exe"
+                if (Test-Path $candidate) { $script:NssmExe = $candidate }
+            }
+        }
+        if ($script:NssmExe) {
+            & $script:NssmExe remove $Name confirm 2>&1 | Out-Null
+        } else {
+            Write-Warning "  -> $Name : nssm.exe not found -- the service could not be removed."
+            Write-DebugLog "ERROR" "nssm.exe not found; cannot remove service $Name"
+        }
+        # Verify instead of claiming: a surviving service holds its port and its
+        # binary directory, which breaks the reinstall that follows. The short retry
+        # covers the moment the SCM needs to drop a service that was just marked
+        # for deletion -- it must not turn into a false warning on a healthy run.
+        $still = $null
+        for ($i = 0; $i -lt 4; $i++) {
+            $still = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            if (-not $still) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($still) {
+            Write-Warning "  -> $Name : still present after removal (status=$($still.Status))."
+            Write-DebugLog "ERROR" "Service $Name still present after nssm remove"
+        } else {
+            Write-Host "  -> $Name : removed." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Service removed: $Name"
+        }
     } else {
         Write-DebugLog "VAR service not found (skip): $Name"
     }
@@ -108,6 +138,8 @@ function Remove-MachinePathEntry {
 # reboot. PendingFileRenameOperations is processed before services start, so
 # queue files first and then directories deepest-first; each directory is empty
 # by the time its own delete entry runs.
+# Returns { Queued; AlreadyQueued } so the caller can distinguish "nothing to do,
+# an earlier run already scheduled it" from "could not be queued at all".
 function Register-PathForDeletionAtReboot {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -117,7 +149,7 @@ function Register-PathForDeletionAtReboot {
     $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue |
                 Sort-Object -Property @{ Expression = { $_.FullName.Length } } -Descending)
     $items += @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
-    if ($items.Count -eq 0) { return 0 }
+    if ($items.Count -eq 0) { return [PSCustomObject]@{ Queued = 0; AlreadyQueued = 0 } }
 
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     $existing = (Get-ItemProperty -Path $key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
@@ -128,7 +160,8 @@ function Register-PathForDeletionAtReboot {
         foreach ($e in @($existing)) { $entries.Add([string]$e) }
     }
 
-    $queued = 0
+    $queued  = 0
+    $skipped = 0
     $already = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($e in $entries) { if ($e) { [void]$already.Add([string]$e) } }
     foreach ($item in $items) {
@@ -137,14 +170,17 @@ function Register-PathForDeletionAtReboot {
         # A path queued by an earlier uninstall that has not rebooted yet must not be
         # queued again -- repeated cycles without a reboot would otherwise keep
         # appending the same 17 entries per profile folder to this value forever.
-        if (-not $already.Add('\??\' + $full)) { continue }
+        if (-not $already.Add('\??\' + $full)) { $skipped++; continue }
         $entries.Add('\??\' + $full)
         $entries.Add('')
         $queued++
     }
-    if ($queued -eq 0) { return 0 }
+    # AlreadyQueued is reported separately so a caller can tell "nothing to do,
+    # it is already scheduled" (the repeat-uninstall-without-reboot case) from
+    # "this path could not be queued at all".
+    if ($queued -eq 0) { return [PSCustomObject]@{ Queued = 0; AlreadyQueued = $skipped } }
     Set-ItemProperty -Path $key -Name PendingFileRenameOperations -Value ([string[]]$entries.ToArray()) -Type MultiString -ErrorAction Stop
-    return $queued
+    return [PSCustomObject]@{ Queued = $queued; AlreadyQueued = $skipped }
 }
 
 # -- 1. Stop any stray processes -----------------------------------------------
@@ -372,7 +408,7 @@ if (Test-Path $jfDir) {
 Write-Host "[3/8] Removing scheduled tasks..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 3: Remove scheduled tasks ==="
 foreach ($task in @("Seedbox_Cloudflare_Updater", "Seedbox_DuckDNS_Updater",
-                    "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update",
+                    "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update", "Seedbox_CaddyLogRelay",
                     "Seedbox_Status_Collector", "Seedbox_TestSuite", "Seedbox_TestSuiteFull",
                     "Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh",
                     "win-seedbox Update Check")) {
@@ -500,6 +536,16 @@ foreach ($sub in @("Caddy", "caddy-data", "Sonarr", "Radarr", "Prowlarr", "Bazar
     $path = Join-Path $InstallDir $sub
     $exists = Test-Path $path
     Write-DebugLog "VAR subdir '$sub' exists: $exists"
+    # <InstallDir>\scripts is the copy 12_security.ps1 drops for its whitelist
+    # refresher -- but when the project checkout IS InstallDir (a layout
+    # 00_service_account.ps1 warns about), it is this repo's own scripts folder.
+    # Deleting it would take the uninstaller's siblings with it.
+    if ($sub -eq "scripts" -and $PSScriptRoot -and
+        $PSScriptRoot.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')) {
+        Write-Warning "  -> Keeping $path : the project checkout is InstallDir, so this is the repo's own directory."
+        Write-DebugLog "WARN" "Skipped removal of $path (project checkout lives inside InstallDir)"
+        continue
+    }
     if ($exists) {
         Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "  -> Removed: $path" -ForegroundColor Yellow
@@ -618,8 +664,13 @@ if ($svcExists) {
 
     # Try to unload the registry hives (services are already stopped so they may be
     # free). A still-loaded hive keeps UsrClass.dat open, which is what stops the
-    # profile directory from being deleted -- so report the failure instead of
-    # hiding it and then blaming a generic "kernel lock" later.
+    # profile directory from being deleted -- so record the outcome instead of
+    # hiding it. This is INFO, not WARN: on a healthy uninstall it is the normal
+    # result (reg unload returns Access denied for profiles created in this or a
+    # previous session), it needs no action beyond the reboot the queue below
+    # already arranges, and a WARN that fires on every run trains the operator to
+    # ignore WARN. Whatever could not be cleaned up is reported where it matters:
+    # on the "locked until reboot / deletion queued" line for the folder itself.
     foreach ($hive in @("HKU\$svcSid", "HKU\${svcSid}_Classes")) {
         $unloaded = $false
         for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
@@ -634,7 +685,7 @@ if ($svcExists) {
         if ($unloaded) {
             Write-DebugLog "INFO" "Registry hive unloaded: $hive"
         } else {
-            Write-DebugLog "WARN" "Registry hive $hive is still loaded and cannot be unloaded until reboot"
+            Write-DebugLog "INFO" "Registry hive $hive stays loaded until reboot (expected: the profile is still mapped); its folder is queued for deletion below"
         }
     }
 
@@ -645,15 +696,7 @@ if ($svcExists) {
     Write-DebugLog "VAR $svcUser profile found: $($null -ne $svcProfile) path=$profileDir"
     if ($svcProfile) {
         $svcProfile | Remove-CimInstance -ErrorAction SilentlyContinue
-        $stillRegistered = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-                           Where-Object { $_.LocalPath -like "*$svcUser*" }
-        if ($stillRegistered) {
-            Write-Warning "  -> seedbox-svc profile entry could not be removed from WMI."
-            Write-DebugLog "WARN" "Win32_UserProfile entry for $svcUser still present after Remove-CimInstance"
-        } else {
-            Write-Host "  -> seedbox-svc profile removed ($profileDir)." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "WMI profile removed for $svcUser"
-        }
+        Write-DebugLog "INFO" "Remove-CimInstance attempted for $svcUser profile ($profileDir)"
     }
 
     # Remove ProfileList registry key (survives WMI removal on some Windows builds).
@@ -665,6 +708,24 @@ if ($svcExists) {
         Write-DebugLog "INFO" "Removed ProfileList key: $plKey"
     }
 
+    # Verified *after* both removal paths have run. Checking between them used to
+    # report "still present" before the ProfileList fallback -- the step the comment
+    # above says exists precisely for builds where Remove-CimInstance does not
+    # stick -- so a healthy uninstall logged a WARN for an entry it then removed.
+    $stillRegistered = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                       Where-Object { $_.LocalPath -like "*$svcUser*" }
+    if ($stillRegistered) {
+        # Same reasoning as the hive message: the profile entry cannot go away
+        # while the profile is mapped, and it is harmless once the account and the
+        # folder are gone -- Windows just creates the profile again on next use.
+        Write-DebugLog "INFO" "Win32_UserProfile entry for $svcUser survives until reboot (expected while the profile is mapped)"
+    } elseif ($svcProfile) {
+        Write-Host "  -> seedbox-svc profile entry removed ($profileDir)." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Win32_UserProfile entry for $svcUser removed"
+    } else {
+        Write-DebugLog "INFO" "No Win32_UserProfile entry was registered for $svcUser"
+    }
+
     # Delete folder directly if still present (hive unload succeeded).
     Write-DebugLog "VAR profile dir $profileDir exists: $(Test-Path $profileDir)"
     if (Test-Path $profileDir) {
@@ -674,15 +735,20 @@ if ($svcExists) {
         # UsrClass.dat stays mapped by the still-loaded hive until reboot. Queue
         # the tree for deletion before services start rather than telling the
         # operator to clean it up by hand after every uninstall.
-        $queued = 0
+        $registration = [PSCustomObject]@{ Queued = 0; AlreadyQueued = 0 }
         try {
-            $queued = Register-PathForDeletionAtReboot -Path $profileDir
+            $registration = Register-PathForDeletionAtReboot -Path $profileDir
         } catch {
             Write-DebugLog "ERROR" "Could not queue $profileDir for deletion at reboot: $_"
         }
-        if ($queued -gt 0) {
-            Write-Host "  -> $profileDir is locked until reboot; deletion queued for next boot ($queued entries)." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "Queued $queued entries under $profileDir for deletion at next boot"
+        if ($registration.Queued -gt 0) {
+            Write-Host "  -> $profileDir is locked until reboot; deletion queued for next boot ($($registration.Queued) entries)." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Queued $($registration.Queued) entries under $profileDir for deletion at next boot"
+        } elseif ($registration.AlreadyQueued -gt 0) {
+            # Repeat uninstall before the pending reboot: the entries are already in
+            # PendingFileRenameOperations, so nothing is missing and nothing is done.
+            Write-Host "  -> $profileDir is locked until reboot; deletion was already queued by an earlier run." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "$profileDir already queued for deletion at next boot ($($registration.AlreadyQueued) entries)"
         } else {
             Write-Warning "  -> $profileDir is locked and could not be queued for deletion  --  remove it manually after reboot."
             Write-DebugLog "WARN" "$profileDir still locked after removal attempt and could not be queued"
@@ -692,9 +758,63 @@ if ($svcExists) {
         Write-DebugLog "INFO" "Profile folder deleted: $profileDir"
     }
 
+    # Strip our account from the logon rights before deleting it. Windows otherwise
+    # leaves a dangling SID behind: 21 install/uninstall cycles had accumulated 21
+    # orphaned SIDs in SeServiceLogonRight and SeBatchLogonRight (RIDs …1004-…1024),
+    # which secedit then reports as unresolvable "*S-1-5-21-…" entries.
+    try {
+        $secInf = Join-Path $env:TEMP "seedbox_uninstall_secedit.inf"
+        & secedit /export /cfg $secInf /quiet 2>&1 | Out-Null
+        if (Test-Path $secInf) {
+            $secLines   = [System.IO.File]::ReadAllLines($secInf)
+            $secOut     = New-Object System.Collections.Generic.List[string]
+            $secChanged = 0
+            foreach ($ln in $secLines) {
+                if ($ln -match '^(SeServiceLogonRight|SeBatchLogonRight)\s*=\s*(.*)$') {
+                    $rightName = $matches[1]
+                    $entries   = @($matches[2] -split ',' | Where-Object { $_.Trim() -ne '' })
+                    $kept      = @($entries | Where-Object {
+                        $e = $_.Trim().TrimStart('*')
+                        -not ($e -eq $svcSid -or $e -eq $svcUser)
+                    })
+                    if ($kept.Count -ne $entries.Count) {
+                        $secChanged++
+                        $secOut.Add("$rightName = " + ($kept -join ','))
+                        Write-DebugLog "INFO" "Logon right ${rightName}: removed $svcUser ($($entries.Count) -> $($kept.Count) entries)"
+                    } else {
+                        $secOut.Add($ln)
+                    }
+                } else {
+                    $secOut.Add($ln)
+                }
+            }
+            if ($secChanged -gt 0) {
+                [System.IO.File]::WriteAllLines($secInf, $secOut.ToArray(), [System.Text.Encoding]::Unicode)
+                $secDb = Join-Path $env:TEMP 'seedbox_uninstall_secedit.sdb'
+                & secedit /configure /db $secDb /cfg $secInf /areas USER_RIGHTS /quiet 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-DebugLog "INFO" "Logon rights cleaned of $svcUser"
+                } else {
+                    Write-DebugLog "WARN" "secedit /configure for the logon rights returned $LASTEXITCODE"
+                }
+                Remove-Item $secDb -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item $secInf -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-DebugLog "WARN" "Could not strip $svcUser from the logon rights: $_"
+    }
+
     Remove-LocalUser -Name $svcUser -ErrorAction SilentlyContinue
-    Write-Host "  -> seedbox-svc account removed." -ForegroundColor Yellow
-    Write-DebugLog "INFO" "Local user account removed: $svcUser"
+    if (Get-LocalUser -Name $svcUser -ErrorAction SilentlyContinue) {
+        # A surviving account still holds ServiceAccountPassword from config.json,
+        # and its profile folders keep being created on every service start.
+        Write-Warning "  -> seedbox-svc account could NOT be removed (it still exists)."
+        Write-DebugLog "ERROR" "Local user account $svcUser still present after Remove-LocalUser"
+    } else {
+        Write-Host "  -> seedbox-svc account removed." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Local user account removed: $svcUser"
+    }
 }
 
 # Every cycle leaves the previous profile behind: its hive stays mapped until the
@@ -702,22 +822,53 @@ if ($svcExists) {
 # .001, and so on. Handling only the current profile therefore leaves one dead
 # 2.6 MB tree per cycle (measured: five of them after five cycles). Sweep every
 # one, including the ones earlier cycles created.
+#
+# The sweep must never touch a profile that belongs to a logged-on human. Comparing
+# only $env:USERPROFILE covers the account this process runs as, which is NOT
+# always the interactive one: the uninstaller is normally elevated from a different
+# administrator account, so the console user has to be resolved and protected
+# explicitly.
+$protectedProfiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($protectedPath in @($env:USERPROFILE, [Environment]::GetFolderPath('UserProfile'), $profileDir)) {
+    if (-not [string]::IsNullOrWhiteSpace($protectedPath)) { [void]$protectedProfiles.Add($protectedPath.TrimEnd('\')) }
+}
+$consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+if ($consoleUser) {
+    try {
+        $consoleSid = (New-Object System.Security.Principal.NTAccount($consoleUser)).Translate(
+                          [System.Security.Principal.SecurityIdentifier]).Value
+        $consoleKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$consoleSid"
+        $consolePath = (Get-ItemProperty -Path $consoleKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+        if (-not [string]::IsNullOrWhiteSpace($consolePath)) { [void]$protectedProfiles.Add($consolePath.TrimEnd('\')) }
+        Write-DebugLog "VAR console user $consoleUser profile $consolePath is protected from the sweep"
+    } catch {
+        Write-DebugLog "VAR console user $consoleUser profile could not be resolved: $_"
+    }
+}
 $leftoverProfiles = @(Get-ChildItem -Path 'C:\Users' -Directory -Filter "$svcUser*" -Force -ErrorAction SilentlyContinue |
-                      Where-Object { $_.FullName -ne $profileDir -and $_.FullName -ne $env:USERPROFILE })
+                      Where-Object { -not $protectedProfiles.Contains($_.FullName.TrimEnd('\')) })
 if ($leftoverProfiles.Count -gt 0) {
     $sweepDeleted = 0
     $sweepQueued  = 0
+    $sweepPending = 0
     foreach ($dir in $leftoverProfiles) {
         if (-not (Test-Path -LiteralPath $dir.FullName)) { continue }
         Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $dir.FullName) {
-            try { $sweepQueued += Register-PathForDeletionAtReboot -Path $dir.FullName } catch { }
+            try {
+                $registration = Register-PathForDeletionAtReboot -Path $dir.FullName
+                $sweepQueued  += $registration.Queued
+                $sweepPending += $registration.AlreadyQueued
+            } catch { }
         } else {
             $sweepDeleted++
         }
     }
-    Write-Host "  -> Removed $sweepDeleted stale $svcUser profile folder(s) from earlier cycles$(if ($sweepQueued -gt 0) { "; queued $sweepQueued entries for the remaining locked one(s)" })." -ForegroundColor Yellow
-    Write-DebugLog "INFO" "Stale $svcUser profile sweep: deleted=$sweepDeleted queuedEntries=$sweepQueued of $($leftoverProfiles.Count) folder(s)"
+    $sweepNote = ""
+    if ($sweepQueued -gt 0)  { $sweepNote = "; queued $sweepQueued entries for the remaining locked one(s)" }
+    elseif ($sweepPending -gt 0) { $sweepNote = "; the remaining one(s) were already queued by an earlier run" }
+    Write-Host "  -> Removed $sweepDeleted stale $svcUser profile folder(s) from earlier cycles$sweepNote." -ForegroundColor Yellow
+    Write-DebugLog "INFO" "Stale $svcUser profile sweep: deleted=$sweepDeleted queuedEntries=$sweepQueued alreadyQueuedEntries=$sweepPending of $($leftoverProfiles.Count) folder(s)"
 }
 
 # -- Done ----------------------------------------------------------------------

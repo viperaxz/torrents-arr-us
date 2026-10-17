@@ -284,8 +284,18 @@ foreach ($upd in $updates) {
 
     if ($res.Status -eq "OK" -and $res.Target) {
         # Keep the legacy lock file in sync (the ledger remains the source of truth).
+        # BOM-free: every other lock writer in the project writes UTF8Encoding($false)
+        # and the lock content is compared as a bare version string.
         $lockFile = Join-Path $LocksDir ".$($upd.App.ToLower()).lock"
-        [System.IO.File]::WriteAllText($lockFile, $res.Target, [System.Text.Encoding]::UTF8)
+        try {
+            if (-not (Test-Path $LocksDir)) { New-Item -Path $LocksDir -ItemType Directory -Force | Out-Null }
+            [System.IO.File]::WriteAllText($lockFile, $res.Target, (New-Object System.Text.UTF8Encoding($false)))
+        } catch {
+            # The ledger already holds the version; a failed mirror write must not
+            # abort the remaining updates (which are still queued behind this entry).
+            Write-Warning "    $($upd.App) updated, but the legacy lock file could not be written: $_"
+            Write-DebugLog "WARN" "Could not write $lockFile : $_"
+        }
         Write-Host "    $($upd.App) updated to $($res.Target)." -ForegroundColor Green
         Write-DebugLog "INFO" "$($upd.App) successfully updated to $($res.Target)"
     } elseif ($res.Status -eq "SKIPPED") {

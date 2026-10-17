@@ -149,19 +149,22 @@ if ($Layer2Config.RootFolders -and $Layer2Config.RootFolders.Count -gt 0) {
 }
 
 # -- 5. Configure Download Clients ---------------------------------------------
-if ($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0) {
+# Deluge password written by 07_deluge.ps1 / configure_layer1_deluge.ps1.
+# A missing file must skip this section only: naming, media management, the
+# Jellyfin notification and the refresh hook do not depend on Deluge, and this
+# block used to "return" -- silently skipping all of them.
+$DelugeAuthFile = Join-Path $Config.General.InstallDir "secrets\deluge_auth.txt"
+Write-DebugLog "VAR DelugeAuthFile=$DelugeAuthFile (exists=$(Test-Path $DelugeAuthFile))"
+$DelugeAuthOk = Test-Path $DelugeAuthFile
+if (-not $DelugeAuthOk -and $Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0) {
+    Write-Warning "[$AppName] Deluge auth file not found at '$DelugeAuthFile'. Download client NOT configured."
+    Write-Warning "     Run configure_layer1_deluge.ps1 first, then re-run this script to add the download client."
+    Write-DebugLog "WARN" "Deluge auth file not found -- skipping download client config"
+}
+if ($DelugeAuthOk -and $Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0) {
     Write-Host "  -> Configuring download clients..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Configuring $($Layer2Config.DownloadClients.Count) download client(s)..."
 
-    # Read Deluge password written by 07_deluge.ps1 / configure_layer1_deluge.ps1
-    $DelugeAuthFile = Join-Path $Config.General.InstallDir "secrets\deluge_auth.txt"
-    Write-DebugLog "VAR DelugeAuthFile=$DelugeAuthFile (exists=$(Test-Path $DelugeAuthFile))"
-    if (-not (Test-Path $DelugeAuthFile)) {
-        Write-Warning "[$AppName] Deluge auth file not found at '$DelugeAuthFile'. Download client NOT configured."
-        Write-Warning "     Run configure_layer1_deluge.ps1 first, then re-run this script to add the download client."
-        Write-DebugLog "WARN" "Deluge auth file not found -- skipping download client config"
-        return
-    }
     $DelugePassword = (Get-Content -Path $DelugeAuthFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
     Write-DebugLog "VAR DelugePassword loaded (length=$($DelugePassword.Length)) [REDACTED]"
 
@@ -494,7 +497,10 @@ if ($Config.Apps.Jellyfin -eq $true) {
                         "host"          { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value '127.0.0.1'        -Force }
                         "port"          { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value ([int]$JellyfinPort) -Force }
                         "apiKey"        { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $JellyfinApiKey    -Force }
-                        "ssl"           { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $false             -Force }
+                        # The MediaBrowser schema calls this field useSsl; matching "ssl"
+                        # here was dead code, so a Jellyfin notification created after
+                        # someone enabled SSL kept talking HTTPS to the plain-HTTP port.
+                        "useSsl"        { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $false             -Force }
                         "urlBase"       { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $JellyfinUrlBase   -Force }
                         "updateLibrary" { $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $true              -Force }
                     }
@@ -797,8 +803,25 @@ if ((Test-Path $RefreshScriptSrc) -and $Config.Apps.Jellyfin -eq $true) {
                     Write-DebugLog "INFO" "Jellyfin refresh custom script registered in Sonarr"
                 }
             } else {
-                Write-Host "     ~ Jellyfin series refresh hook already registered." -ForegroundColor DarkGray
-                Write-DebugLog "INFO" "Jellyfin refresh hook already exists"
+                # Already registered against the right path. Sonarr v4 has no
+                # per-connection "enable" flag, so the only way this hook can end up
+                # inert is an "On Download" toggle switched off in the UI -- in that
+                # case reporting "already registered" would be a silent no-op.
+                if ($hookExists.onDownload -ne $true -or $hookExists.onUpgrade -ne $true) {
+                    $hookExists.onDownload = $true
+                    $hookExists.onUpgrade  = $true
+                    Invoke-RestMethod `
+                        -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification/$($hookExists.id)" `
+                        -Method Put `
+                        -Headers @{"X-Api-Key"=$ApiKey; "Content-Type"="application/json"} `
+                        -Body ($hookExists | ConvertTo-Json -Depth 10 -Compress) `
+                        -UseBasicParsing -ErrorAction Stop | Out-Null
+                    Write-Host "     [OK] Jellyfin series refresh hook re-enabled for On Download/On Upgrade." -ForegroundColor Green
+                    Write-DebugLog "INFO" "Jellyfin refresh hook re-enabled (onDownload/onUpgrade was off)"
+                } else {
+                    Write-Host "     ~ Jellyfin series refresh hook already registered." -ForegroundColor DarkGray
+                    Write-DebugLog "INFO" "Jellyfin refresh hook already exists"
+                }
             }
         } catch {
             Write-Warning "     Jellyfin series refresh hook NOT registered: $_"

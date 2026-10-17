@@ -9,7 +9,7 @@
 # Each app must have UrlBase/BaseUrl configured to match its path prefix.
 # TLS_BLOCK is replaced by the installer with either:
 #   tls internal                    (testing — Caddy local CA)
-#   tls {$TLS_EMAIL}               (production — Let's Encrypt HTTP-01)
+#   tls <email>                     (production — Let's Encrypt HTTP-01)
 
 {$DUCKDNS_HOST} {
     {$TLS_BLOCK}

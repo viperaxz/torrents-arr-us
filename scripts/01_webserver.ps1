@@ -287,8 +287,11 @@ if ($DomainMode -eq "cloudflare") {
         Write-DebugLog "VAR Cloudflare token file=$TokenFile"
 
         # Build subdomain list from enabled apps (Flaresolverr is internal-only)
+        # Grafana belongs here even though 14_grafana.ps1 also appends it: that script
+        # exits early once its lock file exists, so this regenerated updater is the only
+        # thing that keeps the grafana record fresh on every later install run.
         $cfSubdomains = @('""')
-        foreach ($k in @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr")) {
+        foreach ($k in @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr","Grafana")) {
             if ($Config.Apps.$k -eq $true) { $cfSubdomains += "`"$($k.ToLower())`"" }
         }
         if ($LlmEnabled) { $cfSubdomains += "`"$($LlmSubdomain.ToLower())`"" }
@@ -382,7 +385,7 @@ try {
     `$raw = (Invoke-WebRequest -Uri `$url -UseBasicParsing).Content
     `$res = if (`$raw -is [byte[]]) { [Text.Encoding]::UTF8.GetString(`$raw).Trim() } else { ([string]`$raw).Trim() }
     if (`$res -eq "OK") { Write-Output "DuckDNS updated: `$domain -> `$ip" }
-    else { Write-Error "DuckDNS returned: `$res" }
+    else { Write-Error "DuckDNS returned: `$res"; exit 1 }
 } catch { Write-Error "DuckDNS update failed: `$_"; exit 1 }
 "@
         Set-Content -Path $UpdaterPath -Value $UpdaterContent -Encoding UTF8
@@ -491,7 +494,9 @@ if (-not (Test-Path $DashTemplatePath)) {
         $cards += "      <div class=`"app-name`">$($a.Name)</div>"
         $cards += "    </a>"
     }
-    if ($LlmEnabled -and $DomainMode -eq "cloudflare") {
+    if ($LlmEnabled -and $DomainMode -eq "cloudflare" -and $LlmExposeUi) {
+        # Only when the UI is published: with LLM.ExposeUi=false the site answers
+        # nothing but /v1/*, so a card would only land on the 404 catch-all.
         $llmUrl = "https://$($LlmSubdomain.ToLower()).$cfgDomain"
         $cards += "    <a href=`"$llmUrl`" class=`"card`" target=`"_blank`">"
         $cards += "      <div class=`"badge`" style=`"background:#00d26a33;color:#00d26a`">LLM</div>"
@@ -527,6 +532,12 @@ if (-not (Test-Path $TemplatePath)) {
 }
 
 # Build TLS block
+if (@("internal", "letsencrypt", "letsencrypt-staging") -notcontains $TlsMode) {
+    # The switch below falls back to 'tls internal'.  Say so: a typo here silently
+    # downgrades a public site to Caddy's local CA and every browser warns about it.
+    Write-Warning "[WebServer] Unrecognised TlsMode '$TlsMode' -- falling back to 'tls internal' (Caddy's local CA). Valid values: letsencrypt, letsencrypt-staging, internal."
+    Write-DebugLog "WARN" "Unrecognised TlsMode='$TlsMode'; rendering 'tls internal'"
+}
 $TlsBlock = switch ($TlsMode) {
     "internal"       { "tls internal" }
     "letsencrypt"    { "tls $($Config.General.TlsEmail)" }
@@ -777,8 +788,18 @@ Write-DebugLog "INFO" "Caddyfile written to $CaddyfilePath (size=$($Content.Leng
 # Normalize formatting so Caddy's startup warning ("not formatted") is suppressed.
 # caddy fmt tolerates syntactic errors (it always exits 0 on a malformed file), so the
 # exit code is only useful for "file missing"-class failures -- log it either way.
-& $caddyExe fmt --overwrite $CaddyfilePath 2>$null
-$fmtExit = $LASTEXITCODE
+# Caddy writes those failures to stderr, and with EAP=Stop (inherited from
+# master_install.ps1) a native stderr line becomes a terminating NativeCommandError:
+# the guard below is what makes the warning path reachable at all.
+$savedEap = $ErrorActionPreference
+$fmtExit  = 0
+try {
+    $ErrorActionPreference = "Continue"
+    & $caddyExe fmt --overwrite $CaddyfilePath 2>&1 | Out-Null
+    $fmtExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedEap
+}
 Write-DebugLog "INFO" "Caddyfile formatted (caddy fmt, exit=$fmtExit)"
 if ($fmtExit -ne 0) {
     Write-Warning "[WebServer] caddy fmt failed (exit $fmtExit). Check $CaddyfilePath."

@@ -60,11 +60,42 @@ $ErrorActionPreference = "Continue"
 
 $CsCli      = "C:\Program Files\CrowdSec\cscli.exe"
 $ConfigPath = Join-Path (Split-Path $PSScriptRoot -Parent) "config.json"
+$centralDecisions = @()   # filled by the report below, reused by the -Ip action
 
 function Write-Section($text) {
     Write-Host ""
     Write-Host "== $text " -ForegroundColor Cyan -NoNewline
     Write-Host ("=" * [Math]::Max(0, 66 - $text.Length)) -ForegroundColor Cyan
+}
+
+function Test-AddressInRange {
+    # True when $Address falls inside $Range (a bare IP or a CIDR).  String
+    # matching is not enough here: firewall RemoteAddress values are mostly
+    # CIDRs, so "-eq <the unban address>" never matches the rule that actually
+    # covers it, while "-like '<first three octets>.*'" also matches unrelated
+    # neighbours in the same /24 (and unblocks them).
+    param([string]$Address, [string]$Range)
+    if (-not $Address -or -not $Range) { return $false }
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$addr)) { return $false }
+    $parts = $Range -split '/', 2
+    $net   = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$net)) { return $false }
+    if ($net.AddressFamily -ne $addr.AddressFamily) { return $false }
+    $maxLen = if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { 128 } else { 32 }
+    $len    = $maxLen
+    if ($parts.Count -gt 1 -and -not [int]::TryParse($parts[1], [ref]$len)) { return $false }
+    if ($len -lt 0 -or $len -gt $maxLen) { return $false }
+    $a = $net.GetAddressBytes()
+    $b = $addr.GetAddressBytes()
+    $full = [int][Math]::Floor($len / 8)
+    for ($i = 0; $i -lt $full; $i++) { if ($a[$i] -ne $b[$i]) { return $false } }
+    $rem = $len % 8
+    if ($rem -gt 0) {
+        $mask = [byte](256 - [math]::Pow(2, 8 - $rem))
+        if (($a[$full] -band $mask) -ne ($b[$full] -band $mask)) { return $false }
+    }
+    return $true
 }
 
 # -- Report --------------------------------------------------------------------
@@ -78,25 +109,40 @@ if (-not (Test-Path $CsCli)) {
     Write-Host ("  bouncer : {0}" -f $(if ($bncSvc) { $bncSvc.Status } else { 'not installed' })) -ForegroundColor Gray
 
     try {
-        $raw     = (& $CsCli decisions list -o json 2>$null | Out-String).Trim()
+        # --all is required: Community Blocklist decisions (origin CAPI) are
+        # enforced by the bouncer exactly like local ones, but a plain
+        # `decisions list` hides them.  Reporting "No active decisions" while a
+        # dozen crowdsec-blocklist rules are loaded is the worst possible answer
+        # for a lockout-recovery tool.  The central set is thousands of IPs, so it
+        # is counted rather than listed.
+        $raw     = (& $CsCli decisions list --all -o json 2>$null | Out-String).Trim()
         $decCode = $LASTEXITCODE
         if ($decCode -ne 0) {
             # Never report "no active decisions" when the query itself failed --
             # in a lockout-recovery tool that reads as "you are not banned".
             Write-Host "  Could not query decisions (cscli exited $decCode) -- engine or LAPI may be down." -ForegroundColor Yellow
-        } elseif ($raw -and $raw -ne 'null') {
-            $rows = foreach ($alert in @($raw | ConvertFrom-Json)) {
+        } elseif ($raw -and $raw -ne 'null' -and $raw -ne '[]') {
+            $rows    = [System.Collections.Generic.List[object]]::new()
+            $central = [System.Collections.Generic.List[object]]::new()
+            foreach ($alert in @($raw | ConvertFrom-Json)) {
                 foreach ($d in @($alert.decisions)) {
-                    [pscustomobject]@{
+                    if (-not $d) { continue }
+                    $row = [pscustomobject]@{
                         IP       = $d.value
                         Reason   = $d.scenario
                         Duration = $d.duration
                         Origin   = $d.origin
                     }
+                    if ("$($d.origin)" -in @('CAPI', 'console')) { $central.Add($row) } else { $rows.Add($row) }
                 }
             }
-            if ($rows) { $rows | Format-Table -AutoSize | Out-String | Write-Host }
-            else       { Write-Host "  No active decisions." -ForegroundColor Green }
+            $centralDecisions = @($central)
+            if ($rows.Count -gt 0) { $rows | Format-Table -AutoSize | Out-String | Write-Host }
+            else                   { Write-Host "  No locally-sourced decisions." -ForegroundColor Green }
+            if ($central.Count -gt 0) {
+                Write-Host "  $($central.Count) central decision(s) from the Community Blocklist (origin CAPI)" -ForegroundColor Yellow
+                Write-Host "  are also being enforced; those are managed by the CrowdSec Console, not here." -ForegroundColor DarkGray
+            }
         } else {
             Write-Host "  No active decisions." -ForegroundColor Green
         }
@@ -119,11 +165,25 @@ if ($All) {
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  All CrowdSec decisions cleared." -ForegroundColor Green
             Write-Host "  The bouncer syncs within ~10s; firewall rules clear themselves." -ForegroundColor DarkGray
+            if ($centralDecisions.Count -gt 0) {
+                Write-Host "  $($centralDecisions.Count) central decision(s) (Community Blocklist) are NOT affected --" -ForegroundColor Yellow
+                Write-Host "  those are managed by the CrowdSec Console." -ForegroundColor Yellow
+            }
         } else {
             Write-Host "  cscli exited $LASTEXITCODE -- decisions may not have cleared." -ForegroundColor Yellow
         }
     } else {
         Write-Host "  CrowdSec not installed -- nothing to clear." -ForegroundColor Yellow
+    }
+}
+
+# A typo must not reach cscli, the firewall rules, or config.json.
+if ($Ip) {
+    $parsedIp = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$parsedIp)) {
+        Write-Host ""
+        Write-Host "  '$Ip' is not a valid IP address -- nothing changed." -ForegroundColor Yellow
+        $Ip = $null
     }
 }
 
@@ -134,6 +194,10 @@ if ($Ip) {
         & $CsCli decisions delete --ip $Ip
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  CrowdSec decision(s) removed for $Ip." -ForegroundColor Green
+        } elseif (@($centralDecisions | Where-Object { $_.IP -eq $Ip }).Count -gt 0) {
+            Write-Host "  $Ip is banned by the Community Blocklist (origin CAPI)." -ForegroundColor Yellow
+            Write-Host "  Those decisions are managed centrally and cannot be deleted on this box --" -ForegroundColor DarkGray
+            Write-Host "  override it in the CrowdSec Console, or wait for it to expire." -ForegroundColor DarkGray
         } else {
             Write-Host "  cscli exited $LASTEXITCODE for $Ip (may simply not have been banned)." -ForegroundColor DarkGray
         }
@@ -145,8 +209,8 @@ if ($Ip) {
     foreach ($rule in @(Get-NetFirewallRule -DisplayName "Seedbox-Abuse-Blocklist*" -ErrorAction SilentlyContinue)) {
         $filter  = $rule | Get-NetFirewallAddressFilter
         $remotes = @($filter.RemoteAddress)
-        $match   = $remotes | Where-Object { $_ -eq $Ip -or $_ -like "$($Ip.Split('.')[0..2] -join '.').*" }
-        if ($match) {
+        $match   = @($remotes | Where-Object { Test-AddressInRange -Address $Ip -Range $_ })
+        if ($match.Count -gt 0) {
             $hit = $true
             Write-Host "  Found in $($rule.DisplayName): $($match -join ', ')" -ForegroundColor Yellow
             $kept = @($remotes | Where-Object { $_ -notin $match })
@@ -201,6 +265,13 @@ if ($Ip) {
                         $start    = $m.Groups['items'].Index
                         $newJson  = $rawJson.Substring(0, $start) + $newItems +
                                     $rawJson.Substring($start + $m.Groups['items'].Length)
+                    } elseif ($rawJson -match '"ExtraWhitelistIps"\s*:') {
+                        # The key exists, but not as a JSON array (e.g. a bare string).
+                        # Adding a second "ExtraWhitelistIps" key parses fine -- the
+                        # last one wins -- and the verification below would pass, so
+                        # the operator's original value would be lost silently. Refuse.
+                        Write-Host "  Security.ExtraWhitelistIps exists but is not a JSON array -- nothing written." -ForegroundColor Yellow
+                        Write-Host "  Add `"$Ip`" to it by hand; the value must be an array: [`"$Ip`"]" -ForegroundColor Gray
                     } else {
                         # Security block present but no ExtraWhitelistIps key.
                         $m = [regex]::Match($rawJson, '("Security"\s*:\s*\{)')

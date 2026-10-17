@@ -122,9 +122,12 @@ function Invoke-LokiQuery {
         $startNs = [string]([long]([DateTimeOffset]::new($Since.ToUniversalTime(), [TimeSpan]::Zero).ToUnixTimeMilliseconds()) * 1000000)
         $endNs   = [string]([long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) * 1000000)
         $q       = '{job="' + $Job + '"} |~ "' + $Filter + '"'
-        $resp    = Invoke-RestMethod "$LokiUrl/loki/api/v1/query_range" `
-                       -Body @{ query = $q; start = $startNs; end = $endNs; limit = 100 } `
-                       -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+        # Query parameters go in the URL: Loki (Go) parses the URL query for a GET
+        # and only reads the form body for POST, so passing -Body on the default GET
+        # sent a request with no query/start/end at all -- it answered 400, the catch
+        # swallowed it, and the LogDelivery check always claimed "not yet seen in Loki".
+        $uri = "$LokiUrl/loki/api/v1/query_range?query=$([uri]::EscapeDataString($q))&start=$startNs&end=$endNs&limit=100"
+        $resp    = Invoke-RestMethod $uri -Method Get -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
         return @($resp.data.result | ForEach-Object { $_.values } | ForEach-Object { $_[1] })
     } catch { return @() }
 }

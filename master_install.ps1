@@ -504,17 +504,30 @@ if (Test-Path $suiteScript) {
 
 # -- Register 'box' CLI in system PATH ----------------------------------------
 $projectRoot    = $PSScriptRoot
-$machinePath    = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$pathEntries    = $machinePath -split ";" | Where-Object { $_.Trim() -ne "" }
-$alreadyInPath  = $pathEntries | Where-Object { $_.TrimEnd('\') -eq $projectRoot.TrimEnd('\') }
-if (-not $alreadyInPath) {
-    $newPath = ($pathEntries + $projectRoot) -join ";"
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "Machine")
+# Written against the registry (not [Environment]::SetEnvironmentVariable) so the
+# value's type survives: that API rewrites an ExpandString PATH as a plain String,
+# which would stop every %VAR% entry (e.g. %SystemRoot%\system32) from expanding.
+# master_uninstall.ps1's Remove-MachinePathEntry removes the same entry the same way.
+$pathKey        = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+$pathKind       = 'String'
+$machinePath    = $null
+try {
+    $pathKind    = (Get-Item $pathKey -ErrorAction Stop).GetValueKind('Path')
+    $machinePath = (Get-ItemProperty -Path $pathKey -Name Path -ErrorAction Stop).Path
+} catch {
+    Write-Warning "  Could not read the Machine PATH from the registry: $_"
+    Write-DebugLog "WARN" "Machine PATH read failed: $_"
+}
+$pathEntries    = if ($machinePath) { @($machinePath -split ';' | Where-Object { $_.Trim() -ne "" }) } else { @() }
+$alreadyInPath  = $pathEntries | Where-Object { $_.Trim().Trim('"').TrimEnd('\') -eq $projectRoot.TrimEnd('\') }
+if ($machinePath -and -not $alreadyInPath) {
+    $valueType = if ($pathKind -eq 'ExpandString') { 'ExpandString' } else { 'String' }
+    Set-ItemProperty -Path $pathKey -Name Path -Value (($pathEntries + $projectRoot) -join ';') -Type $valueType -ErrorAction Stop
     $env:Path = $env:Path + ";$projectRoot"
     Write-Host "  'box' command registered (project dir added to PATH)." -ForegroundColor DarkGray
     Write-Host "  Open a new terminal and run: box update | box check | box uninstall" -ForegroundColor DarkGray
-    Write-DebugLog "INFO" "Project dir added to Machine PATH: $projectRoot"
-} else {
+    Write-DebugLog "INFO" "Project dir added to Machine PATH ($valueType): $projectRoot"
+} elseif ($machinePath) {
     Write-DebugLog "INFO" "Project dir already in Machine PATH: $projectRoot"
 }
 
@@ -534,6 +547,32 @@ if ($Config.Apps.Grafana -eq $true) {
             Write-Warning "  Alloy did not restart -- log shipping may be incomplete."
             Write-DebugLog "WARN" "Alloy restart failed: service is $($alloySvc.Status)"
         }
+    }
+}
+
+# Restart CrowdSec last, for the same reason as Alloy but with a sharper edge:
+# its file acquisition anchors each source at EOF on startup and remembers a byte
+# offset. The install recreates D:\MediaServer\logs\caddy-access.log while CrowdSec
+# is already running, so the offset ends up past the new EOF and the tail silently
+# reads nothing -- HTTP detection (the only source covering every proxied app) goes
+# dark while the service still looks healthy. Re-anchoring at the end of the install
+# is the fix; verified live: 6 lines read, 6 parsed by crowdsecurity/caddy-logs.
+$csSvc = Get-Service -Name "Crowdsec" -ErrorAction SilentlyContinue
+if ($csSvc) {
+    $caddyAccessLog = Join-Path $Config.General.InstallDir "logs\caddy-access.log"
+    Write-Host "  Restarting CrowdSec so its log tail re-anchors to the final files..." -ForegroundColor DarkGray
+    $null = Restart-ServiceBounded -Name "Crowdsec"
+    Start-Sleep -Seconds 5
+    $csSvc = Get-Service -Name "Crowdsec" -ErrorAction SilentlyContinue
+    if ($csSvc -and $csSvc.Status -eq "Running") {
+        if (Test-Path $caddyAccessLog) {
+            Write-DebugLog "INFO" "CrowdSec restarted post-install; tail re-anchored to $caddyAccessLog"
+        } else {
+            Write-DebugLog "WARN" "CrowdSec restarted but $caddyAccessLog does not exist -- HTTP detection has no source"
+        }
+    } else {
+        Write-Warning "  CrowdSec did not restart -- HTTP attack detection may be inactive."
+        Write-DebugLog "WARN" "CrowdSec restart failed: service is $(if ($csSvc) { $csSvc.Status } else { 'missing' })"
     }
 }
 
@@ -578,7 +617,6 @@ if ($DomainMode -eq "cloudflare") {
         Write-Host "  Dashboard:    https://$DuckHost/dashboard"              -ForegroundColor Cyan
     } else {
         Write-Host "  Dashboard:    https://$DuckHost"                        -ForegroundColor Cyan
-        Write-Host "                https://$DuckHost/dashboard (Jellyseerr is disabled)" -ForegroundColor DarkGray
     }
     if ($Config.Apps.Jellyfin    -eq $true) { Write-Host "  Jellyfin:     https://$DuckHost/jellyfin"              -ForegroundColor Cyan }
     if ($Config.Apps.Sonarr      -eq $true) { Write-Host "  Sonarr:       https://$DuckHost/sonarr"                -ForegroundColor Cyan }

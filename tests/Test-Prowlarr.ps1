@@ -32,6 +32,25 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
         }
     }
 
+    # config.xml is what Prowlarr actually binds to; Ports.Prowlarr / DomainMode in
+    # config.json only say what the install was supposed to set. A mismatch means
+    # every Caddy and Layer 1/2 URL points at a port or path Prowlarr does not serve,
+    # which looks like "the app is down" from every other component.
+    if (Test-Path 'C:\ProgramData\Prowlarr\config.xml') {
+        try {
+            $cfgXml  = [xml](Get-Content 'C:\ProgramData\Prowlarr\config.xml' -Encoding UTF8 -ErrorAction Stop)
+            $xmlPort = [string]$cfgXml.Config.Port
+            $expPort = [string]$Config.Ports.Prowlarr
+            $Script:Results.Add((New-TestResult $svc 1 'ConfigXmlPort' $(if ($xmlPort -eq $expPort) { 'PASS' } else { 'FAIL' }) "config.xml Port=$xmlPort, config.json Ports.Prowlarr=$expPort"))
+            $xmlBase = [string]$cfgXml.Config.UrlBase
+            $Script:Results.Add((New-TestResult $svc 1 'ConfigXmlUrlBase' $(if ($xmlBase -eq $base) { 'PASS' } else { 'FAIL' }) "config.xml UrlBase='$xmlBase', expected '$base' for $($Config.General.DomainMode) mode"))
+        } catch {
+            $Script:Results.Add((New-TestResult $svc 1 'ConfigXmlPort' 'FAIL' "Cannot read config.xml: $_"))
+        }
+    } else {
+        $Script:Results.Add((New-TestResult $svc 1 'ConfigXmlPort' 'FAIL' 'C:\ProgramData\Prowlarr\config.xml not found'))
+    }
+
     $nssm = Get-Service 'Prowlarr' -ErrorAction SilentlyContinue
     $Script:Results.Add((New-TestResult $svc 1 'ServiceRunning' $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) 'NSSM service state'))
 
@@ -64,8 +83,29 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
     if ($Config.Apps.Flaresolverr -eq $true) {
         $proxies = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/indexerproxy" $hdr -TimeoutSec 8
         if ($proxies.ok) {
-            $fsReg = @($proxies.data | Where-Object { $_.implementation -match 'FlareSolverr|flaresolverr' }).Count -gt 0
+            $fsProxy = @($proxies.data | Where-Object { $_.implementation -match 'FlareSolverr|flaresolverr' })[0]
+            $fsReg = $null -ne $fsProxy
             $Script:Results.Add((New-TestResult $svc 2 'FlareSolverrProxy' $(if ($fsReg) { 'PASS' } else { 'FAIL' }) 'FlareSolverr proxy registered in Prowlarr'))
+
+            # A proxy is only used for indexers whose tag list intersects its own
+            # (IndexerProxyDefinition.Enable => Tags.Any(), and the indexer client
+            # intersects the lists). An untagged proxy -- or a proxy whose tag no
+            # indexer carries -- is stored, reported as registered, and never applied:
+            # every Cloudflare-protected indexer then fails with
+            # "Cloudflare protection detected ... Flaresolverr may be required".
+            if ($fsReg) {
+                $proxyTags  = @($fsProxy.tags | Where-Object { $null -ne $_ })
+                $taggedIdx  = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v1/indexer" $hdr -TimeoutSec 8
+                if ($taggedIdx.ok) {
+                    $shared = @($taggedIdx.data | Where-Object {
+                        @($_.tags | Where-Object { $proxyTags -contains $_ }).Count -gt 0
+                    }).Count
+                    $wired = ($proxyTags.Count -gt 0 -and $shared -gt 0)
+                    $Script:Results.Add((New-TestResult $svc 2 'FlareSolverrTagWiring' $(if ($wired) { 'PASS' } else { 'FAIL' }) "proxy tags=[$($proxyTags -join ',')], $shared indexer(s) share a proxy tag"))
+                } else {
+                    $Script:Results.Add((New-TestResult $svc 2 'FlareSolverrTagWiring' 'FAIL' $taggedIdx.error))
+                }
+            }
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'FlareSolverrProxy' 'FAIL' $proxies.error))
         }

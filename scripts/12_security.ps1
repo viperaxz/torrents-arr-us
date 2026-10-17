@@ -21,6 +21,10 @@ $AppName    = "Security"
 $InstallDir = $Config.General.InstallDir
 $LockFile   = Join-Path $InstallDir ".locks\.security.lock"
 $ScriptsDir = $PSScriptRoot
+# Every helper a scheduled task runs is staged here.  A task that points back into
+# the source tree dies silently as soon as that clone is moved or deleted, and the
+# install tree would then be the only thing left with no copy of the script.
+$installScripts = Join-Path $InstallDir "scripts"
 
 # CrowdSec fixed install locations (set by the MSI / chocolatey package)
 $CsProgramDir = "C:\Program Files\CrowdSec"
@@ -76,15 +80,26 @@ Write-DebugLog "VAR ExtraWhitelist=$($ExtraWhitelist -join ',') DoBlocklists=$Do
 # Service names differ slightly between CrowdSec releases; resolve them at runtime
 # instead of hardcoding, so an upstream rename does not silently break the install.
 function Resolve-ServiceName {
-    param([string[]]$Candidates)
+    # -Exclude rejects fuzzy candidates by substring.  Without it the engine lookup
+    # also matches "Crowdsec Windows Firewall Bouncer": on a partial uninstall (the
+    # engine service gone, its binary and config still there) the bouncer would be
+    # resolved as the engine, so the reinstall path is skipped and the *bouncer* is
+    # started/restarted in its place while the install reports the engine running.
+    param([string[]]$Candidates, [string[]]$Exclude)
     foreach ($c in $Candidates) {
         $s = Get-Service -Name $c -ErrorAction SilentlyContinue
         if ($s) { return $s.Name }
     }
     foreach ($c in $Candidates) {
-        $s = Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "*$c*" -or $_.DisplayName -like "*$c*" } |
-            Select-Object -First 1
+        $s = Get-Service -ErrorAction SilentlyContinue | Where-Object {
+                $hn = $_.Name
+                $hd = $_.DisplayName
+                if (-not (($hn -like "*$c*") -or ($hd -like "*$c*"))) { return $false }
+                foreach ($ex in $Exclude) {
+                    if ($ex -and (($hn -like "*$ex*") -or ($hd -like "*$ex*"))) { return $false }
+                }
+                return $true
+            } | Select-Object -First 1
         if ($s) { return $s.Name }
     }
     return $null
@@ -180,7 +195,7 @@ try {
     $configYaml = Join-Path $CsConfigDir "config.yaml"
     $cscliPresent  = Test-Path $CsCli
     $configPresent = Test-Path $configYaml
-    $svcPresent    = (Resolve-ServiceName @("crowdsec", "CrowdSec")) -ne $null
+    $svcPresent    = (Resolve-ServiceName @("crowdsec", "CrowdSec") -Exclude @("bouncer")) -ne $null
     $needsInstall  = (-not $cscliPresent) -or (-not $configPresent) -or (-not $svcPresent)
 
     Write-DebugLog "VAR cscliPresent=$cscliPresent configPresent=$configPresent svcPresent=$svcPresent needsInstall=$needsInstall"
@@ -249,7 +264,7 @@ try {
 
     if (-not (Test-Path $CsCli)) { throw "cscli.exe not found at $CsCli after install" }
 
-    $CrowdSecSvc = Resolve-ServiceName @("crowdsec", "CrowdSec")
+    $CrowdSecSvc = Resolve-ServiceName @("crowdsec", "CrowdSec") -Exclude @("bouncer")
     Write-DebugLog "VAR CrowdSecSvc=$CrowdSecSvc"
     if (-not $CrowdSecSvc) { throw "CrowdSec Windows service not found after install" }
 
@@ -306,17 +321,26 @@ try {
     # (step 1d) extracts the fields the downstream parsers need.
     $logDir          = Join-Path $InstallDir "logs"
     $caddyLogPath    = Join-Path $logDir "caddy-access.log"
+    # CrowdSec tails the RELAY copy, not Caddy's file. Caddy keeps its log open for
+    # writing and CrowdSec's file acquisition on Windows does not see bytes appended
+    # through that handle (measured: 0 lines consumed while real requests piled up;
+    # it only caught up when another process wrote to the file). Seedbox_CaddyLogRelay
+    # copies new complete lines here every minute, and because those bytes come from
+    # a different process CrowdSec consumes them.
+    $caddyRelayPath  = Join-Path $logDir "caddy-access-relay.log"
     $security4625Log = Join-Path $logDir "security-4625.xml"
-    Write-DebugLog "VAR caddyLogPath=$caddyLogPath"
+    Write-DebugLog "VAR caddyLogPath=$caddyLogPath relay=$caddyRelayPath"
     Write-DebugLog "VAR security4625Log=$security4625Log"
 
     $acquis = @"
 # Managed by win-seedbox (scripts/12_security.ps1) -- edits will be overwritten.
 ---
-# Caddy JSON access log. Covers every service behind the reverse proxy:
-# Jellyfin, Sonarr, Radarr, Prowlarr, Bazarr, Deluge Web UI, Jellyseerr, dashboard.
+# Caddy JSON access log, mirrored by Seedbox_CaddyLogRelay. Covers every service
+# behind the reverse proxy: Jellyfin, Sonarr, Radarr, Prowlarr, Bazarr, Deluge Web
+# UI, Jellyseerr, dashboard. Feed this the relay copy, never caddy-access.log
+# itself: see scripts/relay_caddy_log.ps1 for why.
 filenames:
-  - '$caddyLogPath'
+  - '$caddyRelayPath'
 labels:
   type: caddy
 ---
@@ -370,7 +394,6 @@ statics:
     # Copies the export script from the project tree and registers a SYSTEM
     # scheduled task that runs every 5 minutes.
     $exportScriptSrc  = Join-Path $ScriptsDir "export_security_events.ps1"
-    $installScripts   = Join-Path $InstallDir "scripts"
     $exportScriptDst  = Join-Path $installScripts "export_security_events.ps1"
     if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
     Copy-Item -LiteralPath $exportScriptSrc -Destination $exportScriptDst -Force
@@ -394,8 +417,14 @@ statics:
     # afterwards whether the line had run. That is exactly how the missing
     # Seedbox_CrowdSecWhitelistRefresh on this box stayed invisible.
     $evtRegistered = Get-ScheduledTask -TaskName "Seedbox_SecurityEventExport" -ErrorAction SilentlyContinue
-    if ($evtRegistered) {
+    # Present is not the same as armed: a task left Disabled shows up in every query
+    # and never runs. Only Ready (or Running, when it has already fired) is armed.
+    $evtArmed = [bool]($evtRegistered -and ($evtRegistered.State -in @('Ready', 'Running')))
+    if ($evtArmed) {
         Write-DebugLog "INFO" "Seedbox_SecurityEventExport registered (state=$($evtRegistered.State), every 5 min)"
+    } elseif ($evtRegistered) {
+        Write-Warning "     Seedbox_SecurityEventExport exists but is $($evtRegistered.State) -- it will never run."
+        Write-DebugLog "ERROR" "Seedbox_SecurityEventExport present but state=$($evtRegistered.State), expected Ready"
     } else {
         Write-Warning "     Seedbox_SecurityEventExport did NOT register -- CrowdSec gets no event-log feed."
         Write-DebugLog "ERROR" "Seedbox_SecurityEventExport registration did not take effect (Get-ScheduledTask found nothing)"
@@ -403,8 +432,8 @@ statics:
 
     # Run once immediately so CrowdSec has data on first start.
     try { & $exportScriptDst -LogDir $logDir } catch { Write-DebugLog "WARN" "Initial event log export failed: $_" }
-    Write-Host "     Event log export task: $(if ($evtRegistered) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_SecurityEventExport, every 5 min)." `
-        -ForegroundColor $(if ($evtRegistered) { 'DarkGray' } else { 'Yellow' })
+    Write-Host "     Event log export task: $(if ($evtArmed) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_SecurityEventExport, every 5 min)." `
+        -ForegroundColor $(if ($evtArmed) { 'DarkGray' } else { 'Yellow' })
 
     # -- 1f. Whitelist: the anti-lockout guarantee -----------------------------
     # Split into single IPs and CIDRs, because CrowdSec rejects a CIDR in the
@@ -431,14 +460,35 @@ statics:
         Write-DebugLog "WARN" "Could not enumerate local IPs for whitelist: $_"
     }
 
+    # Security.ExtraWhitelistIps is user-supplied and is written verbatim into the
+    # parser file below.  CrowdSec will not load a parser containing a malformed
+    # address, and the whole anti-lockout guarantee lives in that one file (a broken
+    # parser also stops the engine from starting), so invalid entries are dropped
+    # with a warning instead of being written.
+    $wlRejected = 0
     foreach ($extra in $ExtraWhitelist) {
-        $e = [string]$extra
+        $e = ([string]$extra).Trim()
         if (-not $e) { continue }
+        $parsedAddr = $null
         if ($e -match '/') {
-            if (-not $wlCidrs.Contains($e)) { $wlCidrs.Add($e) }
-        } elseif (-not $wlIps.Contains($e)) {
-            $wlIps.Add($e)
+            $parts  = $e -split '/', 2
+            $prefix = 0
+            $addrOk = [System.Net.IPAddress]::TryParse($parts[0], [ref]$parsedAddr)
+            $maxPrefix = if ($addrOk -and $parsedAddr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { 128 } else { 32 }
+            if ($addrOk -and [int]::TryParse($parts[1], [ref]$prefix) -and $prefix -ge 0 -and $prefix -le $maxPrefix) {
+                if (-not $wlCidrs.Contains($e)) { $wlCidrs.Add($e) }
+            } else {
+                $wlRejected++
+            }
+        } elseif ([System.Net.IPAddress]::TryParse($e, [ref]$parsedAddr)) {
+            if (-not $wlIps.Contains($e)) { $wlIps.Add($e) }
+        } else {
+            $wlRejected++
         }
+    }
+    if ($wlRejected -gt 0) {
+        Write-Warning "     Security.ExtraWhitelistIps: $wlRejected invalid entr(y/ies) ignored (not written to the whitelist parser)."
+        Write-DebugLog "WARN" "ExtraWhitelistIps: $wlRejected invalid entries ignored"
     }
 
     $wlIpYaml   = ($wlIps | ForEach-Object {
@@ -498,8 +548,12 @@ $wlCidrYaml
     # that left no evidence. This task is the anti-lockout guard -- without it a WAN
     # IP rotation leaves the operator's old IP whitelisted and the new one bannable.
     $wlRegistered = Get-ScheduledTask -TaskName "Seedbox_CrowdSecWhitelistRefresh" -ErrorAction SilentlyContinue
-    if ($wlRegistered) {
+    $wlArmed = [bool]($wlRegistered -and ($wlRegistered.State -in @('Ready', 'Running')))
+    if ($wlArmed) {
         Write-DebugLog "INFO" "Seedbox_CrowdSecWhitelistRefresh registered (state=$($wlRegistered.State), every 5 min)"
+    } elseif ($wlRegistered) {
+        Write-Warning "     Seedbox_CrowdSecWhitelistRefresh exists but is $($wlRegistered.State) -- a WAN IP change can lock the operator out."
+        Write-DebugLog "ERROR" "Seedbox_CrowdSecWhitelistRefresh present but state=$($wlRegistered.State), expected Ready"
     } else {
         Write-Warning "     Seedbox_CrowdSecWhitelistRefresh did NOT register -- a WAN IP change can lock the operator out."
         Write-DebugLog "ERROR" "Seedbox_CrowdSecWhitelistRefresh registration did not take effect (Get-ScheduledTask found nothing)"
@@ -507,8 +561,8 @@ $wlCidrYaml
 
     # Run once immediately so an IP change right after install is caught.
     try { & $refreshDst } catch { Write-DebugLog "WARN" "Initial whitelist refresh failed: $_" }
-    Write-Host "     Operator-IP whitelist refresh task: $(if ($wlRegistered) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_CrowdSecWhitelistRefresh, every 5 min)." `
-        -ForegroundColor $(if ($wlRegistered) { 'DarkGray' } else { 'Yellow' })
+    Write-Host "     Operator-IP whitelist refresh task: $(if ($wlArmed) { 'registered' } else { 'FAILED TO REGISTER' }) (Seedbox_CrowdSecWhitelistRefresh, every 5 min)." `
+        -ForegroundColor $(if ($wlArmed) { 'DarkGray' } else { 'Yellow' })
 
     # -- 1g. Ban duration profile ---------------------------------------------
     $profiles = @"
@@ -714,7 +768,18 @@ Write-DebugLog "VAR bouncerOk=$bouncerOk"
 if ($DoBlocklists) {
     Write-Host "  [Blocklist] Fetching abuse IP lists (Spamhaus + Firehol)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "=== PHASE 3: Abuse blocklists ==="
-    $blocklistScript = Join-Path $ScriptsDir "update_blocklists.ps1"
+    # Stage the updater next to the other task helpers.  The task used to point
+    # straight at the source tree, so deleting or moving the clone left a 6-hourly
+    # task that failed forever with no trace in the install tree -- and nothing to
+    # run by hand either.
+    $blocklistScript = Join-Path $installScripts "update_blocklists.ps1"
+    try {
+        if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
+        Copy-Item -LiteralPath (Join-Path $ScriptsDir "update_blocklists.ps1") -Destination $blocklistScript -Force
+    } catch {
+        $blocklistScript = Join-Path $ScriptsDir "update_blocklists.ps1"
+        Write-DebugLog "WARN" "Could not stage update_blocklists.ps1 into $installScripts, using ${blocklistScript}: $_"
+    }
     try {
         & $blocklistScript
         # update_blocklists.ps1 exits 1 when no rules could be applied or a rule
@@ -742,7 +807,7 @@ if ($DoBlocklists) {
         -LogonType ServiceAccount -RunLevel Highest
 
     $blAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$blocklistScript`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$blocklistScript`""
     $blTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Hours 6) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -758,6 +823,59 @@ if ($DoBlocklists) {
 } else {
     Write-Host "  [Blocklist] Disabled via Security.AbuseBlocklists." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "Abuse blocklists disabled by config"
+}
+
+# -- 1j. Caddy log relay for CrowdSec ----------------------------------------
+# CrowdSec cannot consume the Caddy access log directly on Windows: Caddy keeps the
+# file open for writing and the acquisition only advances when a different process
+# writes bytes to it (measured: 0 lines while requests piled up, then 8/8 parsed the
+# instant another handle appended). This task mirrors new complete lines into
+# caddy-access-relay.log, which acquis.yaml points at. One minute of latency, which
+# is well inside CrowdSec's ban windows, and no duplicate parsing of the source.
+Write-Host "  -> Registering the Caddy log relay for CrowdSec..." -ForegroundColor Gray
+$relaySrc = Join-Path $ScriptsDir "relay_caddy_log.ps1"
+$relayDst = Join-Path $installScripts "relay_caddy_log.ps1"
+$relayScript = $null
+try {
+    if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
+    Copy-Item -LiteralPath $relaySrc -Destination $relayDst -Force -ErrorAction Stop
+    $relayScript = $relayDst
+} catch {
+    $relayScript = $relaySrc
+    Write-DebugLog "WARN" "Could not stage relay_caddy_log.ps1 into ${installScripts}, using ${relayScript}: $_"
+}
+if ((Test-Path $relayScript) -and $crowdsecOk) {
+    # Run it once now so the relay file exists and CrowdSec has something to tail
+    # before the first scheduled tick.
+    try { & $relayScript -InstallDir $InstallDir } catch { Write-DebugLog "WARN" "Initial relay run failed: $_" }
+
+    $relayAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$relayScript`" -InstallDir `"$InstallDir`""
+    $relayTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $relaySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+    $relayPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+        -LogonType ServiceAccount -RunLevel Highest
+    try {
+        Register-ScheduledTask -TaskName "Seedbox_CaddyLogRelay" `
+            -Action $relayAction -Trigger $relayTrigger `
+            -Settings $relaySettings -Principal $relayPrincipal -Force | Out-Null
+        $relayTask = Get-ScheduledTask -TaskName "Seedbox_CaddyLogRelay" -ErrorAction SilentlyContinue
+        if ($relayTask -and $relayTask.State -in @('Ready', 'Running')) {
+            Write-Host "     OK Caddy log relay registered (every minute, SYSTEM)." -ForegroundColor Green
+            Write-DebugLog "INFO" "Seedbox_CaddyLogRelay registered and armed (state=$($relayTask.State))"
+        } else {
+            Write-Warning "     Caddy log relay task is not armed -- HTTP attack detection will stay idle."
+            Write-DebugLog "ERROR" "Seedbox_CaddyLogRelay registered but state=$(if ($relayTask) { $relayTask.State } else { 'missing' })"
+        }
+    } catch {
+        Write-Warning "     Could not register Seedbox_CaddyLogRelay: $_"
+        Write-DebugLog "ERROR" "Seedbox_CaddyLogRelay registration failed: $_"
+    }
+} else {
+    Write-DebugLog "WARN" "Caddy log relay not registered (relay script present=$(Test-Path $relayScript), crowdsecOk=$crowdsecOk)"
 }
 
 # -- Summary -------------------------------------------------------------------
@@ -785,8 +903,11 @@ $ownedTasks = @("Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh
 if ($DoBlocklists) { $ownedTasks += "Seedbox_Blocklist_Update" }
 foreach ($ownedTask in $ownedTasks) {
     $found = Get-ScheduledTask -TaskName $ownedTask -ErrorAction SilentlyContinue
-    if ($found) {
+    if ($found -and ($found.State -in @('Ready', 'Running'))) {
         Write-DebugLog "VAR task '$ownedTask' registered=True state=$($found.State)"
+    } elseif ($found) {
+        Write-Host "    WARNING: scheduled task '$ownedTask' is $($found.State) -- it will never run." -ForegroundColor Yellow
+        Write-DebugLog "ERROR" "Scheduled task '$ownedTask' is present but state=$($found.State)"
     } else {
         Write-Host "    WARNING: scheduled task '$ownedTask' is not registered." -ForegroundColor Yellow
         Write-DebugLog "ERROR" "Scheduled task '$ownedTask' is not registered"

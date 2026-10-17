@@ -79,6 +79,19 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
                 $proxyTags = @($fsProxies[0].tags)
                 $Script:Results.Add((New-TestResult $svc 2 'ProxyTagged' $(if ($proxyTags.Count -gt 0) { 'PASS' } else { 'FAIL' }) "proxy tags=[$($proxyTags -join ',')] (untagged proxies are ignored by Prowlarr)"))
 
+                # A proxy left on an old port answers nothing, and Prowlarr then
+                # reports every CF-protected indexer as broken rather than the
+                # proxy as misconfigured. Check the endpoint the registration
+                # actually carries against the port this install serves.
+                $proxyHost  = (@($fsProxies[0].fields) | Where-Object { $_.name -eq 'host' } | Select-Object -First 1).value
+                $expectHost = "http://127.0.0.1:$port"
+                $hostOk     = $proxyHost -and ([string]$proxyHost).TrimEnd('/') -ieq $expectHost
+                $Script:Results.Add((New-TestResult $svc 2 'ProxyEndpoint' $(if ($hostOk) { 'PASS' } else { 'FAIL' }) "proxy host='$proxyHost' (expected $expectHost)"))
+
+                # More than one registration is a failed re-run, not a working
+                # setup: the stale copy can shadow the current one.
+                $Script:Results.Add((New-TestResult $svc 2 'SingleProxy' $(if ($fsProxies.Count -eq 1) { 'PASS' } else { 'WARN' }) "$($fsProxies.Count) FlareSolverr proxy definition(s) in Prowlarr"))
+
                 if ($proxyTags.Count -gt 0) {
                     $idxRaw = Invoke-ApiCheck "http://127.0.0.1:$prowlarrPort${pBase}/api/v1/indexer" @{'X-Api-Key'=$prowlarrKey} -TimeoutSec 8
                     if ($idxRaw.ok) {

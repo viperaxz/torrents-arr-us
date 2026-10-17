@@ -34,6 +34,39 @@ if (-not (Get-Command Invoke-Choco -ErrorAction SilentlyContinue)) {
     if (Test-Path $chocoHelpers) { . $chocoHelpers }
 }
 
+# Bounded service stops, loaded for the same reason as the choco helpers: the
+# swap helpers below run in a per-app update script's own process. Stop-Service
+# waits indefinitely on an nssm service wedged in Stop Pending, so using it here
+# is how `box update` could hang forever while install and uninstall stayed
+# bounded (see service_helpers.ps1).
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    $svcHelpers = Join-Path $PSScriptRoot "service_helpers.ps1"
+    if (Test-Path $svcHelpers) { . $svcHelpers }
+}
+
+function Stop-UpdateService {
+    # Stops a service without ever blocking past the bound. Returns $true when the
+    # service is gone or Stopped.
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [int]$TimeoutSeconds = 60
+    )
+    $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $svc) { return $true }
+    $svc.Refresh()
+    if ($svc.Status -eq "Stopped") { return $true }
+    if (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue) {
+        return [bool](Stop-ServiceBounded -Name $Name -TimeoutSeconds $TimeoutSeconds)
+    }
+    try {
+        Stop-Service -Name $Name -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-UcLog "WARN" "Could not stop $Name : $_"
+        return $false
+    }
+}
+
 # -- Ledger helpers ------------------------------------------------------------
 
 function Get-LedgerPath {
@@ -448,7 +481,9 @@ function Swap-AppDirectoryWithRollback {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -eq "Running") {
                 Write-UcLog "INFO" "Stopping service $svcName"
-                Stop-Service -Name $svcName -Force -ErrorAction Stop
+                if (-not (Stop-UpdateService -Name $svcName)) {
+                    throw "service $svcName did not stop within the bound"
+                }
             }
         }
         Start-Sleep -Seconds 2
@@ -569,7 +604,7 @@ function Swap-AppDirectoryWithRollback {
         $err = $_.Exception.Message
         Write-UcLog "WARN" "$AppName swap failed: $err. Rolling back."
         foreach ($svcName in $ServiceNames) {
-            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            $null = Stop-UpdateService -Name $svcName
         }
         Start-Sleep -Seconds 2
         # Only destroy the new content when the previous version was actually
@@ -704,7 +739,9 @@ function Swap-SingleExeWithRollback {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -eq "Running") {
                 Write-UcLog "INFO" "Stopping service $svcName"
-                Stop-Service -Name $svcName -Force -ErrorAction Stop
+                if (-not (Stop-UpdateService -Name $svcName)) {
+                    throw "service $svcName did not stop within the bound"
+                }
             }
         }
         Start-Sleep -Seconds 2
@@ -740,7 +777,7 @@ function Swap-SingleExeWithRollback {
         $err = $_.Exception.Message
         Write-UcLog "WARN" "$AppName exe swap failed: $err. Rolling back."
         foreach ($svcName in $ServiceNames) {
-            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            $null = Stop-UpdateService -Name $svcName
         }
         Start-Sleep -Seconds 2
         # Only touch the live exe when a backup copy exists.

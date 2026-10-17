@@ -120,12 +120,14 @@ if (-not $apiUp) {
 
 # -- 1b. Read current settings (so re-runs do not clobber manual changes) ------
 $CurrentSettings = $null
+$SettingsReadable = $false
 try {
     $CurrentSettings = Invoke-RestMethod -Uri "$ApiBase/api/system/settings" -Method Get `
         -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+    $SettingsReadable = ($null -ne $CurrentSettings)
     Write-DebugLog "INFO" "Read current Bazarr settings for merge"
 } catch {
-    Write-DebugLog "WARN" "Could not read current settings (defaults will be written as-is): $_"
+    Write-DebugLog "WARN" "Could not read current settings: $_"
 }
 
 $ExistingProviders = @()
@@ -225,10 +227,18 @@ $providers = @("opensubtitlescom","yifysubtitles","embeddedsubtitles","gestdown"
 if ($TitloviUser) { $providers += "titlovi" }
 if ($SubdlApiKey) { $providers += "subdl" }
 # Merge with what is already enabled: a re-run must only add providers, never
-# silently disable ones the user turned on in the UI.
-$providers = @(($ExistingProviders + $providers) | Select-Object -Unique)
-$providers | ForEach-Object { $providerParts.Add("settings-general-enabled_providers=$_") }
-Write-DebugLog "VAR enabling providers=$($providers -join ',')"
+# silently disable ones the user turned on in the UI. Bazarr REPLACES the list
+# with whatever is posted, so this is only safe when the current values were
+# actually read.
+if ($SettingsReadable) {
+    $providers = @(($ExistingProviders + $providers) | Select-Object -Unique)
+    $providers | ForEach-Object { $providerParts.Add("settings-general-enabled_providers=$_") }
+    Write-DebugLog "VAR enabling providers=$($providers -join ',')"
+} else {
+    $providers = @()
+    Write-Warning "[$AppName] Current settings could not be read; the enabled-provider list is left untouched."
+    Write-DebugLog "WARN" "provider list not rewritten: current settings unreadable (a partial list would disable the user's providers)"
+}
 if ($OsComUser) {
     $providerParts.Add("settings-opensubtitlescom-username=$([Uri]::EscapeDataString($OsComUser))")
     $providerParts.Add("settings-opensubtitlescom-password=$([Uri]::EscapeDataString($OsComPass))")
@@ -244,17 +254,54 @@ if ($SubdlApiKey) {
     Write-DebugLog "VAR subdl api_key=[REDACTED]"
 }
 
-try {
-    Invoke-BazarrSettings -FormParts $providerParts
-    Write-Host "     OK Providers: $($providers -join ', ')" -ForegroundColor Green
-    Write-Host "                   (titlovi/subdl only when credentials are configured)" -ForegroundColor Green
-    Write-DebugLog "INFO" "Subtitle providers enabled"
-    if (-not $OsComUser)   { Write-Host "     ! Add OpenSubtitles.com credentials in Bazarr Settings for full quota." -ForegroundColor Yellow; Write-DebugLog "INFO" "OpenSubtitles.com credentials not set (optional)" }
-    if (-not $TitloviUser) { Write-Host "     ! Add Titlovi credentials in Bazarr Settings for Romanian subtitles." -ForegroundColor Yellow; Write-DebugLog "INFO" "Titlovi credentials not set (optional)" }
-    if (-not $SubdlApiKey) { Write-Host "     ! Add Layer2.Bazarr.SubdlApiKey to enable the subdl provider." -ForegroundColor Yellow; Write-DebugLog "INFO" "subdl API key not set -- provider disabled (optional)" }
-} catch {
-    Write-Warning "[$AppName] Could not configure providers: $_"
-    Write-DebugLog "ERROR" "Provider configuration failed: $_"
+if ($providerParts.Count -gt 0) {
+    try {
+        Invoke-BazarrSettings -FormParts $providerParts
+        if ($providers.Count -gt 0) {
+            Write-Host "     OK Providers: $($providers -join ', ')" -ForegroundColor Green
+        } else {
+            Write-Host "     OK Provider credentials applied; enabled list left unchanged." -ForegroundColor Green
+        }
+        Write-Host "                   (titlovi/subdl only when credentials are configured)" -ForegroundColor Green
+        Write-DebugLog "INFO" "Subtitle providers enabled"
+        if (-not $OsComUser)   { Write-Host "     ! Add OpenSubtitles.com credentials in Bazarr Settings for full quota." -ForegroundColor Yellow; Write-DebugLog "INFO" "OpenSubtitles.com credentials not set (optional)" }
+        if (-not $TitloviUser) { Write-Host "     ! Add Titlovi credentials in Bazarr Settings for Romanian subtitles." -ForegroundColor Yellow; Write-DebugLog "INFO" "Titlovi credentials not set (optional)" }
+        if (-not $SubdlApiKey) { Write-Host "     ! Add Layer2.Bazarr.SubdlApiKey to enable the subdl provider." -ForegroundColor Yellow; Write-DebugLog "INFO" "subdl API key not set -- provider disabled (optional)" }
+
+        # A credential that IS configured but was REJECTED must stay a WARN: only the
+        # *unset* ones above are optional noise. Bazarr throttles a provider whose
+        # login failed with AuthenticationError/ConfigurationError and /api/providers
+        # reports that reason, so an unset credential is silent while a wrong one is not.
+        $configuredProviders = @()
+        if ($OsComUser)   { $configuredProviders += "opensubtitlescom" }
+        if ($TitloviUser) { $configuredProviders += "titlovi" }
+        if ($SubdlApiKey) { $configuredProviders += "subdl" }
+        if ($configuredProviders.Count -gt 0) {
+            try {
+                $providerStatus = Invoke-RestMethod -Uri "$ApiBase/api/providers" -Method Get `
+                    -Headers $Headers -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+                $rejected = @($providerStatus.data | Where-Object {
+                    $_ -and $_.name -in $configuredProviders -and
+                    $_.status -in @("AuthenticationError", "ConfigurationError", "PaymentRequired")
+                })
+                foreach ($r in $rejected) {
+                    Write-Warning "[$AppName] Configured $($r.name) credentials were REJECTED ($($r.status)). Check the Layer2 credentials in config.json."
+                    Write-DebugLog "WARN" "provider '$($r.name)' rejected its configured credentials (status=$($r.status), retry=$($r.retry))"
+                }
+                if ($rejected.Count -eq 0) {
+                    Write-DebugLog "INFO" "Configured provider credentials accepted: $($configuredProviders -join ', ')"
+                }
+            } catch {
+                Write-DebugLog "WARN" "Could not read provider status for credential validation: $_"
+            }
+        }
+    } catch {
+        Write-Warning "[$AppName] Could not configure providers: $_"
+        Write-DebugLog "ERROR" "Provider configuration failed: $_"
+    }
+} else {
+    Write-Host "     -> No provider settings to write (nothing enabled and no credentials configured)." -ForegroundColor DarkGray
+    Write-DebugLog "WARN" "No provider settings posted: enabled list unreadable and no credentials in config.json"
 }
 
 # -- 5. Create language profiles -----------------------------------------------
@@ -302,6 +349,7 @@ $DesiredProfiles = @(
 )
 
 $ExistingProfiles = @()
+$ProfilesReadable = $false
 try {
     # No @() around the call: in PS 5.1 @(Invoke-RestMethod ...) collapses the whole
     # response array into ONE element, so the comparisons below would see the array
@@ -309,20 +357,38 @@ try {
     # reads as "deleted") and mis-resolve the managed profile ids.
     $fetchedProfiles = Invoke-RestMethod -Uri "$ApiBase/api/system/languages/profiles" -Method Get `
         -Headers $Headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-    if ($fetchedProfiles) {
-        # Only keep entries that actually look like a profile, so a non-array
-        # payload (error document served with HTTP 200) cannot be posted back.
-        $ExistingProfiles = @($fetchedProfiles | Where-Object {
+    if (-not $fetchedProfiles) {
+        # No profiles yet: a fresh install, and the only case where posting
+        # nothing but our own profiles cannot delete anything.
+        $ProfilesReadable = $true
+    } else {
+        # Only accept a payload where EVERY entry looks like a profile. Dropping
+        # some entries would post a shorter list, and Bazarr DELETES every profile
+        # missing from it -- so an error document served with HTTP 200 must abort
+        # the rewrite instead of being filtered down to an empty list.
+        $candidates = @($fetchedProfiles)
+        $validProfiles = @($candidates | Where-Object {
             $_ -and $_.PSObject.Properties['name'] -and $_.PSObject.Properties['profileId']
         })
+        if ($validProfiles.Count -eq $candidates.Count) {
+            $ProfilesReadable = $true
+            $ExistingProfiles = $validProfiles
+        } else {
+            Write-DebugLog "WARN" "Unexpected language-profiles payload ($($candidates.Count) entries, $($validProfiles.Count) usable); refusing to rewrite"
+        }
     }
-    Write-DebugLog "VAR existing language profiles=$(@($ExistingProfiles | ForEach-Object { "$($_.profileId):$($_.name)" }) -join ', ')"
+    Write-DebugLog "VAR existing language profiles=$(@($ExistingProfiles | ForEach-Object { "$($_.profileId):$($_.name)" }) -join ', ') readable=$ProfilesReadable"
 } catch {
-    Write-DebugLog "WARN" "Could not list existing language profiles (using fixed ids 1-3): $_"
+    Write-DebugLog "WARN" "Could not list existing language profiles: $_"
 }
 
 $ProfilesPayload = @()
-if ($ExistingProfiles.Count -gt 0) {
+if (-not $ProfilesReadable) {
+    # Posting a list Bazarr cannot merge would delete every profile it does not
+    # contain. Skip the whole step rather than destroy the user's profiles.
+    Write-Warning "[$AppName] Existing language profiles could not be read; not rewriting them (a partial list would delete profiles)."
+    Write-DebugLog "ERROR" "Language profile rewrite skipped: existing profile list unreadable"
+} elseif ($ExistingProfiles.Count -gt 0) {
     # Keep every existing profile, then append/overwrite our managed ones.
     $managedNames = @($DesiredProfiles | ForEach-Object { $_.name })
     $ProfilesPayload = @($ExistingProfiles | Where-Object { $_.name -notin $managedNames })
@@ -349,38 +415,47 @@ if ($ExistingProfiles.Count -gt 0) {
     $ProfilesPayload = $DesiredProfiles
 }
 
-$profilesJson = @($ProfilesPayload) | ConvertTo-Json -Depth 10 -Compress
+if ($ProfilesReadable) {
+    $profilesJson = @($ProfilesPayload) | ConvertTo-Json -Depth 10 -Compress
 
-Write-DebugLog "VAR profiles JSON length=$($profilesJson.Length) chars"
-try {
-    $body = "languages-profiles=$([Uri]::EscapeDataString($profilesJson))"
-    Invoke-RestMethod -Uri "$ApiBase/api/system/settings" -Method POST `
-        -Headers $Headers -Body $body -ContentType "application/x-www-form-urlencoded" `
-        -UseBasicParsing -ErrorAction Stop | Out-Null
-    Write-Host "     OK Profiles: $(@($ProfilesPayload | ForEach-Object { "$($_.name) ($($_.profileId))" }) -join ', ')" -ForegroundColor Green
-    Write-DebugLog "INFO" "Language profiles written: $(@($ProfilesPayload | ForEach-Object { "$($_.name)($($_.profileId))" }) -join ' ')"
-} catch {
-    Write-Warning "[$AppName] Could not create language profiles: $_"
-    Write-DebugLog "ERROR" "Language profiles creation failed: $_"
+    Write-DebugLog "VAR profiles JSON length=$($profilesJson.Length) chars"
+    try {
+        $body = "languages-profiles=$([Uri]::EscapeDataString($profilesJson))"
+        Invoke-RestMethod -Uri "$ApiBase/api/system/settings" -Method POST `
+            -Headers $Headers -Body $body -ContentType "application/x-www-form-urlencoded" `
+            -UseBasicParsing -ErrorAction Stop | Out-Null
+        Write-Host "     OK Profiles: $(@($ProfilesPayload | ForEach-Object { "$($_.name) ($($_.profileId))" }) -join ', ')" -ForegroundColor Green
+        Write-DebugLog "INFO" "Language profiles written: $(@($ProfilesPayload | ForEach-Object { "$($_.name)($($_.profileId))" }) -join ' ')"
+    } catch {
+        Write-Warning "[$AppName] Could not create language profiles: $_"
+        Write-DebugLog "ERROR" "Language profiles creation failed: $_"
+    }
 }
 
 # -- 6. Set defaults: auto-download for all content ---------------------------
 Write-Host "  -> Configuring auto-download defaults..." -ForegroundColor Gray
-Write-DebugLog "INFO" "Setting auto-download defaults to profile $DefaultProfileId ($DefaultProfileName)..."
-try {
-    Invoke-BazarrSettings -FormParts @(
-        "settings-general-serie_default_enabled=true"
-        "settings-general-serie_default_profile=$DefaultProfileId"
-        "settings-general-movie_default_enabled=true"
-        "settings-general-movie_default_profile=$DefaultProfileId"
-        "settings-general-use_embedded_subs=true"
-        "settings-general-utf8_encode=true"
-    )
-    Write-Host "     OK Auto-download enabled with '$DefaultProfileName' profile ($DefaultProfileId)." -ForegroundColor Green
-    Write-DebugLog "INFO" "Auto-download: series+movies default_profile=$DefaultProfileId use_embedded_subs=true utf8_encode=true"
-} catch {
-    Write-Warning "[$AppName] Could not set auto-download defaults: $_"
-    Write-DebugLog "ERROR" "Auto-download defaults failed: $_"
+if ($ProfilesReadable) {
+    Write-DebugLog "INFO" "Setting auto-download defaults to profile $DefaultProfileId ($DefaultProfileName)..."
+    try {
+        Invoke-BazarrSettings -FormParts @(
+            "settings-general-serie_default_enabled=true"
+            "settings-general-serie_default_profile=$DefaultProfileId"
+            "settings-general-movie_default_enabled=true"
+            "settings-general-movie_default_profile=$DefaultProfileId"
+            "settings-general-use_embedded_subs=true"
+            "settings-general-utf8_encode=true"
+        )
+        Write-Host "     OK Auto-download enabled with '$DefaultProfileName' profile ($DefaultProfileId)." -ForegroundColor Green
+        Write-DebugLog "INFO" "Auto-download: series+movies default_profile=$DefaultProfileId use_embedded_subs=true utf8_encode=true"
+    } catch {
+        Write-Warning "[$AppName] Could not set auto-download defaults: $_"
+        Write-DebugLog "ERROR" "Auto-download defaults failed: $_"
+    }
+} else {
+    # $DefaultProfileId is only known when the profile list was read; pointing
+    # auto-download at a guessed id would silently break subtitle fetching.
+    Write-Warning "[$AppName] Auto-download defaults not set: the profile id could not be resolved (re-run once the profiles API answers)."
+    Write-DebugLog "WARN" "Auto-download defaults skipped: profile id unknown"
 }
 
 # -- 7. Enable subtitle synchronisation ---------------------------------------

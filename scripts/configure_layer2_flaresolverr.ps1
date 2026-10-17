@@ -208,10 +208,15 @@ for ($i = 0; $i -lt $payload["fields"].Count; $i++) {
 
 $body = $payload | ConvertTo-Json -Depth 10 -Compress
 
-# forceSave: a tagged proxy counts as enabled, so without it Prowlarr runs its
-# FlareSolverr Test() (a real browser request through the proxy) on every
-# POST/PUT and rejects the whole registration while the browser is still warming
-# up. Reachability is checked explicitly at the end of this script instead.
+# forceSave: a tagged proxy counts as enabled, so Prowlarr would otherwise reject
+# the registration over every validation warning. Precisely: on PUT forceSave skips
+# the FlareSolverr Test() entirely, but on POST Prowlarr 2.x still runs it (a real
+# browser round-trip through the proxy, measured 3.7s here) and only tolerates
+# warnings -- a hard error such as the solver not answering still fails the save.
+# That is why the installer gates on the API before this step runs, and why
+# reachability is also checked explicitly at the end of this script. On a failed
+# POST there is deliberately no automatic retry: Prowlarr may already have
+# committed the proxy, and a blind retry would leave a duplicate definition.
 try {
     if ($existing) {
         $payload["id"] = $existing.id
@@ -329,6 +334,11 @@ try {
     } else {
         Write-Warning "[$AppName] FlareSolverr proxy is missing tag id=$flareTagId - Prowlarr will not use it."
         Write-DebugLog "ERROR" "Proxy tag verification failed (tags=@($(@($vProxy.tags) -join ',')))"
+        # This is the one failure the whole script exists to prevent: a tagged
+        # proxy is the only thing that makes Prowlarr route through it, and every
+        # Cloudflare-protected indexer silently fails without it. Reporting
+        # success here would mark Layer 2 green on a broken install.
+        exit 1
     }
 } catch {
     Write-Warning "[$AppName] Could not verify the proxy tag: $_"

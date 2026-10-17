@@ -39,9 +39,13 @@ if (-not $Ip) {
 }
 if ($Ip -notmatch '^(\d{1,3}\.){3}\d{1,3}$') { exit 0 }   # sanity: IPv4 only
 
-$lines = [System.Collections.Generic.List[string]]::new(
-    [string[]](Get-Content -Path $WlFile -Encoding UTF8 -ErrorAction SilentlyContinue))
-if ($lines.Count -eq 0) { exit 0 }   # unreadable/corrupt file -- never clobber it
+# Materialise the file first. Casting the (possibly $null) Get-Content result
+# straight into the List constructor throws ArgumentNullException on an empty or
+# unreadable file -- exactly the case the guard below exists for -- and that
+# unhandled exception killed the run before it could exit quietly.
+$raw = @(Get-Content -Path $WlFile -Encoding UTF8 -ErrorAction SilentlyContinue)
+if ($raw.Count -eq 0) { exit 0 }   # unreadable/corrupt/empty file -- never clobber it
+$lines = [System.Collections.Generic.List[string]]::new([string[]]$raw)
 
 $changed = $false
 $found   = $false
@@ -71,35 +75,55 @@ if (-not $found) {
 if ($changed) {
     # BOM-free UTF-8, matching Write-YamlFile / 12_security.ps1.
     [System.IO.File]::WriteAllLines($WlFile, $lines, (New-Object System.Text.UTF8Encoding($false)))
-
-    # Parsers are only read at service start -- there is no hot reload for custom
-    # parser files on Windows.  Resolve the service the same way 12_security.ps1
-    # does (a hardcoded name would make every refresh a silent no-op on a release
-    # that renames it) and retry a transient failure, because the next run would
-    # otherwise find the file already correct, skip the restart, and leave the
-    # engine running with the previous WAN IP whitelisted.
-    $svcName = $null
-    foreach ($candidate in @('crowdsec', 'CrowdSec')) {
-        $s = Get-Service -Name $candidate -ErrorAction SilentlyContinue
-        if ($s) { $svcName = $s.Name; break }
-    }
-    if (-not $svcName) {
-        $s = Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like '*crowdsec*' -and $_.Name -notlike '*bouncer*' } |
-            Select-Object -First 1
-        if ($s) { $svcName = $s.Name }
-    }
-    if (-not $svcName) { exit 0 }   # engine not installed -- nothing to reload
-
-    $restarted = $false
-    for ($attempt = 1; $attempt -le 3 -and -not $restarted; $attempt++) {
-        try {
-            Restart-Service -Name $svcName -Force -ErrorAction Stop
-            $restarted = $true
-        } catch {
-            Start-Sleep -Seconds 2
-        }
-    }
-    if (-not $restarted) { exit 1 }   # file is correct; the engine picks it up on its next start
 }
+
+# -- Does the engine need a restart? -------------------------------------------
+# Parsers are only read at service start -- there is no hot reload for custom
+# parser files on Windows.  Resolve the service the same way 12_security.ps1 does
+# (a hardcoded name would make every refresh a silent no-op on a release that
+# renames it).
+$svcName = $null
+foreach ($candidate in @('crowdsec', 'CrowdSec')) {
+    $s = Get-Service -Name $candidate -ErrorAction SilentlyContinue
+    if ($s) { $svcName = $s.Name; break }
+}
+if (-not $svcName) {
+    $s = Get-Service -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*crowdsec*' -and $_.Name -notlike '*bouncer*' } |
+        Select-Object -First 1
+    if ($s) { $svcName = $s.Name }
+}
+if (-not $svcName) { exit 0 }   # engine not installed -- nothing to reload
+
+# "The file changed" is not the only reason to reload.  A previous run can write
+# the new IP and then fail every restart attempt; the next run finds the file
+# already correct, concludes "nothing changed", and leaves the engine enforcing a
+# whitelist from its last start -- i.e. the old WAN IP is still allowed and the
+# new one is bannable.  The engine's own start time is the durable evidence: if it
+# started before the file was last written, it has not loaded this file.  That
+# needs no marker file and keeps an idle run a no-op (engine newer than file).
+$needsReload = $changed
+if (-not $needsReload) {
+    try {
+        $procId = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction Stop).ProcessId
+        if ($procId) {
+            $engineStart = (Get-Process -Id $procId -ErrorAction Stop).StartTime
+            $needsReload = ((Get-Item -LiteralPath $WlFile -ErrorAction Stop).LastWriteTime -gt $engineStart)
+        }
+    } catch {
+        $needsReload = $false   # cannot tell -- stay a no-op rather than churn restarts
+    }
+}
+if (-not $needsReload) { exit 0 }
+
+$restarted = $false
+for ($attempt = 1; $attempt -le 3 -and -not $restarted; $attempt++) {
+    try {
+        Restart-Service -Name $svcName -Force -ErrorAction Stop
+        $restarted = $true
+    } catch {
+        Start-Sleep -Seconds 2
+    }
+}
+if (-not $restarted) { exit 1 }   # file is correct; the next run retries the reload
 exit 0

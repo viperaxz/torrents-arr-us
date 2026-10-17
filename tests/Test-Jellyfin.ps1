@@ -61,10 +61,12 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         $jfClient = 'MediaBrowser Client="seedbox-tests", Device="test-suite", DeviceId="seedbox-tests", Version="1.0.0"'
         $jfAuth   = @{ 'Authorization' = ($jfClient + ', Token="' + $apiKey + '"') }
         $libs = Invoke-ApiCheck "http://127.0.0.1:$port${base}/Library/VirtualFolders" $jfAuth -TimeoutSec 8
-        if ($libs.ok -and $libs.data -is [array]) {
-            $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' $(if ($libs.data.Count -gt 0) { 'PASS' } else { 'WARN' }) "$($libs.data.Count) virtual folder(s) found"))
-        } elseif ($libs.ok) {
-            $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' 'FAIL' 'API returned unexpected data (not a JSON array)'))
+        if ($libs.ok) {
+            # @() matters: a single virtual folder deserialises to one object, not an array,
+            # and the old "-is [array]" test reported a healthy single-library box as
+            # "unexpected data (not a JSON array)".
+            $libCount = @($libs.data).Count
+            $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' $(if ($libCount -gt 0) { 'PASS' } else { 'WARN' }) "$libCount virtual folder(s) found"))
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'LibrariesPresent' 'FAIL' $libs.error))
         }
@@ -100,6 +102,10 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
     if (-not $cfgGpu) {
         $Script:Results.Add((New-TestResult $svc 3 'GpuProfile' 'SKIP' 'GPU profile not configured (CPU fallback)'))
     } elseif ($apiKey) {
+        # Rebuilt here as well: a -Layer 3-only run never executes the Layer 2 block
+        # above, so $jfAuth would be $null and every admin request would 401.
+        $jfClient = 'MediaBrowser Client="seedbox-tests", Device="test-suite", DeviceId="seedbox-tests", Version="1.0.0"'
+        $jfAuth   = @{ 'Authorization' = ($jfClient + ', Token="' + $apiKey + '"') }
         $enc = Invoke-ApiCheck "http://127.0.0.1:$port${base}/System/Configuration/encoding" $jfAuth -TimeoutSec 8
         if ($enc.ok) {
             $hwAccel = $enc.data.HardwareAccelerationType

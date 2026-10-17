@@ -16,6 +16,13 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "update_common.ps1")
 $Config = Initialize-UpdateScript -Config $Config
 
+# Bounded service control: nssm services can sit in Stop/Start Pending and the
+# built-in cmdlets wait on that indefinitely. 07_deluge.ps1 uses the same helpers,
+# and this path stops/starts exactly those two services.
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
+
 $AppName     = "Deluge"
 $ServiceList = @("DelugeDaemon", "DelugeWeb")
 
@@ -282,7 +289,7 @@ function Stop-DelugeForInstall {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne "Stopped") {
             Write-DebugLog "INFO" "Stopping service $svcName (was $($svc.Status))"
-            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            $null = Stop-ServiceBounded -Name $svcName
         }
     }
     $deadline = (Get-Date).AddSeconds(30)
@@ -553,7 +560,7 @@ try {
         foreach ($svcName in $ServiceList) {
             $svcNow = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if ($svcNow -and $svcNow.Status -ne "Running") {
-                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                $null = Start-ServiceBounded -Name $svcName -TimeoutSeconds 90
             }
         }
     }
@@ -562,6 +569,31 @@ try {
     foreach ($svcName in $ServiceList) {
         $svcAfter = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "$svcName not Running after upgrade" }
+    }
+
+    # A Running service is not proof the Web UI works: Sonarr/Radarr drive Deluge
+    # through POST /json on the web port, so a login is the only end-to-end check
+    # available here.  Recorded as a failure on purpose -- the ledger is meant to
+    # describe an install that actually serves requests.
+    $webPort   = 8112
+    if ($Config -and $Config.Ports -and $Config.Ports.DelugeWeb) { $webPort = [int]$Config.Ports.DelugeWeb }
+    $authFile  = Join-Path $InstallDir 'secrets\deluge_auth.txt'
+    $webOk     = $false
+    if (Test-Path $authFile) {
+        $delugePassword = (Get-Content -Path $authFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
+        $loginBody = @{ method = 'auth.login'; params = @($delugePassword); id = 1 } | ConvertTo-Json -Compress
+        $loginDeadline = (Get-Date).AddSeconds(30)
+        while (-not $webOk -and (Get-Date) -lt $loginDeadline) {
+            try {
+                $loginRes = Invoke-RestMethod -Uri "http://127.0.0.1:$webPort/json" -Method Post -Body $loginBody `
+                    -ContentType 'application/json' -TimeoutSec 5 -ErrorAction Stop
+                if ($loginRes.result -eq $true) { $webOk = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $webOk) { throw "Deluge Web UI on port $webPort did not accept auth.login within 30s after the update" }
+    } else {
+        Write-UcLog "WARN" "Deluge Web UI health check skipped: $authFile not found"
     }
 
     # Report the version that is actually on disk (not the requested pin), so the

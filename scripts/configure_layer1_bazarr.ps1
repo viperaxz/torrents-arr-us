@@ -163,5 +163,38 @@ try {
     exit 1
 }
 
+# -- 5. Verify the credentials actually log in --------------------------------
+# The settings POST only proves Bazarr stored the values; it does not prove a
+# login succeeds (a mangled password stores fine and then rejects every attempt,
+# leaving the UI unreachable behind Caddy while Caddy's own basic-auth still
+# passes). Verify the way the UI does, with the same plain credentials.
+$loginOk = $false
+$loginDetail = ""
+try {
+    $null = Invoke-RestMethod -Uri "$ApiBase/api/system/account" -Method Post `
+        -Body ("action=login&username=$([Uri]::EscapeDataString($Username))&password=$([Uri]::EscapeDataString($Password))") `
+        -ContentType "application/x-www-form-urlencoded" -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+    $loginOk = $true
+} catch {
+    $resp = $_.Exception.Response
+    if ($resp) {
+        $loginDetail = "HTTP $([int]$resp.StatusCode)"
+    } else {
+        $loginDetail = $_.Exception.Message
+    }
+}
+if ($loginOk) {
+    Write-Host "  -> Login verified  : $Username" -ForegroundColor Green
+    Write-DebugLog "INFO" "Bazarr form login verified for $Username"
+} else {
+    # Deliberately no rollback: falling back to auth-type "none" would publish the
+    # UI unauthenticated, which is worse than an app the operator must fix.
+    Write-Host "  -> Login FAILED    : $Username ($loginDetail)" -ForegroundColor Red
+    Write-Warning "[$AppName] Form authentication was stored but a login with General.AdminUsername/AdminPassword is rejected."
+    Write-Warning "  Fix the credentials in config.json and re-run this script; Bazarr's UI is not reachable until then."
+    Write-DebugLog "ERROR" "Bazarr form login verification failed ($loginDetail); credentials in config.json do not work"
+    exit 1
+}
+
 Write-Host "[$AppName] Configuration complete." -ForegroundColor Cyan
 Write-DebugLog "INFO" "configure_layer1_bazarr.ps1 complete"

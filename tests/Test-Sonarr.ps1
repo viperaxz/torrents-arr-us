@@ -62,7 +62,6 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
     $idx = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v3/indexer" $hdr -TimeoutSec 8
     if ($idx.ok) {
         $idxList  = @($idx.data | Where-Object { $null -ne $_ })
-        $idxCount = $idxList.Count
         # A count is not enough. Prowlarr writes each synced indexer's baseUrl at sync
         # time and never revisits it, so a DomainMode change (DuckDNS <-> Cloudflare)
         # leaves every one of them on a path Prowlarr no longer serves: the *arr then
@@ -73,17 +72,21 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $apiKey) {
         $prBase  = Get-AppUrlBase 'prowlarr' $Config.General.DomainMode
         $wantUrl = '^http://127\.0\.0\.1:' + $prPort + [regex]::Escape($prBase) + '/\d+/$'
         $stale   = @()
+        # Count only the Prowlarr-synced indexers: a hand-added indexer made the old
+        # code report "N indexer(s) synced from Prowlarr" when none were.
+        $prCount = 0
         foreach ($e in $idxList) {
             if ($e.name -notmatch '\(Prowlarr\)\s*$') { continue }
+            $prCount++
             $u = ($e.fields | Where-Object { $_.name -eq 'baseUrl' } | Select-Object -First 1).value
             if ("$u" -notmatch $wantUrl) { $stale += "$($e.name)=$u" }
         }
-        if ($idxCount -eq 0) {
+        if ($prCount -eq 0) {
             $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'WARN' 'no indexers synced from Prowlarr'))
         } elseif ($stale.Count -gt 0) {
-            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'FAIL' "$($stale.Count)/$idxCount on a stale URL (expected http://127.0.0.1:$prPort$prBase/<id>/): $($stale[0])"))
+            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'FAIL' "$($stale.Count)/$prCount on a stale URL (expected http://127.0.0.1:$prPort$prBase/<id>/): $($stale[0])"))
         } else {
-            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'PASS' "$idxCount indexer(s) synced from Prowlarr, URLs correct"))
+            $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'PASS' "$prCount indexer(s) synced from Prowlarr, URLs correct"))
         }
     } else {
         $Script:Results.Add((New-TestResult $svc 2 'IndexersFromProwlarr' 'FAIL' $idx.error))

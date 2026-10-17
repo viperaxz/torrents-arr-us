@@ -175,25 +175,34 @@ if ($live.Count -eq 0) {
 # The dashboard Security card reads this file (via collect_status.ps1) to show
 # which lists are applied, how many CIDRs, and when they were last refreshed.
 try {
-    $cfgPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'config.json'
+    # This script runs from two places: the source tree (12_security.ps1 invokes it
+    # there) and, because the scheduled task now uses the staged copy, from
+    # <InstallDir>\scripts.  Only the source tree has config.json beside it, so fall
+    # back to the script's own parent directory -- for the staged copy that IS the
+    # install tree -- instead of quietly skipping the state file.
+    $scriptParent = Split-Path $PSScriptRoot -Parent
+    $installDir   = $null
+    $cfgPath      = Join-Path $scriptParent 'config.json'
     if (Test-Path $cfgPath) {
         $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
-        if ($cfg.General -and $cfg.General.InstallDir) {
-            $dashDir = Join-Path $cfg.General.InstallDir 'dashboard'
-            if (-not (Test-Path $dashDir)) { New-Item -Path $dashDir -ItemType Directory -Force | Out-Null }
-            $blState = [ordered]@{
-                sources        = 'Spamhaus DROP + Firehol level-1'
-                cidr_count     = $applied
-                rule_count     = $live.Count
-                failed_sources = $failedSources
-                updated        = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
-            }
-            [System.IO.File]::WriteAllText(
-                (Join-Path $dashDir 'blocklist_state.json'),
-                ($blState | ConvertTo-Json),
-                (New-Object System.Text.UTF8Encoding($false)))
-            Write-Host "  [Blocklist] Dashboard state written (sources + counts)." -ForegroundColor DarkGray
+        if ($cfg.General -and $cfg.General.InstallDir) { $installDir = [string]$cfg.General.InstallDir }
+    }
+    if (-not $installDir) { $installDir = $scriptParent }
+    if ($installDir) {
+        $dashDir = Join-Path $installDir 'dashboard'
+        if (-not (Test-Path $dashDir)) { New-Item -Path $dashDir -ItemType Directory -Force | Out-Null }
+        $blState = [ordered]@{
+            sources        = 'Spamhaus DROP + Firehol level-1'
+            cidr_count     = $applied
+            rule_count     = $live.Count
+            failed_sources = $failedSources
+            updated        = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
         }
+        [System.IO.File]::WriteAllText(
+            (Join-Path $dashDir 'blocklist_state.json'),
+            ($blState | ConvertTo-Json),
+            (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "  [Blocklist] Dashboard state written (sources + counts)." -ForegroundColor DarkGray
     }
 } catch {
     Write-Host "  [Blocklist] Could not write dashboard state: $($_.Exception.Message)" -ForegroundColor Yellow

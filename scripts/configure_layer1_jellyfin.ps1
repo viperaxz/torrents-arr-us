@@ -282,7 +282,7 @@ foreach ($lib in $libraries) {
     Write-DebugLog "INFO" "Creating library '$($lib.Name)' type=$($lib.Type) path=$($lib.Path)"
     try {
         Invoke-RestMethod `
-            -Uri "$ApiBase/Library/VirtualFolders?name=$($lib.Name)&collectionType=$($lib.Type)&refreshLibrary=false" `
+            -Uri "$ApiBase/Library/VirtualFolders?name=$([Uri]::EscapeDataString($lib.Name))&collectionType=$($lib.Type)&refreshLibrary=false" `
             -Method Post -Body $body -ContentType "application/json" `
             -Headers @{"Authorization" = $AuthHeader} -UseBasicParsing -ErrorAction Stop | Out-Null
         Write-Host "  -> Library '$($lib.Name)': $($lib.Path)" -ForegroundColor Green
@@ -362,6 +362,30 @@ if ($configUsers.Count -gt 0) {
         } elseif ($newUser) {
             Write-Host "    -> '$uName' created (no password  --  set one manually)." -ForegroundColor Yellow
             Write-DebugLog "WARN" "User '$uName' created without a password (no DefaultUserPassword or per-user Password in config)"
+        }
+
+        # A user created through the API starts with EnableAllFolders=false and an empty
+        # EnabledFolders list, which means no library access at all: they can log in and
+        # see an empty server. Nothing later in the pipeline grants access, so set it now.
+        if ($newUser) {
+            try {
+                $userDto = Invoke-RestMethod -Uri "$ApiBase/Users/$($newUser.Id)" `
+                    -Headers @{"Authorization" = $AuthHeader} -UseBasicParsing -ErrorAction Stop
+                $policy = $userDto.Policy
+                if ($policy) {
+                    if ($policy.PSObject.Properties["EnableAllFolders"]) { $policy.EnableAllFolders = $true }
+                    else { $policy | Add-Member -NotePropertyName "EnableAllFolders" -NotePropertyValue $true -Force }
+                    Invoke-RestMethod -Uri "$ApiBase/Users/$($newUser.Id)/Policy" -Method Post `
+                        -Body ($policy | ConvertTo-Json -Depth 10 -Compress) -ContentType "application/json" `
+                        -Headers @{"Authorization" = $AuthHeader} -UseBasicParsing -ErrorAction Stop | Out-Null
+                    Write-DebugLog "INFO" "Library access enabled for '$uName' (EnableAllFolders)"
+                } else {
+                    Write-DebugLog "WARN" "No policy returned for '$uName'  --  library access not granted"
+                }
+            } catch {
+                Write-Warning "    -> User '$uName' created but library access could not be enabled: $_"
+                Write-DebugLog "WARN" "Policy update failed for '$uName': $_"
+            }
         }
     }
 } else {

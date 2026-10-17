@@ -192,6 +192,19 @@ foreach ($pkg in $Packages) {
     Install-ChocoPackage -PackageName $pkg.Name -MinimumVersion $pkg.MinVersion
 }
 
+# NSSM is fatal, not merely required: every application installer creates its
+# service through it, so continuing without it produces fourteen unrelated
+# failures instead of one clear one. master_install.ps1 declares this phase
+# fatal and runs with $ErrorActionPreference = 'Stop', so this terminates the run;
+# the exit code covers a standalone invocation.
+if ([string]::IsNullOrWhiteSpace((Get-ChocoInstalledVersion -Package "nssm"))) {
+    # Log first: Write-Error is terminating under master_install's EAP='Stop', so
+    # anything after it (including this log line) would never run.
+    Write-DebugLog "ERROR" "NSSM missing after the prerequisite install phase -- aborting"
+    Write-Error "[Prerequisites] NSSM is not installed and could not be installed (choco could not install or verify it). Every service-based app would fail. Aborting."
+    exit 1
+}
+
 # Refresh Environment Variables again after installing packages
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 Write-DebugLog "INFO" "PATH refreshed after package installs"

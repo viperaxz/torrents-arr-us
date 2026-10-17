@@ -80,6 +80,14 @@ if (-not $ApiKey) {
 }
 
 # -- 3. Wait for API -----------------------------------------------------------
+# Same prefix rule as Layer 1: every call below is built from $UrlBase, so a
+# config.xml that disagrees with the mode fails at the poll with a generic
+# timeout instead of naming the UrlBase mismatch.
+$CfgUrlBase = [string]$cfgXml.Config.UrlBase
+if ($CfgUrlBase -ne $UrlBase) {
+    Write-Warning "[$AppName] config.xml UrlBase is '$CfgUrlBase' but $DomainMode mode needs '$UrlBase'. The API calls below use that prefix."
+    Write-DebugLog "WARN" "config.xml UrlBase '$CfgUrlBase' does not match the $DomainMode prefix '$UrlBase'"
+}
 Write-Host "  -> Waiting for API on port $Port..." -ForegroundColor Gray
 $apiUrl = "http://127.0.0.1:$Port$UrlBase/api/v3/config/host"
 Write-DebugLog "INFO" "Polling $AppName API at $apiUrl (up to 30s)..."
@@ -145,18 +153,22 @@ if ($Layer2Config.RootFolders -and $Layer2Config.RootFolders.Count -gt 0) {
 }
 
 # -- 5. Configure Download Clients ---------------------------------------------
-if ($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0) {
+# A missing Deluge password skips only this section: the seed criteria, naming and
+# Jellyfin notification below do not depend on Deluge. Returning from the script
+# here used to drop all of them (and still exited 0, so the run looked complete).
+$DelugeAuthFile = Join-Path $Config.General.InstallDir "secrets\deluge_auth.txt"
+Write-DebugLog "VAR DelugeAuthFile=$DelugeAuthFile (exists=$(Test-Path $DelugeAuthFile))"
+$HasDownloadClients = [bool]($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0)
+if ($HasDownloadClients -and -not (Test-Path $DelugeAuthFile)) {
+    Write-Warning "[$AppName] Deluge auth file not found at '$DelugeAuthFile'. Download client NOT configured."
+    Write-Warning "     Run configure_layer1_deluge.ps1 first, then re-run this script to add the download client."
+    Write-DebugLog "WARN" "Deluge auth file not found -- skipping download client config"
+}
+
+if ($HasDownloadClients -and (Test-Path $DelugeAuthFile)) {
     Write-Host "  -> Configuring download clients..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Configuring $($Layer2Config.DownloadClients.Count) download client(s)..."
 
-    $DelugeAuthFile = Join-Path $Config.General.InstallDir "secrets\deluge_auth.txt"
-    Write-DebugLog "VAR DelugeAuthFile=$DelugeAuthFile (exists=$(Test-Path $DelugeAuthFile))"
-    if (-not (Test-Path $DelugeAuthFile)) {
-        Write-Warning "[$AppName] Deluge auth file not found at '$DelugeAuthFile'. Download client NOT configured."
-        Write-Warning "     Run configure_layer1_deluge.ps1 first, then re-run this script to add the download client."
-        Write-DebugLog "WARN" "Deluge auth file not found -- skipping download client config"
-        return
-    }
     $DelugePassword = (Get-Content -Path $DelugeAuthFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
     Write-DebugLog "VAR DelugePassword loaded (length=$($DelugePassword.Length)) [REDACTED]"
 

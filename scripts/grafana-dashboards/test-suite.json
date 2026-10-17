@@ -5,7 +5,7 @@
     { "type": "datasource", "id": "loki", "name": "Loki", "version": "1.0.0" }
   ],
   "annotations": { "list": [] },
-  "description": "win-seedbox test suite results. Fed by test-suite.ps1: the Seedbox_TestSuite scheduled task runs it with -Quick every 15 minutes, so the panels show the latest run.",
+  "description": "win-seedbox test suite results. Fed by test-suite.ps1: the Seedbox_TestSuite scheduled task runs it with -Quick on the cadence configured in Tests.Quick (default every 15 minutes), so the panels show the latest runs. The stat panels count distinct (service, test) pairs over the dashboard range, so overlapping runs do not double the numbers.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,

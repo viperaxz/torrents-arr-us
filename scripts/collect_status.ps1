@@ -12,18 +12,37 @@ $configPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'config.json'
 if (-not (Test-Path $configPath)) { Write-Error "config.json not found at $configPath"; exit 1 }
 $Config      = Get-Content $configPath -Raw | ConvertFrom-Json
 $InstallDir  = $Config.General.InstallDir
+# Fail loudly instead of silently doing nothing: with a null InstallDir every
+# path below is relative and every write fails, yet the script still exits 0 --
+# the scheduled task would look healthy while the dashboard froze forever.
+if (-not $Config -or -not $Config.General -or [string]::IsNullOrWhiteSpace([string]$InstallDir)) {
+    Write-Error "config.json at $configPath has no General.InstallDir -- cannot locate the dashboard directory"
+    exit 1
+}
 $OutputPath  = Join-Path $InstallDir 'dashboard\current_status.json'
 $StatePath   = Join-Path $InstallDir '.locks\health_state.json'
 $DomainMode  = $Config.General.DomainMode
 
 # -- Helpers -------------------------------------------------------------------
 function QuickGet {
-    param([string]$Uri, [hashtable]$H = @{}, [int]$Sec = 5)
+    param([string]$Uri, [hashtable]$H = @{}, [int]$Sec = 5, [switch]$JsonOnly)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $r = Invoke-RestMethod $Uri -Headers $H -UseBasicParsing -TimeoutSec $Sec -ErrorAction Stop
+        $r      = Invoke-WebRequest $Uri -Headers $H -UseBasicParsing -TimeoutSec $Sec -ErrorAction Stop
+        $isJson = ([string]($r.Headers['Content-Type'] -join ';')) -match 'json'
+        # Every *arr / Bazarr / Grafana instance answers an unknown path with its
+        # own SPA: HTTP 200 + text/html.  A wrong UrlBase (or a base_url that never
+        # persisted) therefore used to read as "API OK", and Invoke-RestMethod handed
+        # that HTML back as a single string, so the media cards counted one "movie".
+        # Probes that hit a JSON API pass -JsonOnly; Zurg and Loki legitimately
+        # answer HTML/text and do not.
+        if ($JsonOnly -and -not $isJson) {
+            $sw.Stop()
+            return [PSCustomObject]@{ ok=$false; ms=[int]$sw.ElapsedMilliseconds; data=$null }
+        }
+        $data = if ($isJson -and $r.Content) { $r.Content | ConvertFrom-Json } else { $r.Content }
         $sw.Stop()
-        return [PSCustomObject]@{ ok=$true;  ms=[int]$sw.ElapsedMilliseconds; data=$r }
+        return [PSCustomObject]@{ ok=$true;  ms=[int]$sw.ElapsedMilliseconds; data=$data }
     } catch { $sw.Stop(); return [PSCustomObject]@{ ok=$false; ms=[int]$sw.ElapsedMilliseconds; data=$null } }
 }
 
@@ -172,19 +191,20 @@ $svcs.Add([ordered]@{
 # DuckDNS mode runs Jellyfin with BaseUrl=/jellyfin in network.xml, so every API
 # path lives under that prefix -- probe the prefixed path like every other app
 # (UBase).  Without it Jellyfin answers with a 302 to the web client, which
-# Invoke-RestMethod follows happily: the health check then reports a false "up".
+# Invoke-WebRequest follows happily: the health check then reports a false "up"
+# unless the JSON content type is enforced (-JsonOnly).
 $jPort  = TcpOpen $jellyfinPort
 $jBase  = UBase 'jellyfin'
-$jCheck = QuickGet "http://127.0.0.1:$jellyfinPort${jBase}/System/Info/Public"
+$jCheck = QuickGet "http://127.0.0.1:$jellyfinPort${jBase}/System/Info/Public" @{} 5 -JsonOnly
 $svcs.Add((SvcEntry 'JellyfinServer' 'Jellyfin' $jPort $jCheck.ok $jCheck.ms))
 
 # Sonarr
 if ($sonarrKey) {
     $sPort  = TcpOpen $sonarrPort
     $sBase  = UBase 'sonarr'
-    $sCheck = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/system/status" @{'X-Api-Key'=$sonarrKey}
-    $sQueue = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/queue/status"  @{'X-Api-Key'=$sonarrKey}
-    $sWant  = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/wanted/missing?pageSize=1" @{'X-Api-Key'=$sonarrKey}
+    $sCheck = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/system/status" @{'X-Api-Key'=$sonarrKey} 5 -JsonOnly
+    $sQueue = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/queue/status"  @{'X-Api-Key'=$sonarrKey} 5 -JsonOnly
+    $sWant  = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/wanted/missing?pageSize=1" @{'X-Api-Key'=$sonarrKey} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Sonarr' 'Sonarr' $sPort $sCheck.ok $sCheck.ms @{
         queue_count  = if ($sQueue.ok) { [int]$sQueue.data.totalCount } else { $null }
         wanted_count = if ($sWant.ok  -and $sWant.data.totalRecords) { [int]$sWant.data.totalRecords } else { $null }
@@ -195,8 +215,8 @@ if ($sonarrKey) {
 if ($radarrKey) {
     $rPort  = TcpOpen $radarrPort
     $rBase  = UBase 'radarr'
-    $rCheck = QuickGet "http://127.0.0.1:$radarrPort${rBase}/api/v3/system/status" @{'X-Api-Key'=$radarrKey}
-    $rQueue = QuickGet "http://127.0.0.1:$radarrPort${rBase}/api/v3/queue/status"  @{'X-Api-Key'=$radarrKey}
+    $rCheck = QuickGet "http://127.0.0.1:$radarrPort${rBase}/api/v3/system/status" @{'X-Api-Key'=$radarrKey} 5 -JsonOnly
+    $rQueue = QuickGet "http://127.0.0.1:$radarrPort${rBase}/api/v3/queue/status"  @{'X-Api-Key'=$radarrKey} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Radarr' 'Radarr' $rPort $rCheck.ok $rCheck.ms @{
         queue_count = if ($rQueue.ok) { [int]$rQueue.data.totalCount } else { $null }
     }))
@@ -206,8 +226,8 @@ if ($radarrKey) {
 if ($prowlarrKey) {
     $pPort   = TcpOpen $prowlarrPort
     $pBase   = UBase 'prowlarr'
-    $pCheck  = QuickGet "http://127.0.0.1:$prowlarrPort${pBase}/api/v1/system/status" @{'X-Api-Key'=$prowlarrKey}
-    $pIdxRaw = QuickGet "http://127.0.0.1:$prowlarrPort${pBase}/api/v1/indexer" @{'X-Api-Key'=$prowlarrKey}
+    $pCheck  = QuickGet "http://127.0.0.1:$prowlarrPort${pBase}/api/v1/system/status" @{'X-Api-Key'=$prowlarrKey} 5 -JsonOnly
+    $pIdxRaw = QuickGet "http://127.0.0.1:$prowlarrPort${pBase}/api/v1/indexer" @{'X-Api-Key'=$prowlarrKey} 5 -JsonOnly
     $enabledIdx = 0; $failedIdx = 0
     if ($pIdxRaw.ok -and $pIdxRaw.data) {
         $enabledIdx = @($pIdxRaw.data | Where-Object { $_.enable -eq $true }).Count
@@ -220,6 +240,9 @@ if ($prowlarrKey) {
 }
 
 # Deluge (shared data reused in downloads section below)
+# Skipped entirely when Apps.Deluge is disabled: the probe would otherwise add two
+# permanently-red rows to the status panel for an app the installer never installed.
+$delugeEnabled   = ($Config.Apps.Deluge -ne $false)
 $delugeAuthPath  = Join-Path $InstallDir 'secrets\deluge_auth.txt'
 $delugePassword  = $null
 $delugeLoggedIn  = $false
@@ -276,8 +299,11 @@ if ($delugePassword -and $delugeWebOpen) {
         download_speed_mbps = if ($dlStats) { [math]::Round([double]$dlStats.stats.download_rate / 1MB, 3) } else { $null }
         upload_speed_mbps   = if ($dlStats) { [math]::Round([double]$dlStats.stats.upload_rate / 1MB, 3) } else { $null }
     }))
-} else {
-    $svcs.Add((SvcEntry 'DelugeDaemon' 'Deluge Daemon' $false $false 0))
+} elseif ($delugeEnabled) {
+    # No stored Web UI password (or the Web UI port is closed): the daemon entry
+    # still has to report the daemon's own port, not a hardcoded $false, or a
+    # healthy daemon shows up as "port closed" and resets its consecutive_ok.
+    $svcs.Add((SvcEntry 'DelugeDaemon' 'Deluge Daemon' $delugePortOpen $false 0))
 }
 
 # Deluge Web UI (separate entry -- serves the browser interface)
@@ -288,18 +314,22 @@ if ($delugeWebOpen) {
         $delugeWebOk = ($webCheck.StatusCode -eq 200)
     } catch {}
 }
-$svcs.Add((SvcEntry 'DelugeWeb' 'Deluge Web UI' $delugeWebOpen $delugeWebOk 0))
+if ($delugeEnabled) {
+    $svcs.Add((SvcEntry 'DelugeWeb' 'Deluge Web UI' $delugeWebOpen $delugeWebOk 0))
+}
 
 # Bazarr
 if ($bazarrKey) {
     $bPort  = TcpOpen $bazarrPort
     $bBase  = UBase 'bazarr'
-    $bCheck = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/system/ping" @{'X-Api-Key'=$bazarrKey}
-    $bWantE = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/wanted/episode?rows=1" @{'X-Api-Key'=$bazarrKey}
-    $bWantM = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/wanted/movie?rows=1"   @{'X-Api-Key'=$bazarrKey}
+    $bCheck = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/system/ping" @{'X-Api-Key'=$bazarrKey} 5 -JsonOnly
+    # Bazarr exposes the wanted-subtitle counters on /api/badges (episodes/movies).
+    # /api/wanted/episode and /api/wanted/movie do not exist: Bazarr answers them
+    # with its SPA (200 + text/html), so the old probes returned null forever.
+    $bBadges = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/badges" @{'X-Api-Key'=$bazarrKey} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Bazarr' 'Bazarr' $bPort $bCheck.ok $bCheck.ms @{
-        wanted_episodes = if ($bWantE.ok -and $bWantE.data.total) { [int]$bWantE.data.total } else { $null }
-        wanted_movies   = if ($bWantM.ok -and $bWantM.data.total) { [int]$bWantM.data.total } else { $null }
+        wanted_episodes = if ($bBadges.ok -and $null -ne $bBadges.data.episodes) { [int]$bBadges.data.episodes } else { $null }
+        wanted_movies   = if ($bBadges.ok -and $null -ne $bBadges.data.movies)   { [int]$bBadges.data.movies }   else { $null }
     }))
 }
 
@@ -318,7 +348,7 @@ if ($Config.Apps.Jellyseerr -eq $true) {
     # therefore must NOT carry the DuckDNS prefix -- /jellyseerr/api/v1/status
     # 404s and the dashboard would report Jellyseerr as down in DuckDNS mode.
     $jseOpen  = TcpOpen $jsePort
-    $jseCheck = QuickGet "http://127.0.0.1:$jsePort/api/v1/status"
+    $jseCheck = QuickGet "http://127.0.0.1:$jsePort/api/v1/status" @{} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Jellyseerr' 'Jellyseerr' $jseOpen $jseCheck.ok $jseCheck.ms))
 }
 
@@ -327,7 +357,7 @@ if ($Config.Apps.Grafana -eq $true) {
     # DuckDNS mode runs Grafana with serve_from_sub_path=true, so its API lives
     # under /grafana -- probe the prefixed path like every other app (UBase).
     $gfBase  = UBase 'grafana'
-    $gfCheck = QuickGet "http://127.0.0.1:3000${gfBase}/api/health"
+    $gfCheck = QuickGet "http://127.0.0.1:3000${gfBase}/api/health" @{} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Grafana' 'Grafana' (TcpOpen 3000) $gfCheck.ok $gfCheck.ms))
     $lokiCheck = QuickGet 'http://127.0.0.1:3100/ready'
     $svcs.Add((SvcEntry 'Loki' 'Loki' (TcpOpen 3100) $lokiCheck.ok $lokiCheck.ms))
@@ -368,7 +398,10 @@ if ($Config.LLM -and $Config.LLM.PSObject.Properties["Enabled"] -and $Config.LLM
 
 # -- System --------------------------------------------------------------------
 $status = [ordered]@{
-    timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+    # UTC with an explicit Z: the dashboard runs timeSince() in the browser, and a
+    # bare "yyyy-MM-ddTHH:mm:ss" is parsed as the *browser's* local time, so a phone
+    # in another timezone showed a wrong (sometimes negative) "updated X ago".
+    timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     system    = [ordered]@{}
     drives    = @()
     services  = $svcs.ToArray()
@@ -420,8 +453,13 @@ try {
     $jfKey      = $null
     $jfSettings = 'C:\ProgramData\Jellyseerr\settings.json'
     if (Test-Path $jfSettings) {
-        $js = Get-Content $jfSettings -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = ([string]$js.jellyfin.apiKey).Trim() }
+        # Jellyseerr rewrites settings.json at runtime, so a half-written file must
+        # not abort the whole block -- the secrets\jellyfin_api_key.txt fallback
+        # below is still usable.
+        try {
+            $js = Get-Content $jfSettings -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = ([string]$js.jellyfin.apiKey).Trim() }
+        } catch {}
     }
     if (-not $jfKey) {
         $jfKeyFile = Join-Path $InstallDir 'secrets\jellyfin_api_key.txt'
@@ -440,42 +478,49 @@ try {
         # reading zero without any error surfacing.
         $jfBase   = UBase 'jellyfin'
         $jfClient = 'MediaBrowser Client="seedbox-status", Device="collector", DeviceId="seedbox-status", Version="1.0.0"'
-        $jfCounts = Invoke-RestMethod "http://127.0.0.1:$jellyfinPort${jfBase}/Items/Counts" `
-                        -Headers @{ 'Authorization' = ($jfClient + ', Token="' + $jfKey + '"') } `
-                        -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-        $status.media.jellyfin = [ordered]@{
-            movies   = [int]$jfCounts.MovieCount
-            series   = [int]$jfCounts.SeriesCount
-            episodes = [int]$jfCounts.EpisodeCount
+        # -JsonOnly: with the wrong BaseUrl Jellyfin redirects to the web client and
+        # the HTML body used to be read as "0 movies / 0 series / 0 episodes".
+        $jfRes    = QuickGet "http://127.0.0.1:$jellyfinPort${jfBase}/Items/Counts" @{ 'Authorization' = ($jfClient + ', Token="' + $jfKey + '"') } 10 -JsonOnly
+        if ($jfRes.ok -and $jfRes.data) {
+            $jfCounts = $jfRes.data
+            $status.media.jellyfin = [ordered]@{
+                movies   = [int]$jfCounts.MovieCount
+                series   = [int]$jfCounts.SeriesCount
+                episodes = [int]$jfCounts.EpisodeCount
+            }
         }
     }
 } catch { $status.media.jellyfin = $null }
 
 # -- Media: Radarr -------------------------------------------------------------
-# NOTE: Invoke-RestMethod returns a scalar PSCustomObject for a 1-element JSON
+# NOTE: Invoke-WebRequest returns a scalar PSCustomObject for a 1-element JSON
 # array, and .Count on a scalar PSCustomObject is $null in PS 5.1 -- always
 # normalize through @() before counting (the old code returned null when exactly
 # one movie matched hasFile, which rendered as '--' on the dashboard).
 try {
-    $rBase  = UBase 'radarr'
-    $movies = Invoke-RestMethod "http://127.0.0.1:$radarrPort${rBase}/api/v3/movie" `
-                  -Headers @{'X-Api-Key'=$radarrKey} -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-    if ($null -eq $movies) { $movies = @() }
-    $movies = @($movies)
-    $status.media.movies_total      = $movies.Count
-    $status.media.movies_downloaded = @($movies | Where-Object { $_.hasFile }).Count
+    $rBase   = UBase 'radarr'
+    $rMovies = QuickGet "http://127.0.0.1:$radarrPort${rBase}/api/v3/movie" @{'X-Api-Key'=$radarrKey} 10 -JsonOnly
+    if ($rMovies.ok) {
+        $movies = if ($null -eq $rMovies.data) { @() } else { @($rMovies.data) }
+        $status.media.movies_total      = $movies.Count
+        $status.media.movies_downloaded = @($movies | Where-Object { $_.hasFile }).Count
+    } else {
+        $status.media.movies_total = $null; $status.media.movies_downloaded = $null
+    }
 } catch { $status.media.movies_total = $null; $status.media.movies_downloaded = $null }
 
 # -- Media: Sonarr -------------------------------------------------------------
 try {
-    $sBase  = UBase 'sonarr'
-    $series = Invoke-RestMethod "http://127.0.0.1:$sonarrPort${sBase}/api/v3/series" `
-                  -Headers @{'X-Api-Key'=$sonarrKey} -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
-    if ($null -eq $series) { $series = @() }
-    $series = @($series)
-    $status.media.series_total        = $series.Count
-    $status.media.episodes_total      = [int](($series | ForEach-Object { $_.statistics.totalEpisodeCount } | Measure-Object -Sum).Sum)
-    $status.media.episodes_downloaded = [int](($series | ForEach-Object { $_.statistics.episodeFileCount  } | Measure-Object -Sum).Sum)
+    $sBase   = UBase 'sonarr'
+    $rSeries = QuickGet "http://127.0.0.1:$sonarrPort${sBase}/api/v3/series" @{'X-Api-Key'=$sonarrKey} 10 -JsonOnly
+    if ($rSeries.ok) {
+        $series = if ($null -eq $rSeries.data) { @() } else { @($rSeries.data) }
+        $status.media.series_total        = $series.Count
+        $status.media.episodes_total      = [int](($series | ForEach-Object { $_.statistics.totalEpisodeCount } | Measure-Object -Sum).Sum)
+        $status.media.episodes_downloaded = [int](($series | ForEach-Object { $_.statistics.episodeFileCount  } | Measure-Object -Sum).Sum)
+    } else {
+        $status.media.series_total = $null; $status.media.episodes_total = $null; $status.media.episodes_downloaded = $null
+    }
 } catch { $status.media.series_total = $null; $status.media.episodes_total = $null; $status.media.episodes_downloaded = $null }
 
 # -- Downloads: Deluge (live session stats from web.update_ui) -----------------
@@ -494,7 +539,7 @@ if ($dlStats) {
 } elseif ($delugePassword -and $delugeLoggedIn) {
     $status.downloads = [ordered]@{ active = $null; error = 'Deluge session failed' }
 } else {
-    $status.downloads = [ordered]@{ active = $null; error = 'Deluge unavailable' }
+    $status.downloads = [ordered]@{ active = $null; error = $(if ($delugeEnabled) { 'Deluge unavailable' } else { 'Deluge disabled in config' }) }
 }
 
 # -- Security ------------------------------------------------------------------

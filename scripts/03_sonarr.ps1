@@ -14,6 +14,47 @@ if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "03_sonarr.ps1 started"
 
+# -- config.xml helpers --------------------------------------------------------
+# PowerShell's XML adapter cannot create a missing element by assignment (it
+# throws "property cannot be found"), and it hands back an element's text rather
+# than the node itself, so RemoveChild($xml.Config.UrlBase) fails. Both the
+# restore re-align and the post-first-run alignment below need to add or drop
+# nodes, so they go through these helpers.
+function Set-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name, [string]$Value)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $node.InnerText = $Value }
+    else {
+        $node = $Xml.CreateElement($Name)
+        $node.InnerText = $Value
+        $Xml.Config.AppendChild($node) | Out-Null
+    }
+}
+
+function Remove-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $Xml.Config.RemoveChild($node) | Out-Null }
+}
+
+function Test-ZipArchive {
+    # A download interrupted mid-transfer leaves a truncated file in bin/, and the
+    # cache lookup runs before the download on every later run -- so a partial zip
+    # would be retried forever instead of being fetched again.
+    param([string]$Path)
+    try {
+        if (-not ("System.IO.Compression.ZipFile" -as [type])) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        }
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try { $entryCount = $archive.Entries.Count } finally { $archive.Dispose() }
+        return ($entryCount -gt 0)
+    } catch {
+        Write-DebugLog "WARN" "Zip validation failed for '$Path': $_"
+        return $false
+    }
+}
+
 $AppName     = "Sonarr"
 $AppLower    = "sonarr"
 $AppPort     = $Config.Ports.Sonarr
@@ -67,6 +108,15 @@ $CachedZip = if ($VersionNumeric) {
 }
 Write-DebugLog "VAR cached zip found=$($null -ne $CachedZip) name=$($CachedZip.Name)"
 
+# Validate a cached zip before trusting it: an interrupted download leaves a
+# truncated file behind and the cache is consulted before GitHub on every run.
+if ($CachedZip -and -not (Test-ZipArchive -Path $CachedZip.FullName)) {
+    Write-Warning "  -> Cached $($CachedZip.Name) is incomplete. Removing it and downloading again."
+    Write-DebugLog "WARN" "Cached zip failed validation, deleting: $($CachedZip.FullName)"
+    Remove-Item -Path $CachedZip.FullName -Force -ErrorAction SilentlyContinue
+    $CachedZip = $null
+}
+
 if ($CachedZip) {
     Write-Host "  -> Using cached $($CachedZip.Name)..." -ForegroundColor Gray
     $ZipPath = $CachedZip.FullName
@@ -98,7 +148,17 @@ if ($CachedZip) {
     $ZipPath = Join-Path $BinDir $Asset.name
     Write-Host "  -> Downloading $AppName $($Release.tag_name)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Downloading $($Asset.browser_download_url) -> $ZipPath"
-    Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        # Never leave a partial file in the cache: the cached-zip branch above runs
+        # first on the next attempt, so a truncated download would be reused and
+        # every later run would die in Expand-Archive instead of downloading again.
+        if (Test-Path $ZipPath) { Remove-Item -Path $ZipPath -Force -ErrorAction SilentlyContinue }
+        Write-Warning "  -> Download failed: $_"
+        Write-DebugLog "ERROR" "Download failed from $($Asset.browser_download_url): $_"
+        exit 1
+    }
     $zipSize = (Get-Item $ZipPath).Length
     Write-DebugLog "INFO" "Download complete. File=$ZipPath size=$zipSize bytes"
     if (-not $PinnedVersion) { $PinnedVersion = $Release.tag_name }
@@ -111,8 +171,33 @@ if (-not (Test-Path $AppBinDir)) {
 }
 Write-Host "  -> Extracting..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Extracting $ZipPath -> $AppBinDir"
-Expand-Archive -Path $ZipPath -DestinationPath $AppBinDir -Force
+try {
+    Expand-Archive -Path $ZipPath -DestinationPath $AppBinDir -Force -ErrorAction Stop
+} catch {
+    # A cached zip can be corrupt past its central directory (the part Test-ZipArchive
+    # checks); drop it so the next run re-downloads rather than failing on the same
+    # file forever.
+    Write-Warning "  -> Extraction failed: $_"
+    Write-DebugLog "ERROR" "Extraction failed for '$ZipPath': $_"
+    if (Test-Path $ZipPath) { Remove-Item -Path $ZipPath -Force -ErrorAction SilentlyContinue }
+    exit 1
+}
 Write-DebugLog "INFO" "Extraction complete"
+
+# The release zip wraps everything in a single "Sonarr" folder. Flatten it, the
+# way 09_bazarr.ps1 and 10_flaresolverr.ps1 do, because update_sonarr.ps1 swaps
+# this directory with Swap-AppDirectoryWithRollback -- which flattens
+# single-directory zips. Leaving the install nested meant the registered NSSM
+# Application (<InstallDir>\Sonarr\Sonarr\Sonarr.exe) stopped existing after the
+# first update, so the new build could never start.
+$NestedExe = Join-Path $AppBinDir "$AppName\$AppName.exe"
+if ((Test-Path $NestedExe) -and -not (Test-Path (Join-Path $AppBinDir "$AppName.exe"))) {
+    $NestedDir = Join-Path $AppBinDir $AppName
+    Write-DebugLog "INFO" "Flattening single-directory archive: $NestedDir -> $AppBinDir"
+    Get-ChildItem -Path $NestedDir -Force | ForEach-Object { Move-Item -Path $_.FullName -Destination $AppBinDir -Force }
+    Remove-Item -Path $NestedDir -Recurse -Force
+    Write-DebugLog "INFO" "Archive flattened"
+}
 
 $AppExe = Get-ChildItem -Path $AppBinDir -Recurse -Filter "$AppName.exe" | Select-Object -First 1
 Write-DebugLog "VAR AppExe=$($AppExe.FullName)"
@@ -138,7 +223,13 @@ Write-DebugLog "VAR target sonarr.db exists=$(Test-Path $ArrDbFile)"
 if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
     Write-Host "  -> Restoring Sonarr data from previous install..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Restoring Sonarr data from $ArrBackupDir -> $DataDir"
-    Copy-Item -Path (Join-Path $ArrBackupDir "*") -Destination $DataDir -Force -ErrorAction SilentlyContinue
+    try {
+        Copy-Item -Path (Join-Path $ArrBackupDir "*") -Destination $DataDir -Force -ErrorAction Stop
+    } catch {
+        # SilentlyContinue used to hide this, and the backup was deleted regardless.
+        Write-Warning "  -> Could not restore Sonarr data from '$ArrBackupDir': $_"
+        Write-DebugLog "ERROR" "Sonarr data restore failed: $_"
+    }
 
     # Re-align the restored config.xml with the current config.json: the
     # port and URL base may have changed since the backup was taken.
@@ -146,21 +237,14 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
     if (Test-Path $ConfigXml) {
         try {
             [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
-            $xml.Config.Port = [string]$AppPort
+            Set-ConfigXmlValue -Xml $xml -Name "Port" -Value ([string]$AppPort)
             if ($DomainMode -eq "duckdns") {
-                if ($null -eq $xml.Config.UrlBase) {
-                    $node = $xml.CreateElement("UrlBase"); $node.InnerText = "/$AppLower"
-                    $xml.Config.AppendChild($node) | Out-Null
-                } else { $xml.Config.UrlBase = "/$AppLower" }
+                Set-ConfigXmlValue -Xml $xml -Name "UrlBase" -Value "/$AppLower"
             } else {
-                # PowerShell's XML adapter hands back an element's text (a String),
-                # not a node, so RemoveChild($xml.Config.UrlBase) throws
-                # ("cannot convert ... to type System.Xml.XmlNode"). That exception
-                # used to abort the whole re-align before $xml.Save(), leaving a
-                # stale UrlBase (and port) behind after a DuckDNS -> Cloudflare
-                # reinstall. Remove the node itself instead.
-                $urlBaseNode = $xml.Config.SelectSingleNode("UrlBase")
-                if ($urlBaseNode) { $xml.Config.RemoveChild($urlBaseNode) | Out-Null }
+                # A backup taken in DuckDNS mode still carries UrlBase=/sonarr; it must
+                # not survive a Cloudflare-mode reinstall. Remove the node (not the
+                # text) -- see Remove-ConfigXmlValue.
+                Remove-ConfigXmlValue -Xml $xml -Name "UrlBase"
             }
             $xml.Save($ConfigXml)
             Write-DebugLog "INFO" "Restored config.xml re-aligned: port=$AppPort"
@@ -174,8 +258,16 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
         }
     }
 
-    Remove-Item -Path $ArrBackupDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-DebugLog "INFO" "Sonarr backup cleaned up after restore"
+    # Keep the only copy of the previous library until the restore demonstrably
+    # worked: deleting it after a failed Copy-Item destroys the user's shows with
+    # no way back. sonarr.db is what the restore was for.
+    if (Test-Path $ArrDbFile) {
+        Remove-Item -Path $ArrBackupDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-DebugLog "INFO" "Sonarr backup cleaned up after restore"
+    } else {
+        Write-Warning "  -> Restore did not produce sonarr.db. Keeping the backup at $ArrBackupDir"
+        Write-DebugLog "WARN" "Restore did not produce $ArrDbFile -- backup left in place at $ArrBackupDir"
+    }
 } elseif (Test-Path $ArrBackupDir) {
     Write-DebugLog "INFO" "Sonarr backup found but sonarr.db already exists -- skip restore"
 } else {
@@ -203,6 +295,23 @@ if (-not $ExistingService) {
     Write-DebugLog "INFO" "NSSM service '$AppName' created. AppDirectory=$($AppExe.DirectoryName)"
 } else {
     Write-DebugLog "INFO" "NSSM service '$AppName' already exists. Skipping creation."
+    # Keep the registered path in step with the directory just extracted: the
+    # archive is flattened above, so a service left over from an older (nested)
+    # install would still point at <AppName>\<AppName>\<AppName>.exe, which no
+    # longer exists, and the service would fail to start.
+    $nssmCmd = (Get-Command nssm -ErrorAction SilentlyContinue).Source
+    if ($nssmCmd) {
+        $nssmCurrentApp = (& $nssmCmd get $AppName Application 2>$null | Out-String).Trim().Trim('"')
+        if ($nssmCurrentApp -ne $AppExe.FullName) {
+            Write-Host "  -> Re-pointing existing $AppName service at $($AppExe.FullName)..." -ForegroundColor Gray
+            Write-DebugLog "INFO" "NSSM Application re-pointed: '$nssmCurrentApp' -> '$($AppExe.FullName)'"
+            & $nssmCmd set $AppName Application $AppExe.FullName | Out-Null
+            & $nssmCmd set $AppName AppDirectory $AppExe.DirectoryName | Out-Null
+        }
+    } else {
+        Write-Warning "  -> nssm not found on PATH; cannot verify the exe path registered for the existing $AppName service."
+        Write-DebugLog "WARN" "nssm not found on PATH; existing $AppName service path not verified"
+    }
 }
 
 # 6. Firewall
@@ -229,67 +338,107 @@ while (-not (Test-Path $ConfigXml) -and (Get-Date) -lt $deadline) {
 }
 Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s"
 
-# 8. Set UrlBase for DuckDNS path mode
-if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
-    Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
-    $null = Stop-ServiceBounded -Name $AppName
-    # Stop-ServiceBounded returns as soon as the SCM reports Stopped, which can be
-    # before the NSSM-managed process has actually released its files.
-    # and a process that is still shutting down rewrites config.xml on its way out,
-    # discarding the edit made below. Wait for the service to report Stopped, the
-    # same way configure_layer1_sonarr.ps1 waits before restoring its config backup.
-    $stopDeadline = (Get-Date).AddSeconds(15)
-    do {
-        Start-Sleep -Seconds 1
-        $svcStopping = Get-Service -Name $AppName -ErrorAction SilentlyContinue
-    } while ($svcStopping -and $svcStopping.Status -ne "Stopped" -and (Get-Date) -lt $stopDeadline)
-    Write-DebugLog "VAR $AppName status after stop wait=$(if ($svcStopping) { $svcStopping.Status } else { 'N/A' })"
+# 8. Align config.xml with config.json (port always, UrlBase per domain mode)
+# Sonarr writes config.xml itself on first run, always on its default port 8989.
+# Only the restore path above used to apply Ports.Sonarr, so a fresh install with
+# a non-default port created the firewall rule and every Caddy/Layer 1/Layer 2
+# URL on the configured port while the app kept listening on 8989. In DuckDNS
+# mode UrlBase=/sonarr must be present; in Cloudflare mode it must not be.
+if (Test-Path $ConfigXml) {
+    $desiredUrlBase = if ($DomainMode -eq "duckdns") { "/$AppLower" } else { "" }
+    $alignPort      = $true
+    $alignUrlBase   = $true
     try {
-        [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
-        $beforeUrlBase = $xml.Config.UrlBase
-        Write-DebugLog "VAR config.xml UrlBase before='$beforeUrlBase'"
-        if ($null -ne $xml.Config.UrlBase) {
-            $xml.Config.UrlBase = "/$AppLower"
-        } else {
-            $node           = $xml.CreateElement("UrlBase")
-            $node.InnerText = "/$AppLower"
-            $xml.Config.AppendChild($node) | Out-Null
-        }
-        $xml.Save($ConfigXml)
-        Write-Host "  -> UrlBase set to /$AppLower (DuckDNS mode)." -ForegroundColor Green
-        Write-DebugLog "INFO" "config.xml UrlBase updated: '$beforeUrlBase' -> '/$AppLower'"
+        [xml]$currentXml = Get-Content -Path $ConfigXml -Encoding UTF8
+        $alignPort    = ([string]$currentXml.Config.Port) -ne ([string]$AppPort)
+        $alignUrlBase = ([string]$currentXml.Config.UrlBase) -ne $desiredUrlBase
+        Write-DebugLog "VAR config.xml port='$($currentXml.Config.Port)' UrlBase='$([string]$currentXml.Config.UrlBase)' desiredPort=$AppPort desiredUrlBase='$desiredUrlBase'"
     } catch {
-        Write-Warning "  -> Could not set UrlBase: $_"
-        Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
+        # Cannot read it -> rewrite both; the edit below reports the real reason.
+        Write-DebugLog "WARN" "Could not read $ConfigXml before aligning it: $_"
     }
-    $null = Start-ServiceBounded -Name $AppName
-    Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
 
-    # Verify the edit survived the restart. Without UrlBase Sonarr answers only on
-    # "/" while Caddy sends every request to "/sonarr", so a lost edit makes the app
-    # unreachable through the proxy -- worth a warning rather than a silent success.
-    Start-Sleep -Seconds 3
-    try {
-        [xml]$verifyXml = Get-Content -Path $ConfigXml -Encoding UTF8
-        $verifyUrlBase  = [string]$verifyXml.Config.UrlBase
-        if ($verifyUrlBase -ne "/$AppLower") {
-            Write-Warning "  -> config.xml UrlBase is '$verifyUrlBase' (expected '/$AppLower'). Sonarr will not answer on the /$AppLower path route."
-            Write-DebugLog "WARN" "UrlBase verification failed: got '$verifyUrlBase'"
-        } else {
-            Write-DebugLog "INFO" "UrlBase verification OK: '/$AppLower'"
+    if (-not $alignPort -and -not $alignUrlBase) {
+        Write-DebugLog "INFO" "config.xml already aligned: port=$AppPort UrlBase='$desiredUrlBase'"
+    } else {
+        Write-DebugLog "INFO" "Aligning config.xml in $DomainMode mode: port=$AppPort UrlBase='$desiredUrlBase' (portChange=$alignPort urlBaseChange=$alignUrlBase)"
+        $null = Stop-ServiceBounded -Name $AppName
+        # Stop-ServiceBounded returns as soon as the SCM reports Stopped, which can be
+        # before the NSSM-managed process has actually released its files, and a
+        # process that is still shutting down rewrites config.xml on its way out,
+        # discarding the edit made below. Wait for the service to report Stopped, the
+        # same way configure_layer1_sonarr.ps1 waits before restoring its config backup.
+        $stopDeadline = (Get-Date).AddSeconds(15)
+        do {
+            Start-Sleep -Seconds 1
+            $svcStopping = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+        } while ($svcStopping -and $svcStopping.Status -ne "Stopped" -and (Get-Date) -lt $stopDeadline)
+        Write-DebugLog "VAR $AppName status after stop wait=$(if ($svcStopping) { $svcStopping.Status } else { 'N/A' })"
+        try {
+            [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
+            $beforeUrlBase = [string]$xml.Config.UrlBase
+            Write-DebugLog "VAR config.xml UrlBase before='$beforeUrlBase'"
+            Set-ConfigXmlValue -Xml $xml -Name "Port" -Value ([string]$AppPort)
+            if ($desiredUrlBase) {
+                Set-ConfigXmlValue -Xml $xml -Name "UrlBase" -Value $desiredUrlBase
+            } else {
+                Remove-ConfigXmlValue -Xml $xml -Name "UrlBase"
+            }
+            $xml.Save($ConfigXml)
+            if ($desiredUrlBase) {
+                Write-Host "  -> config.xml aligned: port $AppPort, UrlBase $desiredUrlBase (DuckDNS mode)." -ForegroundColor Green
+            } else {
+                Write-Host "  -> config.xml aligned: port $AppPort, no UrlBase (Cloudflare mode)." -ForegroundColor Green
+            }
+            Write-DebugLog "INFO" "config.xml aligned: port=$AppPort UrlBase '$beforeUrlBase' -> '$desiredUrlBase'"
+        } catch {
+            Write-Warning "  -> Could not align config.xml: $_"
+            Write-DebugLog "ERROR" "config.xml alignment failed: $_"
         }
-    } catch {
-        Write-DebugLog "WARN" "UrlBase verification could not read config.xml: $_"
+        $null = Start-ServiceBounded -Name $AppName
+        Write-DebugLog "INFO" "$AppName restarted after config.xml change"
+
+        # Verify the edit survived the restart. Without UrlBase Sonarr answers only on
+        # "/" while Caddy sends every request to "/sonarr", so a lost edit makes the app
+        # unreachable through the proxy -- worth a warning rather than a silent success.
+        Start-Sleep -Seconds 3
+        try {
+            [xml]$verifyXml = Get-Content -Path $ConfigXml -Encoding UTF8
+            $verifyPort    = [string]$verifyXml.Config.Port
+            $verifyUrlBase = [string]$verifyXml.Config.UrlBase
+            if ($verifyPort -ne [string]$AppPort) {
+                Write-Warning "  -> config.xml Port is '$verifyPort' (expected '$AppPort'). Sonarr will not answer on port $AppPort."
+                Write-DebugLog "WARN" "Port verification failed: got '$verifyPort' (expected '$AppPort')"
+            } elseif ($verifyUrlBase -ne $desiredUrlBase) {
+                Write-Warning "  -> config.xml UrlBase is '$verifyUrlBase' (expected '$desiredUrlBase')."
+                Write-DebugLog "WARN" "UrlBase verification failed: got '$verifyUrlBase' (expected '$desiredUrlBase')"
+            } else {
+                Write-DebugLog "INFO" "config.xml verification OK: port=$AppPort UrlBase='$desiredUrlBase'"
+            }
+        } catch {
+            Write-DebugLog "WARN" "config.xml verification could not read config.xml: $_"
+        }
     }
-} elseif (-not (Test-Path $ConfigXml)) {
-    Write-Warning "  -> config.xml not found after 90s. UrlBase not set."
-    Write-DebugLog "WARN" "config.xml not generated within 90s. UrlBase not set."
 } else {
-    Write-DebugLog "INFO" "Cloudflare mode: UrlBase not needed"
+    # Without config.xml there is no API key to read and no port/UrlBase to set, so
+    # Layer 1 cannot configure the app and Caddy has nothing reachable to proxy to.
+    # Record nothing and fail: writing the lock here made the failure permanent,
+    # because every later run then reported "Already installed. Skipping.".
+    Write-Warning "  -> config.xml not found after 90s. Port and UrlBase not aligned."
+    Write-DebugLog "ERROR" "config.xml not generated within 90s; lock file and ledger NOT written so a re-run retries"
+    exit 1
 }
 
 # 9. Validate
 Start-Sleep -Seconds 3
+# NSSM keeps the service on LocalSystem if the "nssm set ObjectName" call above
+# failed, which silently bypasses the service-isolation model (and the ACLs that
+# grant seedbox-svc -- not LocalSystem administrators -- access to data and logs).
+$svcAccount = (Get-CimInstance Win32_Service -Filter "Name='$AppName'" -ErrorAction SilentlyContinue).StartName
+if ($svcAccount -and $svcAccount -notlike "*seedbox-svc*") {
+    Write-Warning "  -> $AppName runs as '$svcAccount' (expected '.\seedbox-svc'). Check the nssm ObjectName setting."
+    Write-DebugLog "WARN" "$AppName service account is '$svcAccount', expected .\seedbox-svc"
+}
 $svc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $AppName final status=$(if ($svc) { $svc.Status } else { 'NOT FOUND' })"
 if ($svc -and $svc.Status -eq "Running") {

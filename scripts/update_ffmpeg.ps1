@@ -62,8 +62,17 @@ try {
     $actual  = $install.Tag
     $lockDir = Join-Path $InstallDir ".locks"
     if (-not (Test-Path $lockDir)) { New-Item -Path $lockDir -ItemType Directory -Force | Out-Null }
-    [System.IO.File]::WriteAllText((Join-Path $lockDir ".ffmpeg.lock"), $actual, [System.Text.Encoding]::UTF8)
-    Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $actual
+    # BOM-free, like scripts\08_ffmpeg.ps1 writes it (the project convention is to
+    # never emit EF BB BF), and never zero-byte: WriteAllText of a null version
+    # creates an *empty* lock, which Get-InstalledVersion can only report as
+    # "unknown" while Set-InstalledVersion silently ignores it, leaving the ledger
+    # claiming the old version over a freshly installed binary.
+    if ($actual) {
+        [System.IO.File]::WriteAllText((Join-Path $lockDir ".ffmpeg.lock"), $actual, (New-Object System.Text.UTF8Encoding($false)))
+        Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $actual
+    } else {
+        Write-Warning "  -> the installed release tag is unknown; leaving the lock file and the ledger as they were."
+    }
 
     $detail = ""
     if ($actual -and $Version -and ($actual -ne $Version)) {

@@ -54,6 +54,34 @@ foreach ($d in @($GrafanaDir, $GrafanaData, $LokiDir, $LokiData, $AlloyDir, $All
 # UTF-8 without BOM -- Grafana and Go YAML parsers reject the BOM preamble
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
+# An archive left behind by an interrupted download is cached by Test-Path and
+# would fail extraction on every retry, so there is no way back without deleting
+# it by hand. Verify that a cached archive still opens before trusting it.
+function Test-ArchiveReadable {
+    param([string]$Path, [bool]$IsZip)
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        if ($IsZip) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Path)
+            $entries = $zip.Entries.Count
+            $zip.Dispose()
+            return ($entries -gt 0)
+        }
+        # tar.gz: reading the first block validates the gzip header, which catches
+        # a zero-length file and an HTML error page saved under the archive name.
+        $stream = [System.IO.File]::OpenRead($Path)
+        $gzip = New-Object System.IO.Compression.GZipStream($stream, [System.IO.Compression.CompressionMode]::Decompress)
+        $buffer = New-Object byte[] 512
+        $read = $gzip.Read($buffer, 0, 512)
+        $gzip.Dispose()
+        $stream.Dispose()
+        return ($read -gt 0)
+    } catch {
+        return $false
+    }
+}
+
 # -- Phase 1: Grafana ----------------------------------------------------------
 # Grafana binaries are on dl.grafana.com (not GitHub releases).
 # Strategy: query the Grafana stable API for version number, then probe known
@@ -67,9 +95,17 @@ $grafanaVerOverride = if ($Config._Versions -and $Config._Versions.Apps.Grafana 
 } else { $null }
 
 try {
-    # Get stable version from Grafana API (works regardless of GitHub)
-    $grafanaInfo = Invoke-RestMethod "https://grafana.com/api/grafana/versions/stable" `
-        -UseBasicParsing -TimeoutSec 30
+    # Get stable version from Grafana API (works regardless of GitHub). A pinned
+    # version in versions.json makes the API call unnecessary, so a grafana.com
+    # outage must not block an install whose version is already known.
+    $grafanaInfo = $null
+    try {
+        $grafanaInfo = Invoke-RestMethod "https://grafana.com/api/grafana/versions/stable" `
+            -UseBasicParsing -TimeoutSec 30
+    } catch {
+        if (-not $grafanaVerOverride) { throw }
+        Write-DebugLog "WARN" "Grafana version API unavailable; using pinned $grafanaVerOverride : $_"
+    }
     $grafanaVer = if ($grafanaVerOverride) { $grafanaVerOverride } else { $grafanaInfo.version }
     Write-DebugLog "INFO" "Grafana stable version=$grafanaVer (API=$($grafanaInfo.version) override=$grafanaVerOverride)"
 
@@ -81,13 +117,17 @@ try {
         "https://dl.grafana.com/oss/release/grafana-oss_${grafanaVer}_windows_amd64.tar.gz"
     )
 
-    # If the Grafana API returned a Windows package URL, prepend it
-    if ($grafanaInfo.packages) {
+    # If the Grafana API returned a Windows package URL, add it as a fallback. The
+    # packages entries carry os/arch ("win", not "windows") and point at the
+    # versioned dl.grafana.com/grafana/release/<ver>/ layout Grafana has moved to;
+    # the legacy dl.grafana.com/oss/release/grafana-<ver> URLs above stay first so
+    # the established download path is unchanged.
+    if ($grafanaInfo -and $grafanaInfo.packages) {
         $winPkg = $grafanaInfo.packages |
-            Where-Object { $_.platform -eq "windows" -and $_.arch -eq "amd64" } |
+            Where-Object { $_.os -eq "win" -and $_.arch -eq "amd64" } |
             Select-Object -First 1
         if ($winPkg -and $winPkg.url) {
-            $candidates = @($winPkg.url) + $candidates
+            $candidates = $candidates + @($winPkg.url)
             Write-DebugLog "VAR Grafana API package URL: $($winPkg.url)"
         }
     }
@@ -124,7 +164,11 @@ try {
 
     $isZip = $grafanaFileName -like "*.zip"
     $grafanaFile = Join-Path $BinDir $grafanaFileName
-    if (-not (Test-Path $grafanaFile)) {
+    if (-not (Test-ArchiveReadable -Path $grafanaFile -IsZip $isZip)) {
+        if (Test-Path $grafanaFile) {
+            Write-DebugLog "WARN" "Discarding unusable cached archive: $grafanaFile"
+            Remove-Item $grafanaFile -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "  [Grafana] Downloading $grafanaVer ($grafanaFileName)..." -ForegroundColor Gray
         Invoke-WebRequest -Uri $grafanaUrl -OutFile $grafanaFile -UseBasicParsing
         Write-DebugLog "INFO" "Grafana downloaded: $grafanaFile ($((Get-Item $grafanaFile).Length) bytes)"
@@ -201,7 +245,11 @@ try {
     if (-not $lokiAsset) { throw "loki-windows-amd64.exe.zip not found in release $lokiTag" }
 
     $lokiZip = Join-Path $BinDir "loki-$lokiTag-win.zip"
-    if (-not (Test-Path $lokiZip)) {
+    if (-not (Test-ArchiveReadable -Path $lokiZip -IsZip $true)) {
+        if (Test-Path $lokiZip) {
+            Write-DebugLog "WARN" "Discarding unusable cached archive: $lokiZip"
+            Remove-Item $lokiZip -Force -ErrorAction SilentlyContinue
+        }
         Write-Host "  [Loki] Downloading $lokiTag..." -ForegroundColor Gray
         Invoke-WebRequest -Uri $lokiAsset.browser_download_url -OutFile $lokiZip -UseBasicParsing
         Write-DebugLog "INFO" "Loki downloaded: $lokiZip"
@@ -242,7 +290,11 @@ try {
     if (-not $alloyAsset) { throw "alloy-windows-amd64.exe.zip not found in release $alloyTag" }
 
     $alloyZip = Join-Path $BinDir "alloy-$alloyTag-win.zip"
-    if (-not (Test-Path $alloyZip)) {
+    if (-not (Test-ArchiveReadable -Path $alloyZip -IsZip $true)) {
+        if (Test-Path $alloyZip) {
+            Write-DebugLog "WARN" "Discarding unusable cached archive: $alloyZip"
+            Remove-Item $alloyZip -Force -ErrorAction SilentlyContinue
+        }
         Invoke-WebRequest -Uri $alloyAsset.browser_download_url -OutFile $alloyZip -UseBasicParsing
         Write-DebugLog "INFO" "Alloy downloaded: $alloyZip"
     }
@@ -265,7 +317,9 @@ $lokiYaml = @"
 auth_enabled: false
 
 server:
+  http_listen_address: 127.0.0.1
   http_listen_port: $LokiPort
+  grpc_listen_address: 127.0.0.1
   grpc_listen_port: 9096
   log_level: warn
 
@@ -968,10 +1022,10 @@ $LokiLog  = Join-Path $LokiDir "loki.log"
 $AlloyLog = Join-Path $AlloyDir "alloy.log"
 
 # Loki readiness.
-# loki-config.yml sets server.http_listen_port ($LokiPort) but no
-# server.http_listen_address, so Loki binds all interfaces and is reachable on
-# 127.0.0.1:$LokiPort. Loki answers GET /ready with 200 once ready and 503 while
-# it is still starting.
+# loki-config.yml binds Loki (HTTP $LokiPort and gRPC 9096) to 127.0.0.1 -- it has
+# no authentication, and both Alloy and the Grafana data source reach it over
+# loopback -- so probe the loopback address. Loki answers GET /ready with 200 once
+# ready and 503 while it is still starting.
 if (Get-Service "Loki" -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 5
     $lokiState = (Get-Service "Loki" -ErrorAction SilentlyContinue).Status
@@ -998,6 +1052,10 @@ if (Get-Service "Loki" -ErrorAction SilentlyContinue) {
         if ($lokiReady) { break }
         Start-Sleep -Seconds 3
     }
+    # Re-read after the poll: Loki can still be StartPending when the loop begins
+    # and Running by the time it answers /ready, which would report a healthy
+    # component as WARN.
+    $lokiState = (Get-Service "Loki" -ErrorAction SilentlyContinue).Status
     Write-DebugLog "VAR Loki service=$lokiState ready=$lokiReady probe=$lokiProbe"
     if ($lokiReady -and $lokiState -eq "Running") {
         Write-Host "  -> Loki readiness: PASS (service=$lokiState, GET /ready: $lokiProbe)." -ForegroundColor Green
@@ -1064,7 +1122,15 @@ Write-DebugLog "VAR Grafana API ready=$grafanaReady"
 
 $svcGrafana = Get-Service "Grafana" -ErrorAction SilentlyContinue
 if ($svcGrafana -and $svcGrafana.Status -eq "Running") {
-    Write-Host "  -> Grafana running on port $GrafanaPort." -ForegroundColor Green
+    if ($grafanaReady) {
+        Write-Host "  -> Grafana running on port $GrafanaPort." -ForegroundColor Green
+    } else {
+        # The service is Running but /api/health never answered. NSSM's
+        # "AppExit Default Restart" keeps a crash-looping Grafana in Running, so
+        # the service state alone is not proof the UI is up.
+        Write-Host "  -> Grafana service is Running but $grafanaHealthUrl did not answer within 60s. Check $GrafanaData\logs\grafana.log" -ForegroundColor Yellow
+        Write-DebugLog "WARN" "Grafana service Running but API probe $grafanaHealthUrl never answered"
+    }
 } else {
     Write-Host "  -> Grafana may not have started. Check $GrafanaData\logs\grafana.log" -ForegroundColor Yellow
 }
@@ -1137,9 +1203,32 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe) {
         # BOM-free -- parsed by Caddy (Go), see 01_webserver.ps1.
         [System.IO.File]::WriteAllText($CaddyfilePath, $caddyContent, (New-Object System.Text.UTF8Encoding($false)))
         try { & $caddyExe fmt --overwrite $CaddyfilePath 2>&1 | Out-Null } catch {}
-        try { & $caddyExe reload --config $CaddyfilePath 2>&1 | Out-Null } catch {}
-        Write-Host "  -> Caddyfile updated and reloaded." -ForegroundColor Green
-        Write-DebugLog "INFO" "Caddy reloaded with Grafana route"
+        # A rejected reload leaves the running Caddy on its previous config, so the
+        # route is on disk but not live. Report that instead of claiming success.
+        # Caddy writes JSON logs to stderr on success too, so relax EAP for the call
+        # (same pattern as the tar extraction above) and judge by exit code.
+        $reloadOk   = $false
+        $reloadNote = ""
+        $savedEap   = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            $reloadOut = & $caddyExe reload --config $CaddyfilePath 2>&1 | Out-String
+            $reloadOk  = ($LASTEXITCODE -eq 0)
+            if (-not $reloadOk) {
+                $reloadNote = "exit {0}: {1}" -f $LASTEXITCODE, $reloadOut.Trim()
+            }
+        } catch {
+            $reloadNote = $_.Exception.Message
+        } finally {
+            $ErrorActionPreference = $savedEap
+        }
+        if ($reloadOk) {
+            Write-Host "  -> Caddyfile updated and reloaded." -ForegroundColor Green
+            Write-DebugLog "INFO" "Caddy reloaded with Grafana route"
+        } else {
+            Write-Warning "  -> Caddyfile has the Grafana route but Caddy refused to reload it: $reloadNote"
+            Write-DebugLog "WARN" "Caddy reload failed after the Grafana patch: $reloadNote"
+        }
     } else {
         Write-DebugLog "INFO" "Grafana route already present in Caddyfile - skipping"
     }
@@ -1167,10 +1256,20 @@ if ($DomainMode -eq "cloudflare") {
             Write-Host "  -> Running immediate DNS update for grafana..." -ForegroundColor DarkGray
             try {
                 $prevEap = $ErrorActionPreference
-                $ErrorActionPreference = "Continue"
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterPath 2>&1 | Out-Null
-                $ErrorActionPreference = $prevEap
-                Write-DebugLog "INFO" "Immediate DNS update for grafana triggered"
+                try {
+                    $ErrorActionPreference = "Continue"
+                    $dnsOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterPath 2>&1 | Out-String
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                # Without the A record the new subdomain resolves nowhere; the
+                # scheduled updater retries, but say so instead of reporting success.
+                if ($LASTEXITCODE -eq 0) {
+                    Write-DebugLog "INFO" "Immediate DNS update for grafana succeeded"
+                } else {
+                    Write-Warning "  -> Immediate DNS update failed (exit $LASTEXITCODE). The scheduled updater will retry."
+                    Write-DebugLog "WARN" "Immediate DNS update for grafana failed (exit=$LASTEXITCODE): $($dnsOut.Trim())"
+                }
             } catch {
                 Write-DebugLog "WARN" "Immediate DNS update for grafana failed (will retry on schedule): $_"
             }

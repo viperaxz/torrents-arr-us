@@ -295,7 +295,9 @@ if (-not $svcExists) {
     nssm set $AppName Start          SERVICE_AUTO_START | Out-Null
     nssm set $AppName AppStdout      (Join-Path $DataDir "jellyseerr-stdout.log") | Out-Null
     nssm set $AppName AppStderr      (Join-Path $DataDir "jellyseerr-stderr.log") | Out-Null
-    # the loudest of these (it logs at debug), so this matters most here.
+    # Jellyseerr logs at debug, so it is the loudest writer in this suite and rotation
+    # matters most here.  AppRotateOnline stays unset on purpose: it wedges nssm
+    # services in StopPending.
     nssm set $AppName AppRotateFiles 1 | Out-Null
     nssm set $AppName AppRotateBytes 5242880 | Out-Null
     nssm set $AppName ObjectName     ".\$SvcUser" $SvcPass | Out-Null
