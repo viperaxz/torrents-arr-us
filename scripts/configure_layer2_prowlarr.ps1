@@ -860,11 +860,69 @@ if ($seedRulesMap.Count -gt 0) {
 $syncTargets = @()
 if ($Config.Apps.Sonarr -eq $true -and (Test-Path "C:\ProgramData\Sonarr\config.xml")) {
     $syncTargets += @{ Name="Sonarr"; Port=$Config.Ports.Sonarr; UrlBase=$SonarrUrlBase
-                       Xml="C:\ProgramData\Sonarr\config.xml" }
+                       Xml="C:\ProgramData\Sonarr\config.xml"
+                       Db="C:\ProgramData\Sonarr\sonarr.db" }
 }
 if ($Config.Apps.Radarr -eq $true -and (Test-Path "C:\ProgramData\Radarr\config.xml")) {
     $syncTargets += @{ Name="Radarr"; Port=$Config.Ports.Radarr; UrlBase=$RadarrUrlBase
-                       Xml="C:\ProgramData\Radarr\config.xml" }
+                       Xml="C:\ProgramData\Radarr\config.xml"
+                       Db="C:\ProgramData\Radarr\radarr.db" }
+}
+
+# Which synced indexers still carry a key other than Prowlarr's current one?
+# The API masks apiKey as "********", so it cannot be compared through REST, and
+# probing a few indexers only proves those few are fine. The Settings JSON in each
+# app's own database holds the real value, and reading it needs no admin rights the
+# installer lacks. Returns $null when the answer is unknown (no python, no db).
+# Section 5d only resolves Python when it has CF indexers to enable, so resolve it
+# once here: both the DB read below and the SQLite fallback in the repair need it.
+$prowlarrPythonExe = $pythonExe
+if (-not $prowlarrPythonExe) {
+    if (Test-Path "C:\Python312\python.exe") {
+        $prowlarrPythonExe = "C:\Python312\python.exe"
+    } else {
+        $gcPy = Get-Command python -ErrorAction SilentlyContinue
+        if ($gcPy) { $prowlarrPythonExe = $gcPy.Source }
+    }
+}
+Write-DebugLog "VAR apiKey repair python=$(if ($prowlarrPythonExe) { $prowlarrPythonExe } else { 'not found' })"
+
+function Get-StaleProwlarrIndexerIds {
+    param([string]$DbPath, [string]$ProwlarrKey)
+    if (-not $prowlarrPythonExe -or -not (Test-Path $DbPath)) {
+        Write-DebugLog "VAR apiKey check skipped for $DbPath (python=$(if ($prowlarrPythonExe) { $prowlarrPythonExe } else { 'not found' }), db=$(Test-Path $DbPath))"
+        return $null
+    }
+    $pySrc = @'
+import sqlite3, sys, json
+db = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+rows = db.execute("SELECT Id, Settings FROM Indexers").fetchall()
+db.close()
+stale = []
+for rid, s in rows:
+    try:
+        cfg = json.loads(s)
+    except Exception:
+        continue
+    if 'apiKey' in cfg and cfg['apiKey'] != sys.argv[2]:
+        stale.append(rid)
+print(json.dumps(stale))
+'@
+    $tmpPy = [System.IO.Path]::GetTempFileName() + '.py'
+    try {
+        [System.IO.File]::WriteAllText($tmpPy, ($pySrc -split "`r?`n" -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+        $savedEAP = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $raw = & $prowlarrPythonExe $tmpPy $DbPath $ProwlarrKey 2>&1 | Out-String
+        } finally { $ErrorActionPreference = $savedEAP }
+        return @(($raw.Trim() | ConvertFrom-Json))
+    } catch {
+        Write-DebugLog "WARN" "Could not read stored indexer keys from $DbPath : $_"
+        return $null
+    } finally {
+        Remove-Item $tmpPy -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($syncTargets.Count -gt 0) {
@@ -914,7 +972,7 @@ if ($syncTargets.Count -gt 0) {
                 } catch {
                     $plPutErr = $_
                     if ($plAttempt -lt 2) {
-                        Write-DebugLog "WARN" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_"
+                        Write-DebugLog "DEBUG" "Prowlarr indexer '$($plIdx.name)' PUT failed (attempt $plAttempt), retrying: $_"
                         Start-Sleep -Seconds 5
                     }
                 }
@@ -976,6 +1034,126 @@ if ($syncTargets.Count -gt 0) {
         if ($probed -gt 0 -and $stale.Count -eq 0) { break }
         if ((Get-Date) -ge $syncDeadline) { break }
         Start-Sleep -Seconds 5
+    }
+
+    # Prowlarr generates a NEW API key when its data directory is recreated, while the
+    # uninstaller preserves Sonarr's and Radarr's data with the previous key baked into
+    # every synced indexer. Every feed request then answers 401, and because the *arr
+    # validates an indexer on PUT, every later write fails with 400 as well -- on a
+    # clean uninstall -> install cycle this hit all 33 indexers in both apps and the
+    # seed-ratio step could not set a single one.
+    #
+    # The stored key cannot be read back (both apps return the mask "********"), so
+    # detect staleness by behaviour: re-PUT one indexer unchanged and look for a 401
+    # from Prowlarr in the validation failure. That keeps a healthy reinstall at one
+    # request per app instead of 33 (measured: a blind repair of both apps took 395s).
+    # A PUT carrying the mask ******** leaves the real key untouched, so the probe is
+    # harmless.
+    $keyRepaired  = 0
+    foreach ($t in $syncTargets) {
+        # Per app: ids are not unique across Sonarr and Radarr, so a list carried
+        # between iterations would write the wrong rows.
+        $keyApiFailed = [System.Collections.Generic.List[int]]::new()
+        $tKey  = ([xml](Get-Content $t.Xml -Encoding UTF8)).Config.ApiKey
+        $tBase = "http://127.0.0.1:$($t.Port)$($t.UrlBase)"
+        $tHdrs = @{"X-Api-Key"=$tKey; "Content-Type"="application/json"}
+
+        $staleIds = Get-StaleProwlarrIndexerIds -DbPath $t.Db -ProwlarrKey $ApiKey
+        if ($null -eq $staleIds) {
+            Write-DebugLog "WARN" "$($t.Name): could not determine the stored indexer keys; skipping the apiKey repair"
+            continue
+        }
+        if ($staleIds.Count -eq 0) {
+            Write-DebugLog "VAR $($t.Name) apiKey check: all stored keys already match Prowlarr"
+            continue
+        }
+        Write-DebugLog "WARN" "$($t.Name): $($staleIds.Count) synced indexer(s) still hold the previous Prowlarr key -- repairing"
+        Write-Host "     $($t.Name): repairing the Prowlarr API key on $($staleIds.Count) indexer(s)..." -ForegroundColor Gray
+
+        try {
+            $tIdx = Invoke-RestMethod "$tBase/api/v3/indexer" -Headers $tHdrs -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Write-DebugLog "WARN" "$($t.Name): could not list indexers for the apiKey repair: $_"
+            continue
+        }
+        foreach ($e in $tIdx) {
+            if ($staleIds -notcontains [int]$e.id) { continue }
+            $k = $e.fields | Where-Object { $_.name -eq 'apiKey' } | Select-Object -First 1
+            if (-not $k) { continue }
+            Set-ApiFieldValue -Field $k -Value $ApiKey
+            # The *arr validates the indexer on PUT by fetching its caps, so a slow
+            # tracker can reject an otherwise correct write; retry with backoff.
+            $krDelays = @(5, 10)
+            $repaired = $false
+            for ($kr = 1; $kr -le 3; $kr++) {
+                try {
+                    Invoke-RestMethod "$tBase/api/v3/indexer/$($e.id)" -Method Put -Headers $tHdrs `
+                        -Body ($e | ConvertTo-Json -Depth 20 -Compress) `
+                        -UseBasicParsing -ErrorAction Stop | Out-Null
+                    $keyRepaired++
+                    $repaired = $true
+                    Write-DebugLog "INFO" "$($t.Name) indexer '$($e.name)' apiKey repaired to the current Prowlarr key"
+                    break
+                } catch {
+                    if ($kr -lt 3) { Start-Sleep -Seconds $krDelays[$kr - 1] }
+                    else { Write-DebugLog "WARN" "$($t.Name) indexer '$($e.name)' apiKey repair via API failed after 3 attempts: $_" }
+                }
+            }
+            if (-not $repaired) { $keyApiFailed += [int]$e.id }
+            Start-Sleep -Milliseconds 300
+        }
+
+        # An indexer Prowlarr itself is failing (429 from its own backoff) can never
+        # pass the *arr's validation-on-PUT, so the API cannot carry the key and the
+        # row stays stale -- a deadlock that would outlive the tracker's outage. Write
+        # the key straight into the app's database for just those rows, the same
+        # approach section 6 already uses when Prowlarr rejects a minimumSeeders PUT.
+        if ($keyApiFailed.Count -gt 0) {
+            Write-DebugLog "VAR $($t.Name) apiKey repair fell back to SQLite for ids: $($keyApiFailed -join ',')"
+            try {
+                $null = Stop-ServiceBounded -Name $t.Name
+                $sqlStopDl = (Get-Date).AddSeconds(20)
+                while ((Get-Service $t.Name -ErrorAction SilentlyContinue).Status -eq "Running" -and (Get-Date) -lt $sqlStopDl) {
+                    Start-Sleep -Seconds 1
+                }
+                $idsList = $keyApiFailed -join ','
+                $pyKey = @'
+import sqlite3, sys, json
+db = sqlite3.connect(sys.argv[1])
+ids = [int(x) for x in sys.argv[2].split(",")]
+n = 0
+for row_id, s in db.execute("SELECT Id,Settings FROM Indexers WHERE Id IN (%s)" % ",".join("?"*len(ids)), ids).fetchall():
+    cfg = json.loads(s)
+    if "apiKey" in cfg:
+        cfg["apiKey"] = sys.argv[3]
+        db.execute("UPDATE Indexers SET Settings=? WHERE Id=?", (json.dumps(cfg), row_id))
+        n += 1
+db.commit(); db.close(); print(n)
+'@
+                $tmpKeyPy = [System.IO.Path]::GetTempFileName() + '.py'
+                [System.IO.File]::WriteAllText($tmpKeyPy, ($pyKey -split "`r?`n" -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+                $savedEAP = $ErrorActionPreference
+                try {
+                    $ErrorActionPreference = 'Continue'
+                    $sqlKeyResult = & $prowlarrPythonExe $tmpKeyPy $t.Db $idsList $ApiKey 2>&1 | Out-String
+                } finally { $ErrorActionPreference = $savedEAP }
+                Remove-Item $tmpKeyPy -Force -ErrorAction SilentlyContinue
+                $keyRepaired += [int]($sqlKeyResult.Trim())
+                Write-DebugLog "INFO" "$($t.Name) apiKey written directly for $($sqlKeyResult.Trim()) indexer(s) Prowlarr is currently failing"
+            } catch {
+                Write-DebugLog "WARN" "$($t.Name) apiKey SQLite fallback failed: $_"
+            } finally {
+                $null = Start-ServiceBounded -Name $t.Name
+                $sqlStartDl = (Get-Date).AddSeconds(30)
+                while ((Get-Service $t.Name -ErrorAction SilentlyContinue).Status -ne "Running" -and (Get-Date) -lt $sqlStartDl) {
+                    Start-Sleep -Seconds 1
+                }
+            }
+        }
+    }
+    if ($keyRepaired -gt 0) {
+        Write-Host "     OK Repaired the Prowlarr API key on $keyRepaired synced indexer(s)." -ForegroundColor Green
+        Write-DebugLog "INFO" "Repaired the Prowlarr API key on $keyRepaired synced indexer(s)"
     }
 
     # The scheduled sync gets it right on its own; if it was rate-limited or still

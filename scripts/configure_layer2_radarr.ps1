@@ -238,6 +238,26 @@ if ($Layer2Config.DownloadClients -and $Layer2Config.DownloadClients.Count -gt 0
 }
 
 # -- 6. Configure seed criteria -----------------------------------------------
+function Invoke-IndexerPut {
+    param([string]$Uri, [hashtable]$Headers, [string]$Body)
+    try {
+        $r = Invoke-WebRequest -Uri $Uri -Method Put -Headers $Headers -Body $Body `
+            -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        return [pscustomobject]@{ Ok = $true; Status = [int]$r.StatusCode; Body = '' }
+    } catch {
+        $resp = $_.Exception.Response
+        $bodyText = ''
+        if ($resp) {
+            try {
+                $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+                $bodyText = $sr.ReadToEnd()
+            } catch { }
+            return [pscustomobject]@{ Ok = $false; Status = [int]$resp.StatusCode; Body = $bodyText }
+        }
+        return [pscustomobject]@{ Ok = $false; Status = 0; Body = $_.Exception.Message }
+    }
+}
+
 $SeedRatio = if ($Config.Layer2.PSObject.Properties['PublicTrackerSeedRatio'] -and $null -ne $Config.Layer2.PublicTrackerSeedRatio) {
     [double]$Config.Layer2.PublicTrackerSeedRatio
 } else { 1.0 }
@@ -262,6 +282,7 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
             -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
         Write-DebugLog "VAR Radarr indexers from API=$($radarrIndexers.Count)"
 
+        $skippedUnavailable = 0
         foreach ($idx in $radarrIndexers) {
             $baseName   = $idx.name -replace '\s*\(Prowlarr\)\s*$', ''
             if ($SeedRuleIndexerNames -contains $baseName) {
@@ -282,11 +303,23 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
             $idx.PSObject.Properties | ForEach-Object { $payload[$_.Name] = $_.Value }
             $body = $payload | ConvertTo-Json -Depth 10 -Compress
 
-            try {
-                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/indexer/$($idx.id)" `
-                    -Method Put `
-                    -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
-                    -Body $body -UseBasicParsing -ErrorAction Stop | Out-Null
+            # Same as the Sonarr twin: the *arr validates the indexer on PUT by asking
+            # Prowlarr for its caps, so retry with backoff and keep the response body
+            # (it names the real cause: 429 backoff or no results for the categories).
+            $putOk   = $false
+            $putBody = ''
+            $putDelays = @(5, 10)
+            for ($putAttempt = 1; $putAttempt -le 3; $putAttempt++) {
+                $res = Invoke-IndexerPut -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/indexer/$($idx.id)" `
+                    -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} -Body $body
+                $putBody = $res.Body
+                if ($res.Ok) { $putOk = $true; break }
+                if ($putAttempt -lt 3) {
+                    Write-DebugLog "DEBUG" "Indexer '$($idx.name)' PUT rejected (attempt $putAttempt, HTTP $($res.Status)), retrying"
+                    Start-Sleep -Seconds $putDelays[$putAttempt - 1]
+                }
+            }
+            if ($putOk) {
                 if ($isPublic) {
                     Write-Host "     [OK] $($idx.name): seed ratio set to $SeedRatio" -ForegroundColor Green
                     Write-DebugLog "INFO" "Indexer '$($idx.name)' seed ratio set to $SeedRatio"
@@ -294,10 +327,24 @@ if ($SeedRatio -and $ConfiguredIndexerNames.Count -gt 0) {
                     Write-Host "     [OK] $($idx.name): seed ratio cleared (private  --  unlimited)" -ForegroundColor Green
                     Write-DebugLog "INFO" "Indexer '$($idx.name)' seed ratio cleared (private)"
                 }
-            } catch {
-                Write-Warning "     Failed to update seed ratio for '$($idx.name)': $_"
-                Write-DebugLog "WARN" "Failed to update seed ratio for '$($idx.name)': $_"
+            } else {
+                # See the Sonarr twin: a 429 from Prowlarr means the tracker is in its
+                # own failure backoff, and "no results in the configured categories"
+                # means the definition cannot answer this app at all. Neither is
+                # something this installer can fix.
+                if ($putBody -match '\[429' -or $putBody -match 'no results in the configured categor') {
+                    $skippedUnavailable++
+                    Write-DebugLog "INFO" "Indexer '$($idx.name)' skipped: Prowlarr cannot serve it for these categories (429 backoff or no results)"
+                } else {
+                    $firstErr = if ($putBody -match 'errorMessage"\s*:\s*"([^"]+)') { $Matches[1] } else { $putBody }
+                    Write-Warning "     Failed to update seed ratio for '$($idx.name)': $firstErr"
+                    Write-DebugLog "WARN" "Failed to update seed ratio for '$($idx.name)' after 3 attempts: $firstErr"
+                }
             }
+        }
+        if ($skippedUnavailable -gt 0) {
+            Write-Host "     $skippedUnavailable indexer(s) skipped: Prowlarr cannot serve them for these categories (429 backoff or no results) -- not a config problem." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "$skippedUnavailable indexer(s) skipped because Prowlarr cannot serve them (429 or no results in the requested categories)"
         }
     } catch {
         Write-Warning "[$AppName] Failed to configure seed criteria: $_"
