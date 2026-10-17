@@ -6,6 +6,12 @@
 #   .\test-suite.ps1 -Service Sonarr -Layer 2 # one service, one layer
 #   .\test-suite.ps1 -Quick                   # L1 only across all services
 #
+# -ScheduledDaily is what the Seedbox_TestSuiteFull task passes: it refuses to run
+# twice on the same calendar day, because a full pass performs real operations (an
+# RSS sync over every synced indexer, a live indexer search, a magnet added and
+# removed) and more than one of those per day is not wanted. Manual runs are never
+# gated.
+#
 # Results are pushed to Loki when Apps.Grafana = true (works unelevated) and also
 # exported to <InstallDir>\dashboard\test_results.json. That directory is
 # administrator-only (README: "Install directory permissions"), so run this from
@@ -15,7 +21,8 @@
 param(
     [string]$Service = '',
     [int]$Layer      = 0,
-    [switch]$Quick
+    [switch]$Quick,
+    [switch]$ScheduledDaily
 )
 
 $ErrorActionPreference = 'Continue'
@@ -28,6 +35,30 @@ if (-not (Test-Path $configPath)) {
 }
 $Config     = Get-Content $configPath -Raw | ConvertFrom-Json
 $InstallDir = $Config.General.InstallDir
+
+# -- Once-per-day guard (scheduled full run only) -------------------------------
+# The day is claimed *before* the suite runs, so a hung or crashed run cannot be
+# retried into a second full pass the same day. Task Scheduler's -StartWhenAvailable
+# can fire a missed run late; the stamp still keeps it to one per calendar day.
+if ($ScheduledDaily) {
+    $dailyStamp = Join-Path $InstallDir '.locks\test-suite-full.last-run'
+    $today      = (Get-Date).ToString('yyyy-MM-dd')
+    if (Test-Path $dailyStamp) {
+        $lastRun = (Get-Content -Path $dailyStamp -Raw -ErrorAction SilentlyContinue)
+        if ($null -ne $lastRun) { $lastRun = $lastRun.Trim() }
+        if ($lastRun -eq $today) {
+            Write-Host "[TestSuite] The full suite already ran today ($today). Skipping." -ForegroundColor DarkGray
+            return
+        }
+    }
+    try {
+        $stampDir = Split-Path -Parent $dailyStamp
+        if (-not (Test-Path $stampDir)) { New-Item -Path $stampDir -ItemType Directory -Force | Out-Null }
+        [System.IO.File]::WriteAllText($dailyStamp, $today, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Warning "[TestSuite] Could not claim today in $dailyStamp : $($_.Exception.Message)"
+    }
+}
 
 . (Join-Path $PSScriptRoot 'tests\Helpers.ps1')
 

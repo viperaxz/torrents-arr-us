@@ -405,6 +405,35 @@ if (Test-Path $suiteScript) {
     } catch {
         Write-DebugLog "WARN" "Initial health check run failed: $_"
     }
+
+    # Daily full pass. The 15-minute task above is Layer 1 only; a full pass runs real
+    # operations (RSS sync over every synced indexer, a live indexer search, a magnet
+    # added and removed), so it is scheduled once a day and -ScheduledDaily refuses a
+    # second run on the same calendar day.
+    try {
+        $fullAction    = New-ScheduledTaskAction -Execute "powershell.exe" `
+                            -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$suiteScript`" -ScheduledDaily"
+        $fullTrigger   = New-ScheduledTaskTrigger -Daily -At "04:00"
+        $fullSettings  = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                            -MultipleInstances IgnoreNew `
+                            -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
+        $fullPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+                            -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName "Seedbox_TestSuiteFull" -Action $fullAction -Trigger $fullTrigger `
+            -Settings $fullSettings -Principal $fullPrincipal -Force | Out-Null
+        $fullTask = Get-ScheduledTask -TaskName "Seedbox_TestSuiteFull" -ErrorAction SilentlyContinue
+        if ($fullTask) {
+            Write-Host "  Full health-check task registered (test-suite daily at 04:00, once per day)." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Scheduled task 'Seedbox_TestSuiteFull' registered (daily 04:00, state=$($fullTask.State))"
+        } else {
+            Write-Warning "  Seedbox_TestSuiteFull did NOT register -- the full suite will not run on a schedule."
+            Write-DebugLog "ERROR" "Seedbox_TestSuiteFull registration did not take effect"
+        }
+    } catch {
+        Write-Warning "Could not register the full health-check task: $_"
+        Write-DebugLog "WARN" "Failed to register scheduled task 'Seedbox_TestSuiteFull': $_"
+    }
 }
 
 # -- Register 'box' CLI in system PATH ----------------------------------------
