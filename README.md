@@ -46,7 +46,7 @@ A fully automated, Swizzin-inspired **Windows media server installer** written i
 - **Subtitle automation**: Bazarr pre-configured with subtitle providers and language profiles (English + Romanian out of the box, easily adjusted).
 - **Dynamic DNS**: a scheduled task under `seedbox-svc` updates your public IP every 5 minutes.
 - **Cloudflare bypass**: Flaresolverr runs as a local Windows service and is registered with Prowlarr automatically — unlocks CF-protected trackers with no per-indexer setup.
-- **Public indexers**: the enabled entries of `Layer2.Prowlarr.Indexers` (8 of the 12 shipped in `config.json.example`) are added to Prowlarr during Layer 2.
+- **Public indexers**: the enabled entries of `Layer2.Prowlarr.Indexers` (all 30 public trackers shipped in `config.json.example`) are added to Prowlarr during Layer 2.
 - **Media request portal**: Jellyseerr is installed and fully wired to Jellyfin, Sonarr, and Radarr — users request movies/shows through a Netflix-style UI without ever touching the *arr apps directly.
 - **Shared user provisioning**: users defined once in `config.json` are created in both Jellyfin and Jellyseerr automatically; no duplicate admin work across apps.
 - **Debug logging**: opt-in structured log file (`General.DebugLogging: true`) capturing every phase, variable, and API call for post-install diagnosis.

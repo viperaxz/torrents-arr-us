@@ -159,8 +159,9 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Recyclarr is downloaded at Layer 2 time and run to push these profiles into Sonarr/Radarr via their APIs.
 
 ### Public Indexer Configuration
-- Layer 2 auto-adds the enabled entries of a curated indexer list to Prowlarr via its API — `config.json.example` ships 12 entries with 8 enabled (Nyaa.si, LimeTorrents, Knaben, and others).
-- Indexers are declared in `config.json.example` under `Layer2.Prowlarr.Indexers` as `{Name, DefinitionName, Enabled}` entries — the list is fully customizable, and only an explicit `"Enabled": false` skips an entry (a missing `Enabled` property is treated as enabled).
+- Layer 2 auto-adds the enabled entries of a curated indexer list to Prowlarr via its API — `config.json.example` ships 34 entries: **30 public trackers enabled** (1337x, The Pirate Bay, Knaben, Nyaa.si, RuTor, Torrent9, Zamunda LIFE, …) plus 4 private trackers left `"Enabled": false` as credential placeholders.
+- Indexers are declared in `config.json.example` under `Layer2.Prowlarr.Indexers` as `{Name, DefinitionName, Enabled, FlareSolverr}` entries — the list is fully customizable, and only an explicit `"Enabled": false` skips an entry (a missing `Enabled` property is treated as enabled).
+- `"FlareSolverr": true` forces the indexer through the solver even when Prowlarr's schema does not report `info_flaresolverr`. Public trackers turn Cloudflare on long before their indexer definitions catch up, so all 30 public entries set it; a blocked indexer is unusable, and a non-CF indexer pays nothing for the tag (measured: The Pirate Bay 0.7s tagged, 1337x 14.2s tagged — the solver only engages on a challenge). Remove the property per indexer to opt out.
 - A `Layer2.MinimumSeeders` threshold (default 1) is applied globally to all indexers; it is only pushed when greater than 1, since 1 means "no minimum".
 
 ### Cloudflare CAPTCHA Bypass (Flaresolverr)

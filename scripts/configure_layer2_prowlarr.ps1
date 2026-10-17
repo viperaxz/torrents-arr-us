@@ -386,6 +386,15 @@ foreach ($idx in $Layer2Config.Indexers) {
             Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=TRUE (hardcoded fallback)"
         }
     }
+    # Explicit opt-in from config.json. Public trackers turn their Cloudflare setup
+    # on long before Prowlarr's indexer definitions catch up, and a blocked indexer
+    # is simply unusable, so let the operator force the solver per indexer.
+    if ($idx.PSObject.Properties['FlareSolverr'] -and $idx.FlareSolverr -eq $true) {
+        if (-not $needsFlare) {
+            Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=TRUE (FlareSolverr=true in config.json)"
+        }
+        $needsFlare = $true
+    }
     Write-DebugLog "VAR indexer '$idxName' (def=$idxDef) needsFlare=$needsFlare"
 
     $exists = $existingIndexers | Where-Object { $_.definitionName -eq $idxDef -or $_.name -eq $idxName }
