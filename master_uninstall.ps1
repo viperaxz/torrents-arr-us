@@ -138,6 +138,8 @@ function Remove-MachinePathEntry {
 # reboot. PendingFileRenameOperations is processed before services start, so
 # queue files first and then directories deepest-first; each directory is empty
 # by the time its own delete entry runs.
+# Returns { Queued; AlreadyQueued } so the caller can distinguish "nothing to do,
+# an earlier run already scheduled it" from "could not be queued at all".
 function Register-PathForDeletionAtReboot {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -147,7 +149,7 @@ function Register-PathForDeletionAtReboot {
     $items += @(Get-ChildItem -LiteralPath $Path -Recurse -Force -Directory -ErrorAction SilentlyContinue |
                 Sort-Object -Property @{ Expression = { $_.FullName.Length } } -Descending)
     $items += @(Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
-    if ($items.Count -eq 0) { return 0 }
+    if ($items.Count -eq 0) { return [PSCustomObject]@{ Queued = 0; AlreadyQueued = 0 } }
 
     $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     $existing = (Get-ItemProperty -Path $key -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
@@ -158,7 +160,8 @@ function Register-PathForDeletionAtReboot {
         foreach ($e in @($existing)) { $entries.Add([string]$e) }
     }
 
-    $queued = 0
+    $queued  = 0
+    $skipped = 0
     $already = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($e in $entries) { if ($e) { [void]$already.Add([string]$e) } }
     foreach ($item in $items) {
@@ -167,14 +170,17 @@ function Register-PathForDeletionAtReboot {
         # A path queued by an earlier uninstall that has not rebooted yet must not be
         # queued again -- repeated cycles without a reboot would otherwise keep
         # appending the same 17 entries per profile folder to this value forever.
-        if (-not $already.Add('\??\' + $full)) { continue }
+        if (-not $already.Add('\??\' + $full)) { $skipped++; continue }
         $entries.Add('\??\' + $full)
         $entries.Add('')
         $queued++
     }
-    if ($queued -eq 0) { return 0 }
+    # AlreadyQueued is reported separately so a caller can tell "nothing to do,
+    # it is already scheduled" (the repeat-uninstall-without-reboot case) from
+    # "this path could not be queued at all".
+    if ($queued -eq 0) { return [PSCustomObject]@{ Queued = 0; AlreadyQueued = $skipped } }
     Set-ItemProperty -Path $key -Name PendingFileRenameOperations -Value ([string[]]$entries.ToArray()) -Type MultiString -ErrorAction Stop
-    return $queued
+    return [PSCustomObject]@{ Queued = $queued; AlreadyQueued = $skipped }
 }
 
 # -- 1. Stop any stray processes -----------------------------------------------
@@ -704,15 +710,20 @@ if ($svcExists) {
         # UsrClass.dat stays mapped by the still-loaded hive until reboot. Queue
         # the tree for deletion before services start rather than telling the
         # operator to clean it up by hand after every uninstall.
-        $queued = 0
+        $registration = [PSCustomObject]@{ Queued = 0; AlreadyQueued = 0 }
         try {
-            $queued = Register-PathForDeletionAtReboot -Path $profileDir
+            $registration = Register-PathForDeletionAtReboot -Path $profileDir
         } catch {
             Write-DebugLog "ERROR" "Could not queue $profileDir for deletion at reboot: $_"
         }
-        if ($queued -gt 0) {
-            Write-Host "  -> $profileDir is locked until reboot; deletion queued for next boot ($queued entries)." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "Queued $queued entries under $profileDir for deletion at next boot"
+        if ($registration.Queued -gt 0) {
+            Write-Host "  -> $profileDir is locked until reboot; deletion queued for next boot ($($registration.Queued) entries)." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Queued $($registration.Queued) entries under $profileDir for deletion at next boot"
+        } elseif ($registration.AlreadyQueued -gt 0) {
+            # Repeat uninstall before the pending reboot: the entries are already in
+            # PendingFileRenameOperations, so nothing is missing and nothing is done.
+            Write-Host "  -> $profileDir is locked until reboot; deletion was already queued by an earlier run." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "$profileDir already queued for deletion at next boot ($($registration.AlreadyQueued) entries)"
         } else {
             Write-Warning "  -> $profileDir is locked and could not be queued for deletion  --  remove it manually after reboot."
             Write-DebugLog "WARN" "$profileDir still locked after removal attempt and could not be queued"
