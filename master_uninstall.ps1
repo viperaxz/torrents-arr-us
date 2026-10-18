@@ -408,7 +408,7 @@ if (Test-Path $jfDir) {
 Write-Host "[3/8] Removing scheduled tasks..." -ForegroundColor Cyan
 Write-DebugLog "INFO" "=== PHASE 3: Remove scheduled tasks ==="
 foreach ($task in @("Seedbox_Cloudflare_Updater", "Seedbox_DuckDNS_Updater",
-                    "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update",
+                    "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update", "Seedbox_CaddyLogRelay",
                     "Seedbox_Status_Collector", "Seedbox_TestSuite", "Seedbox_TestSuiteFull",
                     "Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh",
                     "win-seedbox Update Check")) {

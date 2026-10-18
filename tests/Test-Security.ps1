@@ -41,7 +41,7 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     $acquisPath = Join-Path $CsConfigDir 'acquis.yaml'
     if (Test-Path $acquisPath) {
         $acquis = Get-Content $acquisPath -Raw -ErrorAction SilentlyContinue
-        $hasCaddy = $acquis -match 'caddy-access\.log'
+        $hasCaddy = $acquis -match 'caddy-access(-relay)?\.log'
         $hasEvtLog = $acquis -match 'security-4625\.xml'
         $Script:Results.Add((New-TestResult $svc 2 'CaddyAcquisition' `
             $(if ($hasCaddy) { 'PASS' } else { 'FAIL' }) 'Caddy access log registered as a CrowdSec datasource'))
@@ -50,6 +50,58 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     } else {
         $Script:Results.Add((New-TestResult $svc 2 'CaddyAcquisition' 'SKIP' "acquis.yaml not found at $acquisPath"))
         $Script:Results.Add((New-TestResult $svc 2 'EventLogAcquisition' 'SKIP' 'acquis.yaml not found'))
+    }
+
+    # Configured is not the same as consuming. The Caddy access log is the only
+    # source covering HTTP (every proxied app sits behind it), and a file tail can
+    # start cleanly ("Adding file ... to datasources") and then never read a line,
+    # in which case HTTP attacks are invisible while acquis.yaml, the collection and
+    # the parsers all look correct. If the log has been written since the engine
+    # started but cscli reports zero reads for it, that source is dead.
+    $caddyLogPath = $null
+    if ($acquis) {
+        $mCaddy = [regex]::Match($acquis, "-\s*'([^']*caddy-access(?:-relay)?\.log)'")
+        if ($mCaddy.Success) { $caddyLogPath = $mCaddy.Groups[1].Value }
+    }
+    if (-not $caddyLogPath -or -not (Test-Path -LiteralPath $caddyLogPath) -or -not (Test-Path $CsCli)) {
+        $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'SKIP' 'Caddy access log or cscli not available'))
+    } else {
+        $csReads    = -1
+        $engineStart = $null
+        try {
+            $metrics = ((& $CsCli metrics -o json 2>$null | Out-String) | ConvertFrom-Json)
+            $mKey    = "file:$caddyLogPath"
+            if ($metrics.acquisition -and $metrics.acquisition.PSObject.Properties[$mKey]) {
+                $csReads = [int]$metrics.acquisition.$mKey.reads
+            } else {
+                $csReads = 0
+            }
+        } catch { $csReads = -1 }
+        try {
+            $csSvcObj = Get-Service 'crowdsec' -ErrorAction SilentlyContinue
+            if ($csSvcObj) {
+                $csProcId = (Get-CimInstance -ClassName Win32_Service -Filter "Name='$($csSvcObj.Name)'" -ErrorAction Stop).ProcessId
+                if ($csProcId) { $engineStart = (Get-Process -Id $csProcId -ErrorAction Stop).StartTime }
+            }
+        } catch { $engineStart = $null }
+        $caddyWritten = (Get-Item -LiteralPath $caddyLogPath).LastWriteTime
+        # The engine anchors the tail at EOF on startup, so lines written before it
+        # started are deliberately skipped. Judging "log newer than the engine" with
+        # no margin turned a sub-second ordering into a false FAIL immediately after
+        # the post-install restart. Only call it dead once the file has been written
+        # well past the engine's start and CrowdSec still has not read anything.
+        $missedTraffic = ($engineStart -and $caddyWritten -gt $engineStart.AddSeconds(60) -and $csReads -eq 0)
+        if ($csReads -lt 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'WARN' 'cscli metrics could not be read'))
+        } elseif ($missedTraffic) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'FAIL' `
+                "Caddy log written $($caddyWritten.ToString('HH:mm:ss')) (engine started $($engineStart.ToString('HH:mm:ss'))) but CrowdSec read 0 lines -- the tail is stuck, HTTP detection is dead"))
+        } elseif ($csReads -eq 0) {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'WARN' `
+                'No Caddy lines consumed yet (no matching HTTP traffic since the engine started)'))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 2 'CaddyDatasourceLive' 'PASS' "$csReads line(s) consumed from the Caddy access log"))
+        }
     }
 
     # Whitelist -- the guard against banning yourself.

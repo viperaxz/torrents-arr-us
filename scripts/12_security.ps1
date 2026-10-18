@@ -21,6 +21,10 @@ $AppName    = "Security"
 $InstallDir = $Config.General.InstallDir
 $LockFile   = Join-Path $InstallDir ".locks\.security.lock"
 $ScriptsDir = $PSScriptRoot
+# Every helper a scheduled task runs is staged here.  A task that points back into
+# the source tree dies silently as soon as that clone is moved or deleted, and the
+# install tree would then be the only thing left with no copy of the script.
+$installScripts = Join-Path $InstallDir "scripts"
 
 # CrowdSec fixed install locations (set by the MSI / chocolatey package)
 $CsProgramDir = "C:\Program Files\CrowdSec"
@@ -317,17 +321,26 @@ try {
     # (step 1d) extracts the fields the downstream parsers need.
     $logDir          = Join-Path $InstallDir "logs"
     $caddyLogPath    = Join-Path $logDir "caddy-access.log"
+    # CrowdSec tails the RELAY copy, not Caddy's file. Caddy keeps its log open for
+    # writing and CrowdSec's file acquisition on Windows does not see bytes appended
+    # through that handle (measured: 0 lines consumed while real requests piled up;
+    # it only caught up when another process wrote to the file). Seedbox_CaddyLogRelay
+    # copies new complete lines here every minute, and because those bytes come from
+    # a different process CrowdSec consumes them.
+    $caddyRelayPath  = Join-Path $logDir "caddy-access-relay.log"
     $security4625Log = Join-Path $logDir "security-4625.xml"
-    Write-DebugLog "VAR caddyLogPath=$caddyLogPath"
+    Write-DebugLog "VAR caddyLogPath=$caddyLogPath relay=$caddyRelayPath"
     Write-DebugLog "VAR security4625Log=$security4625Log"
 
     $acquis = @"
 # Managed by win-seedbox (scripts/12_security.ps1) -- edits will be overwritten.
 ---
-# Caddy JSON access log. Covers every service behind the reverse proxy:
-# Jellyfin, Sonarr, Radarr, Prowlarr, Bazarr, Deluge Web UI, Jellyseerr, dashboard.
+# Caddy JSON access log, mirrored by Seedbox_CaddyLogRelay. Covers every service
+# behind the reverse proxy: Jellyfin, Sonarr, Radarr, Prowlarr, Bazarr, Deluge Web
+# UI, Jellyseerr, dashboard. Feed this the relay copy, never caddy-access.log
+# itself: see scripts/relay_caddy_log.ps1 for why.
 filenames:
-  - '$caddyLogPath'
+  - '$caddyRelayPath'
 labels:
   type: caddy
 ---
@@ -381,7 +394,6 @@ statics:
     # Copies the export script from the project tree and registers a SYSTEM
     # scheduled task that runs every 5 minutes.
     $exportScriptSrc  = Join-Path $ScriptsDir "export_security_events.ps1"
-    $installScripts   = Join-Path $InstallDir "scripts"
     $exportScriptDst  = Join-Path $installScripts "export_security_events.ps1"
     if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
     Copy-Item -LiteralPath $exportScriptSrc -Destination $exportScriptDst -Force
@@ -725,7 +737,18 @@ Write-DebugLog "VAR bouncerOk=$bouncerOk"
 if ($DoBlocklists) {
     Write-Host "  [Blocklist] Fetching abuse IP lists (Spamhaus + Firehol)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "=== PHASE 3: Abuse blocklists ==="
-    $blocklistScript = Join-Path $ScriptsDir "update_blocklists.ps1"
+    # Stage the updater next to the other task helpers.  The task used to point
+    # straight at the source tree, so deleting or moving the clone left a 6-hourly
+    # task that failed forever with no trace in the install tree -- and nothing to
+    # run by hand either.
+    $blocklistScript = Join-Path $installScripts "update_blocklists.ps1"
+    try {
+        if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
+        Copy-Item -LiteralPath (Join-Path $ScriptsDir "update_blocklists.ps1") -Destination $blocklistScript -Force
+    } catch {
+        $blocklistScript = Join-Path $ScriptsDir "update_blocklists.ps1"
+        Write-DebugLog "WARN" "Could not stage update_blocklists.ps1 into $installScripts, using ${blocklistScript}: $_"
+    }
     try {
         & $blocklistScript
         # update_blocklists.ps1 exits 1 when no rules could be applied or a rule
@@ -753,7 +776,7 @@ if ($DoBlocklists) {
         -LogonType ServiceAccount -RunLevel Highest
 
     $blAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$blocklistScript`""
+        -Argument "-NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$blocklistScript`""
     $blTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
         -RepetitionInterval (New-TimeSpan -Hours 6) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -769,6 +792,59 @@ if ($DoBlocklists) {
 } else {
     Write-Host "  [Blocklist] Disabled via Security.AbuseBlocklists." -ForegroundColor DarkGray
     Write-DebugLog "INFO" "Abuse blocklists disabled by config"
+}
+
+# -- 1j. Caddy log relay for CrowdSec ----------------------------------------
+# CrowdSec cannot consume the Caddy access log directly on Windows: Caddy keeps the
+# file open for writing and the acquisition only advances when a different process
+# writes bytes to it (measured: 0 lines while requests piled up, then 8/8 parsed the
+# instant another handle appended). This task mirrors new complete lines into
+# caddy-access-relay.log, which acquis.yaml points at. One minute of latency, which
+# is well inside CrowdSec's ban windows, and no duplicate parsing of the source.
+Write-Host "  -> Registering the Caddy log relay for CrowdSec..." -ForegroundColor Gray
+$relaySrc = Join-Path $ScriptsDir "relay_caddy_log.ps1"
+$relayDst = Join-Path $installScripts "relay_caddy_log.ps1"
+$relayScript = $null
+try {
+    if (-not (Test-Path $installScripts)) { New-Item -Path $installScripts -ItemType Directory -Force | Out-Null }
+    Copy-Item -LiteralPath $relaySrc -Destination $relayDst -Force -ErrorAction Stop
+    $relayScript = $relayDst
+} catch {
+    $relayScript = $relaySrc
+    Write-DebugLog "WARN" "Could not stage relay_caddy_log.ps1 into ${installScripts}, using ${relayScript}: $_"
+}
+if ((Test-Path $relayScript) -and $crowdsecOk) {
+    # Run it once now so the relay file exists and CrowdSec has something to tail
+    # before the first scheduled tick.
+    try { & $relayScript -InstallDir $InstallDir } catch { Write-DebugLog "WARN" "Initial relay run failed: $_" }
+
+    $relayAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$relayScript`" -InstallDir `"$InstallDir`""
+    $relayTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $relaySettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -MultipleInstances IgnoreNew
+    $relayPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+        -LogonType ServiceAccount -RunLevel Highest
+    try {
+        Register-ScheduledTask -TaskName "Seedbox_CaddyLogRelay" `
+            -Action $relayAction -Trigger $relayTrigger `
+            -Settings $relaySettings -Principal $relayPrincipal -Force | Out-Null
+        $relayTask = Get-ScheduledTask -TaskName "Seedbox_CaddyLogRelay" -ErrorAction SilentlyContinue
+        if ($relayTask -and $relayTask.State -in @('Ready', 'Running')) {
+            Write-Host "     OK Caddy log relay registered (every minute, SYSTEM)." -ForegroundColor Green
+            Write-DebugLog "INFO" "Seedbox_CaddyLogRelay registered and armed (state=$($relayTask.State))"
+        } else {
+            Write-Warning "     Caddy log relay task is not armed -- HTTP attack detection will stay idle."
+            Write-DebugLog "ERROR" "Seedbox_CaddyLogRelay registered but state=$(if ($relayTask) { $relayTask.State } else { 'missing' })"
+        }
+    } catch {
+        Write-Warning "     Could not register Seedbox_CaddyLogRelay: $_"
+        Write-DebugLog "ERROR" "Seedbox_CaddyLogRelay registration failed: $_"
+    }
+} else {
+    Write-DebugLog "WARN" "Caddy log relay not registered (relay script present=$(Test-Path $relayScript), crowdsecOk=$crowdsecOk)"
 }
 
 # -- Summary -------------------------------------------------------------------

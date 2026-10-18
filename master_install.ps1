@@ -550,6 +550,32 @@ if ($Config.Apps.Grafana -eq $true) {
     }
 }
 
+# Restart CrowdSec last, for the same reason as Alloy but with a sharper edge:
+# its file acquisition anchors each source at EOF on startup and remembers a byte
+# offset. The install recreates D:\MediaServer\logs\caddy-access.log while CrowdSec
+# is already running, so the offset ends up past the new EOF and the tail silently
+# reads nothing -- HTTP detection (the only source covering every proxied app) goes
+# dark while the service still looks healthy. Re-anchoring at the end of the install
+# is the fix; verified live: 6 lines read, 6 parsed by crowdsecurity/caddy-logs.
+$csSvc = Get-Service -Name "Crowdsec" -ErrorAction SilentlyContinue
+if ($csSvc) {
+    $caddyAccessLog = Join-Path $Config.General.InstallDir "logs\caddy-access.log"
+    Write-Host "  Restarting CrowdSec so its log tail re-anchors to the final files..." -ForegroundColor DarkGray
+    $null = Restart-ServiceBounded -Name "Crowdsec"
+    Start-Sleep -Seconds 5
+    $csSvc = Get-Service -Name "Crowdsec" -ErrorAction SilentlyContinue
+    if ($csSvc -and $csSvc.Status -eq "Running") {
+        if (Test-Path $caddyAccessLog) {
+            Write-DebugLog "INFO" "CrowdSec restarted post-install; tail re-anchored to $caddyAccessLog"
+        } else {
+            Write-DebugLog "WARN" "CrowdSec restarted but $caddyAccessLog does not exist -- HTTP detection has no source"
+        }
+    } else {
+        Write-Warning "  CrowdSec did not restart -- HTTP attack detection may be inactive."
+        Write-DebugLog "WARN" "CrowdSec restart failed: service is $(if ($csSvc) { $csSvc.Status } else { 'missing' })"
+    }
+}
+
 Write-Host ""
 Write-Host "=============================================" -ForegroundColor Green
 Write-Host "  Installation complete!" -ForegroundColor Green
