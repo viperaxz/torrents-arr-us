@@ -217,33 +217,107 @@ $waited    = 0
 while (-not (Test-Path $ConfigXml) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 3; $waited += 3 }
 Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s"
 
-if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
-    Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
-    $null = Stop-ServiceBounded -Name $AppName
-    Start-Sleep -Seconds 3
-    try {
-        [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
-        $beforeUrlBase = $xml.Config.UrlBase
-        Write-DebugLog "VAR config.xml UrlBase before='$beforeUrlBase'"
-        if ($null -ne $xml.Config.UrlBase) { $xml.Config.UrlBase = "/$AppLower" }
-        else {
-            $node = $xml.CreateElement("UrlBase"); $node.InnerText = "/$AppLower"
-            $xml.Config.AppendChild($node) | Out-Null
-        }
-        $xml.Save($ConfigXml)
-        Write-Host "  -> UrlBase set to /$AppLower (DuckDNS mode)." -ForegroundColor Green
-        Write-DebugLog "INFO" "config.xml UrlBase updated: '$beforeUrlBase' -> '/$AppLower'"
-    } catch {
-        Write-Warning "  -> Could not set UrlBase: $_"
-        Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
-    }
-    $null = Start-ServiceBounded -Name $AppName
-    Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
-} elseif (-not (Test-Path $ConfigXml)) {
+if (-not (Test-Path $ConfigXml)) {
     Write-Warning "  -> config.xml not found after 90s."
     Write-DebugLog "WARN" "config.xml not generated within 90s"
 } else {
-    Write-DebugLog "INFO" "Cloudflare mode: UrlBase not needed"
+    # 8. UrlBase: "/radarr" for DuckDNS path routing, none for a Cloudflare
+    # subdomain. Every Layer 1/2 call is built as
+    # http://127.0.0.1:$Port$UrlBase/api/v3/..., so the file and the mode have to
+    # agree or the app is unreachable through Caddy while its API answers on the
+    # other path.
+    $DesiredUrlBase = if ($DomainMode -eq "duckdns") { "/$AppLower" } else { "" }
+
+    # Radarr rewrites config.xml itself, and a process that is still shutting down
+    # does so on its way out -- discarding an edit made in that window.
+    # Stop-ServiceBounded returns as soon as the SCM reports Stopped, which can be
+    # before the NSSM-managed process has actually exited, so wait for Stopped and
+    # read the file back afterwards to prove the edit survived the restart.
+    function Set-RadarrUrlBase {
+        param([string]$ConfigXmlPath, [string]$UrlBase)
+
+        $null = Stop-ServiceBounded -Name $AppName
+        $stopDeadline = (Get-Date).AddSeconds(15)
+        do {
+            Start-Sleep -Seconds 1
+            $svcStopping = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+        } while ($svcStopping -and $svcStopping.Status -ne "Stopped" -and (Get-Date) -lt $stopDeadline)
+        Write-DebugLog "VAR $AppName status after stop wait=$(if ($svcStopping) { $svcStopping.Status } else { 'N/A' })"
+
+        try {
+            [xml]$xml = Get-Content -Path $ConfigXmlPath -Encoding UTF8 -ErrorAction Stop
+            $beforeUrlBase = [string]$xml.Config.UrlBase
+            $urlBaseNode = $xml.Config.SelectSingleNode("UrlBase")
+            if ($UrlBase) {
+                if ($urlBaseNode) {
+                    $xml.Config.UrlBase = $UrlBase
+                } else {
+                    $node = $xml.CreateElement("UrlBase"); $node.InnerText = $UrlBase
+                    $xml.Config.AppendChild($node) | Out-Null
+                }
+            } else {
+                # PowerShell's XML adapter hands back an element's text (a String),
+                # not a node, so RemoveChild($xml.Config.UrlBase) throws. Remove the
+                # node it returns from SelectSingleNode instead.
+                if ($urlBaseNode) { $xml.Config.RemoveChild($urlBaseNode) | Out-Null }
+            }
+            $xml.Save($ConfigXmlPath)
+            Write-DebugLog "INFO" "config.xml UrlBase '$beforeUrlBase' -> '$UrlBase'"
+        } catch {
+            Write-Warning "  -> Could not set UrlBase: $_"
+            Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
+        }
+
+        $null = Start-ServiceBounded -Name $AppName
+
+        # Verify the edit survived the restart. A lost UrlBase leaves Radarr
+        # answering only on "/" while Caddy routes "/radarr/*" (or the reverse),
+        # and nothing later re-checks the file.
+        Start-Sleep -Seconds 3
+        try {
+            [xml]$verifyXml = Get-Content -Path $ConfigXmlPath -Encoding UTF8 -ErrorAction Stop
+            $verifyUrlBase = [string]$verifyXml.Config.UrlBase
+            if ($verifyUrlBase -ne $UrlBase) {
+                Write-Warning "  -> config.xml UrlBase is '$verifyUrlBase' (expected '$UrlBase'). $AppName will not answer on its $DomainMode route."
+                Write-DebugLog "WARN" "UrlBase verification failed: got '$verifyUrlBase', expected '$UrlBase'"
+                return $false
+            }
+            Write-DebugLog "INFO" "UrlBase verification OK: '$UrlBase'"
+        } catch {
+            Write-Warning "  -> Could not verify config.xml UrlBase: $_"
+            Write-DebugLog "WARN" "UrlBase verification could not read config.xml: $_"
+            return $false
+        }
+        return $true
+    }
+
+    # Radarr may still be writing config.xml when it first appears; an empty or
+    # partial document is not an error worth acting on yet.
+    $CurrentUrlBase = $null
+    $readDeadline = (Get-Date).AddSeconds(15)
+    while ($null -eq $CurrentUrlBase -and (Get-Date) -lt $readDeadline) {
+        try {
+            [xml]$urlBaseXml = Get-Content -Path $ConfigXml -Encoding UTF8 -ErrorAction Stop
+            $CurrentUrlBase = [string]$urlBaseXml.Config.UrlBase
+        } catch { Start-Sleep -Seconds 1 }
+    }
+
+    if ($null -eq $CurrentUrlBase) {
+        Write-Warning "  -> Could not read $ConfigXml. UrlBase not applied."
+        Write-DebugLog "WARN" "could not read config.xml to apply UrlBase"
+    } elseif ($CurrentUrlBase -eq $DesiredUrlBase) {
+        Write-DebugLog "INFO" "$DomainMode mode: config.xml UrlBase already '$CurrentUrlBase'"
+    } else {
+        Write-DebugLog "INFO" "$DomainMode mode: config.xml UrlBase '$CurrentUrlBase' -> '$DesiredUrlBase'"
+        if (Set-RadarrUrlBase -ConfigXmlPath $ConfigXml -UrlBase $DesiredUrlBase) {
+            if ($DesiredUrlBase) {
+                Write-Host "  -> UrlBase set to $DesiredUrlBase (DuckDNS mode)." -ForegroundColor Green
+            } else {
+                Write-Host "  -> Stale UrlBase removed (Cloudflare mode)." -ForegroundColor Green
+            }
+        }
+        Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
+    }
 }
 
 Start-Sleep -Seconds 3

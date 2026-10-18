@@ -162,33 +162,101 @@ $waited    = 0
 while (-not (Test-Path $ConfigXml) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 3; $waited += 3 }
 Write-DebugLog "VAR config.xml created=$(Test-Path $ConfigXml) waited=${waited}s"
 
-if ($DomainMode -eq "duckdns" -and (Test-Path $ConfigXml)) {
-    Write-DebugLog "INFO" "DuckDNS mode: setting UrlBase=/$AppLower in $ConfigXml"
-    $null = Stop-ServiceBounded -Name $AppName
-    Start-Sleep -Seconds 3
-    try {
-        [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
-        $beforeUrlBase = $xml.Config.UrlBase
-        Write-DebugLog "VAR config.xml UrlBase before='$beforeUrlBase'"
-        if ($null -ne $xml.Config.UrlBase) { $xml.Config.UrlBase = "/$AppLower" }
-        else {
-            $node = $xml.CreateElement("UrlBase"); $node.InnerText = "/$AppLower"
-            $xml.Config.AppendChild($node) | Out-Null
-        }
-        $xml.Save($ConfigXml)
-        Write-Host "  -> UrlBase set to /$AppLower (DuckDNS mode)." -ForegroundColor Green
-        Write-DebugLog "INFO" "config.xml UrlBase updated: '$beforeUrlBase' -> '/$AppLower'"
-    } catch {
-        Write-Warning "  -> Could not set UrlBase: $_"
-        Write-DebugLog "ERROR" "config.xml UrlBase update failed: $_"
+# Align config.xml with config.json: the port always, UrlBase per domain mode.
+# Prowlarr writes config.xml itself on first run, always on its default port 9696,
+# and the old DuckDNS-only block never touched Port -- so a fresh install on a
+# non-default Ports.Prowlarr created the firewall rule and every Caddy/Layer 1/2
+# URL on the configured port while the app kept listening on 9696. The same block
+# also left a DuckDNS UrlBase in place when the mode was Cloudflare (a retry after
+# a failed DuckDNS install), where Caddy routes the app at the root.
+# Prowlarr rewrites config.xml on shutdown, so the edit only survives if the
+# process has really stopped -- the same sequence as 03_sonarr.ps1.
+function Set-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name, [string]$Value)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $node.InnerText = $Value }
+    else {
+        $node = $Xml.CreateElement($Name)
+        $node.InnerText = $Value
+        $Xml.Config.AppendChild($node) | Out-Null
     }
-    $null = Start-ServiceBounded -Name $AppName
-    Write-DebugLog "INFO" "$AppName restarted after UrlBase change"
-} elseif (-not (Test-Path $ConfigXml)) {
-    Write-Warning "  -> config.xml not found after 90s."
-    Write-DebugLog "WARN" "config.xml not generated within 90s"
+}
+
+function Remove-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $Xml.Config.RemoveChild($node) | Out-Null }
+}
+
+if (Test-Path $ConfigXml) {
+    $desiredUrlBase = if ($DomainMode -eq "duckdns") { "/$AppLower" } else { "" }
+    $alignPort      = $true
+    $alignUrlBase   = $true
+    try {
+        [xml]$currentXml = Get-Content -Path $ConfigXml -Encoding UTF8
+        $alignPort    = ([string]$currentXml.Config.Port) -ne ([string]$AppPort)
+        $alignUrlBase = ([string]$currentXml.Config.UrlBase) -ne $desiredUrlBase
+        Write-DebugLog "VAR config.xml port='$($currentXml.Config.Port)' UrlBase='$([string]$currentXml.Config.UrlBase)' desiredPort=$AppPort desiredUrlBase='$desiredUrlBase'"
+    } catch {
+        # Cannot read it -> rewrite both; the edit below reports the real reason.
+        Write-DebugLog "WARN" "Could not read $ConfigXml before aligning it: $_"
+    }
+
+    if (-not $alignPort -and -not $alignUrlBase) {
+        Write-DebugLog "INFO" "config.xml already aligned: port=$AppPort UrlBase='$desiredUrlBase'"
+    } else {
+        Write-DebugLog "INFO" "Aligning config.xml ($DomainMode mode): port=$AppPort UrlBase='$desiredUrlBase' (portChange=$alignPort urlBaseChange=$alignUrlBase)"
+        $null = Stop-ServiceBounded -Name $AppName
+        $stopDeadline = (Get-Date).AddSeconds(15)
+        do {
+            Start-Sleep -Seconds 1
+            $svcStopping = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+        } while ($svcStopping -and $svcStopping.Status -ne "Stopped" -and (Get-Date) -lt $stopDeadline)
+        try {
+            [xml]$xml = Get-Content -Path $ConfigXml -Encoding UTF8
+            $beforeUrlBase = [string]$xml.Config.UrlBase
+            Write-DebugLog "VAR config.xml UrlBase before='$beforeUrlBase'"
+            Set-ConfigXmlValue -Xml $xml -Name "Port" -Value ([string]$AppPort)
+            if ($desiredUrlBase) {
+                Set-ConfigXmlValue -Xml $xml -Name "UrlBase" -Value $desiredUrlBase
+            } else {
+                Remove-ConfigXmlValue -Xml $xml -Name "UrlBase"
+            }
+            $xml.Save($ConfigXml)
+            Write-Host "  -> config.xml aligned: port $AppPort, UrlBase '$desiredUrlBase'." -ForegroundColor Green
+            Write-DebugLog "INFO" "config.xml aligned: port=$AppPort UrlBase '$beforeUrlBase' -> '$desiredUrlBase'"
+        } catch {
+            Write-Warning "  -> Could not align config.xml: $_"
+            Write-DebugLog "ERROR" "config.xml alignment failed: $_"
+        }
+        $null = Start-ServiceBounded -Name $AppName
+        Write-DebugLog "INFO" "$AppName restarted after config.xml change"
+
+        # Verify the edit survived the restart. Prowlarr answers only on its
+        # config.xml port and, in DuckDNS mode, only under its UrlBase -- Caddy
+        # always sends the prefixed path, so a lost edit makes the app unreachable
+        # through the proxy while the service still reports Running.
+        Start-Sleep -Seconds 3
+        try {
+            [xml]$verifyXml = Get-Content -Path $ConfigXml -Encoding UTF8
+            $verifyPort    = [string]$verifyXml.Config.Port
+            $verifyUrlBase = [string]$verifyXml.Config.UrlBase
+            if ($verifyPort -ne [string]$AppPort) {
+                Write-Warning "  -> config.xml Port is '$verifyPort' (expected '$AppPort'). $AppName will not answer on port $AppPort."
+                Write-DebugLog "WARN" "Port verification failed: got '$verifyPort' (expected '$AppPort')"
+            } elseif ($verifyUrlBase -ne $desiredUrlBase) {
+                Write-Warning "  -> config.xml UrlBase is '$verifyUrlBase' (expected '$desiredUrlBase')."
+                Write-DebugLog "WARN" "UrlBase verification failed: got '$verifyUrlBase' (expected '$desiredUrlBase')"
+            } else {
+                Write-DebugLog "INFO" "config.xml verification OK: port=$AppPort UrlBase='$desiredUrlBase'"
+            }
+        } catch {
+            Write-DebugLog "WARN" "config.xml verification could not read config.xml: $_"
+        }
+    }
 } else {
-    Write-DebugLog "INFO" "Cloudflare mode: UrlBase not needed"
+    Write-Warning "  -> config.xml not found after 90s. Port and UrlBase not aligned."
+    Write-DebugLog "WARN" "config.xml not generated within 90s. Port and UrlBase not aligned."
 }
 
 Start-Sleep -Seconds 3
