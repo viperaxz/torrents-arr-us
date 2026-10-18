@@ -39,6 +39,19 @@ if ($Config.Apps.Flaresolverr -ne $true) {
     Write-DebugLog "INFO" "$AppName skipped (Apps.Flaresolverr != true)"
     return
 }
+# -- 0. Firewall hygiene -------------------------------------------------------
+# Deliberately NO inbound rule. The service is started with HOST=127.0.0.1, so it
+# only ever listens on loopback and is reached exclusively by Prowlarr on the same
+# machine. Loopback traffic bypasses the firewall entirely, which makes an inbound
+# allow rule for :$AppPort pure attack surface -- it exposes a headless Chromium
+# that performs arbitrary fetches on request. Clean up the rule from older installs.
+# This must run BEFORE the "already installed" early return: the legacy rule was
+# created by an install that also wrote the lock file, so a cleanup placed after
+# the lock check never runs on the one machine that still carries the rule.
+Get-NetFirewallRule -DisplayName "Flaresolverr" -ErrorAction SilentlyContinue |
+    Remove-NetFirewallRule -ErrorAction SilentlyContinue
+Write-DebugLog "INFO" "No firewall rule for $AppName (loopback-only); legacy rule removed if present"
+
 if (Test-Path $LockFile) {
     Write-Host "[$AppName] Already installed. Skipping." -ForegroundColor Green
     Write-DebugLog "INFO" "$AppName already installed (lock file present)"
@@ -97,8 +110,12 @@ if ($PinnedCacheHit) {
         $ZipPath = $StaleZip.FullName
         $staleVer = if ($StaleZip.Name -match '-([vV]?\d[\w\.\-]*)\.zip$') { $Matches[1] } else { $null }
         if ($staleVer) { $PinnedVersion = $staleVer }
-        Write-Warning "  -> API unreachable; installing cached $($StaleZip.Name)" +
-                      $(if ($staleVer) { " ($staleVer)" } else { "" }) + " instead of the pin -- re-run 'box update' to pick it up."
+        $staleSuffix = if ($staleVer) { " ($staleVer)" } else { "" }
+        # Single interpolated string on purpose: "msg" + $x in argument mode is not
+        # concatenation, it binds "+" as a positional parameter and throws (the
+        # install runs with $ErrorActionPreference = "Stop", so the whole offline
+        # fallback path died here instead of using the cached zip).
+        Write-Warning "  -> API unreachable; installing cached $($StaleZip.Name)$staleSuffix instead of the pin -- re-run 'box update' to pick it up."
         Write-DebugLog "WARN" "API unreachable, fell back to cached zip $($StaleZip.Name) (version=$staleVer)"
     }
     if ($Release) {
@@ -113,11 +130,36 @@ if ($PinnedCacheHit) {
         $ZipPath = Join-Path $BinDir "flaresolverr-$Version.zip"
         Write-Host "  -> Downloading FlareSolverr $Version..." -ForegroundColor Gray
         Write-DebugLog "INFO" "Downloading $($Asset.browser_download_url) -> $ZipPath"
-        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing
+        try {
+            Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+        } catch {
+            # A truncated file left here is worse than none: $StaleZip matches any
+            # flaresolverr-*.zip, so the next run's offline fallback would pick up
+            # the broken download and fail extraction after wiping the install.
+            Remove-Item $ZipPath -Force -ErrorAction SilentlyContinue
+            Write-DebugLog "ERROR" "Download failed from $($Asset.browser_download_url): $_"
+            Write-Error "[$AppName] Download of $($Asset.browser_download_url) failed: $_"
+            exit 1
+        }
         $zipSize = (Get-Item $ZipPath).Length
         Write-DebugLog "INFO" "Download complete. ZipPath=$ZipPath size=$zipSize bytes"
         if (-not $PinnedVersion) { $PinnedVersion = $Version }
     }
+}
+
+# -- 1b. Validate the archive before it is allowed to destroy the install ------
+# Section 2 removes the existing binary directory first, so a corrupt download or
+# a stale half-written cache file would take a working install with it.
+try {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    $probe = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    $entryCount = $probe.Entries.Count
+    $probe.Dispose()
+    Write-DebugLog "VAR archive check ok zip=$ZipPath entries=$entryCount"
+} catch {
+    Write-DebugLog "ERROR" "Archive validation failed for ${ZipPath}: $_"
+    Write-Error "[$AppName] '$ZipPath' is not a readable zip archive: $_"
+    exit 1
 }
 
 # -- 2. Extract ----------------------------------------------------------------
@@ -178,9 +220,21 @@ Write-DebugLog "VAR $AppName service exists=$($null -ne $svcExists)"
 if (-not $svcExists) {
     Write-DebugLog "INFO" "Creating NSSM service '$AppName' exe=$ExePath port=$AppPort"
     nssm install $AppName "`"$ExePath`"" | Out-Null
+    $nssmInstallExit = $LASTEXITCODE
+    Write-DebugLog "VAR nssm install $AppName exit=$nssmInstallExit"
+    if ($nssmInstallExit -ne 0) {
+        Write-DebugLog "ERROR" "nssm install exited $nssmInstallExit"
+        Write-Error "[$AppName] 'nssm install $AppName' failed (exit $nssmInstallExit)."
+        exit 1
+    }
     nssm set $AppName AppDirectory  $AppBinDir | Out-Null
     # Bind to localhost only  --  Prowlarr accesses FlareSolverr internally; no external exposure needed.
-    nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" "HOST=127.0.0.1" "PORT=$AppPort" | Out-Null
+    # LOG_LEVEL=warning on purpose. At its default (info) FlareSolverr writes every
+    # request body it handles to stdout, and Prowlarr sends private-tracker logins
+    # through it (observed: 'postData': 'login_username=...&login_password=...').
+    # That log is rotated but kept, and Alloy ships it to Loki when Grafana is on,
+    # so info would copy the user's tracker passwords into the log store.
+    nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=warning" "HOST=127.0.0.1" "PORT=$AppPort" | Out-Null
     nssm set $AppName Description   "FlareSolverr - Cloudflare and DDoS-Guard CAPTCHA solver proxy" | Out-Null
     nssm set $AppName Start         SERVICE_AUTO_START | Out-Null
     nssm set $AppName AppStdout     (Join-Path $DataDir "flaresolverr-stdout.log") | Out-Null
@@ -199,19 +253,39 @@ if (-not $svcExists) {
     # 0.0.0.0) and an inbound firewall rule. The lock file is gone in that case,
     # so this branch runs on the next install and must not leave the old bind in
     # place.
-    nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" "HOST=127.0.0.1" "PORT=$AppPort" | Out-Null
-    Write-DebugLog "INFO" "Re-applied HOST=127.0.0.1 PORT=$AppPort to existing service"
+    nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=warning" "HOST=127.0.0.1" "PORT=$AppPort" | Out-Null
+    Write-DebugLog "INFO" "Re-applied HOST=127.0.0.1 PORT=$AppPort LOG_LEVEL=warning to existing service"
+    # Re-assert the account too: `nssm set ObjectName` can fail while the rest of
+    # the service is created, and this branch is the only place a re-run could
+    # repair it -- otherwise the service would stay on whatever account the SCM
+    # already had (LocalSystem, if the original set never landed).
+    nssm set $AppName ObjectName ".\$SvcUser" $SvcPass | Out-Null
+}
+
+# A service that exists is not a service that is configured: nssm exits non-zero
+# for a rejected `set`, and its output is discarded above. Verify what the SCM
+# actually recorded before starting a headless browser under the wrong identity.
+$svcCheck = Get-Service -Name $AppName -ErrorAction SilentlyContinue
+if (-not $svcCheck) {
+    Write-DebugLog "ERROR" "Service '$AppName' missing after nssm install/set"
+    Write-Error "[$AppName] Service '$AppName' does not exist after nssm configuration."
+    exit 1
+}
+$svcCim = Get-CimInstance Win32_Service -Filter "Name='$AppName'" -ErrorAction SilentlyContinue
+if ($svcCim) {
+    Write-DebugLog "VAR $AppName StartName=$($svcCim.StartName) expected=.\$SvcUser"
+    if ([string]$svcCim.StartName -notmatch "(^|\\)$([regex]::Escape($SvcUser))$") {
+        Write-DebugLog "ERROR" "$AppName StartName is '$($svcCim.StartName)', expected '.\$SvcUser'"
+        Write-Error "[$AppName] Service runs as '$($svcCim.StartName)' but must run as .\$SvcUser."
+        exit 1
+    }
+} else {
+    Write-DebugLog "WARN" "Could not read StartName for $AppName; service account left unverified"
 }
 
 # -- 5. Firewall ---------------------------------------------------------------
-# Deliberately NO inbound rule. The service is started with HOST=127.0.0.1, so it
-# only ever listens on loopback and is reached exclusively by Prowlarr on the same
-# machine. Loopback traffic bypasses the firewall entirely, which makes an inbound
-# allow rule for :$AppPort pure attack surface -- it exposes a headless Chromium
-# that performs arbitrary fetches on request. Clean up the rule from older installs.
-Get-NetFirewallRule -DisplayName "Flaresolverr" -ErrorAction SilentlyContinue |
-    Remove-NetFirewallRule -ErrorAction SilentlyContinue
-Write-DebugLog "INFO" "No firewall rule for $AppName (loopback-only); legacy rule removed if present"
+# No inbound rule is created at all -- see section 0, which also removes the rule
+# older installs created (and does so on every run, not just on a fresh install).
 
 # -- 6. Start and validate -----------------------------------------------------
 # FlareSolverr binds its HTTP listener only after it has located a browser,
@@ -269,8 +343,11 @@ if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
     $exposed   = @($listeners | Where-Object { $_.LocalAddress -ne "127.0.0.1" -and $_.LocalAddress -ne "::1" })
     Write-DebugLog "VAR listeners on :$AppPort = $(@($listeners | Select-Object -ExpandProperty LocalAddress) -join ',')"
     if ($exposed.Count -gt 0) {
-        Write-Warning "  -> ! $AppName listens on $($exposed[0].LocalAddress):$AppPort - it must be loopback-only."
-        Write-DebugLog "ERROR" "$AppName listening on non-loopback address(es): $(@($exposed | Select-Object -ExpandProperty LocalAddress) -join ',')"
+        Write-Warning "  -> ! $AppName listens on $($exposed[0].LocalAddress):$AppPort - it must be loopback-only. Stopping it."
+        Write-DebugLog "ERROR" "$AppName listening on non-loopback address(es): $(@($exposed | Select-Object -ExpandProperty LocalAddress) -join ',') -- stopping the service and failing the install"
+        $null = Stop-ServiceBounded -Name $AppName
+        Write-Error "[$AppName] Reached a non-loopback address ($($exposed[0].LocalAddress):$AppPort). It performs arbitrary fetches without authentication, so the install is not recorded."
+        exit 1
     } elseif ($listeners.Count -gt 0) {
         Write-DebugLog "INFO" "$AppName bound to loopback only on port $AppPort"
     }
