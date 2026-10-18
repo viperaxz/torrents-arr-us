@@ -186,11 +186,11 @@ CrowdSec splits into two independent components, and **both are required** — t
 - A `General.DefaultUserPassword` field sets a shared default; per-user `Password` fields override it when present.
 
 ### Sonarr → Jellyfin Auto-Repair Hook
-- `scripts/sonarr_jellyfin_refresh.py` is a Sonarr Custom Script connection that fires on `OnDownload` events.
-- Detects the broken-season-hierarchy bug (Jellyfin scans before TVDB metadata is ready, leaving `Shows/Seasons` returning 0 and the web player crashing) and fixes it by triggering a targeted `Items/{id}/Refresh`.
-- **Runs detached**: Sonarr executes a Custom Script synchronously and waits for its exit code, so the invoked process re-launches itself with `DETACHED_PROCESS` and exits immediately; the child owns the 45 s settle delay. Sleeping inline stalled the import pipeline at exactly 45 s per episode (a 9-season pack sat in the queue as `importPending` for hours).
-- **Discovers new series**: when the series is not in Jellyfin at all, it triggers `POST /Library/Refresh`. The installer's first scan runs while the media folder is still empty, so Jellyfin logs `inaccessible or empty, skipping`; Sonarr's `Library/Media/Updated` only refreshes paths Jellyfin already knows, so without this the TV library stayed at 0 series even with files on disk.
-- Configured in Sonarr `Settings → Connect → Custom Script` pointing at this file.
+- `scripts/sonarr_jellyfin_refresh.py` is a Custom Script connection that fires on `OnDownload` events. Both Layer 2 scripts deploy it: Sonarr as `sonarr_jellyfin_refresh.py`, Radarr as `radarr_jellyfin_refresh.py`; the script reads `sonarr_series_title` or `radarr_movie_title` to tell which app called it.
+- Detects the broken-season-hierarchy bug (Jellyfin scans before TVDB metadata is ready, leaving `Shows/Seasons` returning 0 and the web player crashing) and fixes it by triggering a targeted `Items/{id}/Refresh`. Radarr needs only the discovery step below.
+- **Runs detached**: the apps execute a Custom Script synchronously and wait for its exit code, so the invoked process re-launches itself with `DETACHED_PROCESS` and exits immediately; the child owns the 45 s settle delay. Sleeping inline stalled the import pipeline at exactly 45 s per episode (a 9-season pack sat in the queue as `importPending` for hours).
+- **Discovers new content**: when the series/movie is not in Jellyfin at all, it triggers `POST /Library/Refresh`. The installer's first scan runs while the media folder is still empty, so Jellyfin logs `inaccessible or empty, skipping`; the apps' `Library/Media/Updated` only refreshes paths Jellyfin already knows, so without this a library stays at 0 items even with files on disk. The request is rate-limited to one per five minutes (`<InstallDir>\.jellyfin_refresh_last`, shared by both hooks) because a refresh cancels whatever scan is running.
+- Configured in `Settings → Connect → Custom Script` (`Jellyfin Series Refresh` / `Jellyfin Movie Refresh`) pointing at the deployed wrapper.
 
 ### Hardware-Accelerated Transcoding (Jellyfin)
 - Layer 2 configures Jellyfin's encoding settings for **NVIDIA (NVENC/NVDEC)**, **AMD (AMF)**, or **Intel (QSV)** GPUs via their REST API.
@@ -599,7 +599,7 @@ Connects Sonarr to the rest of the stack:
 - **Refresh hook**: registers the Jellyfin series-refresh Custom Script connection (see [Sonarr → Jellyfin Auto-Repair Hook](#sonarr--jellyfin-auto-repair-hook)), re-pointing an existing connection if the project path changed.
 
 #### `scripts/configure_layer2_radarr.ps1`
-Same as Sonarr's Layer 2, adapted for Radarr: `/api/v3/rootFolder`, download client, seed criteria, naming scheme, media management, and the Jellyfin (MediaBrowser) notification. It has no equivalent of Sonarr's post-import refresh hook.
+Same as Sonarr's Layer 2, adapted for Radarr: `/api/v3/rootFolder`, download client, seed criteria, naming scheme, media management, the Jellyfin (MediaBrowser) notification, and the same Jellyfin refresh hook (registered as `Jellyfin Movie Refresh`; a movie needs only the discovery step, not the season-hierarchy repair).
 
 
 #### `scripts/configure_layer2_recyclarr.ps1`
