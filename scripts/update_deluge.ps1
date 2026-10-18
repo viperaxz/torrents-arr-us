@@ -571,6 +571,31 @@ try {
         if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "$svcName not Running after upgrade" }
     }
 
+    # A Running service is not proof the Web UI works: Sonarr/Radarr drive Deluge
+    # through POST /json on the web port, so a login is the only end-to-end check
+    # available here.  Recorded as a failure on purpose -- the ledger is meant to
+    # describe an install that actually serves requests.
+    $webPort   = 8112
+    if ($Config -and $Config.Ports -and $Config.Ports.DelugeWeb) { $webPort = [int]$Config.Ports.DelugeWeb }
+    $authFile  = Join-Path $InstallDir 'secrets\deluge_auth.txt'
+    $webOk     = $false
+    if (Test-Path $authFile) {
+        $delugePassword = (Get-Content -Path $authFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
+        $loginBody = @{ method = 'auth.login'; params = @($delugePassword); id = 1 } | ConvertTo-Json -Compress
+        $loginDeadline = (Get-Date).AddSeconds(30)
+        while (-not $webOk -and (Get-Date) -lt $loginDeadline) {
+            try {
+                $loginRes = Invoke-RestMethod -Uri "http://127.0.0.1:$webPort/json" -Method Post -Body $loginBody `
+                    -ContentType 'application/json' -TimeoutSec 5 -ErrorAction Stop
+                if ($loginRes.result -eq $true) { $webOk = $true; break }
+            } catch { }
+            Start-Sleep -Seconds 2
+        }
+        if (-not $webOk) { throw "Deluge Web UI on port $webPort did not accept auth.login within 30s after the update" }
+    } else {
+        Write-UcLog "WARN" "Deluge Web UI health check skipped: $authFile not found"
+    }
+
     # Report the version that is actually on disk (not the requested pin), so the
     # ledger and the legacy lock file describe the installed build.
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $detected

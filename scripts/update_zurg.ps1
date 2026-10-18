@@ -2,8 +2,10 @@
 # Per-app update script: Zurg (GitHub release, single-exe swap).
 # zurg.exe lives next to config.yml, so only the executable is replaced.
 # NOTE: Zurg versions historically shipped mount-path regressions (the
-# compilePattern panic in v0.9.3).  After every Zurg update, verify that the
-# rclone movies mount is still readable.
+# compilePattern panic in v0.9.3), so the swap is gated on the WebDAV listener
+# answering again.  The rclone mount is deliberately NOT part of that gate: Zurg
+# republishes __all__ only after compiling its torrent cache (minutes), and
+# rclone keeps serving the previous listing meanwhile.
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$InstallDir,
@@ -55,18 +57,45 @@ try {
         Expand-Archive -Path $dlZip -DestinationPath $exDir -Force
         $newExe = Get-ChildItem $exDir -Recurse -Filter "*.exe" | Select-Object -First 1
     } else {
-        $newExe = Join-Path $tmpDir "zurg-new.exe"
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $newExe -UseBasicParsing
+        $dlExe = Join-Path $tmpDir "zurg-new.exe"
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dlExe -UseBasicParsing
+        $newExe = Get-Item $dlExe
     }
     if (-not $newExe) { throw "Could not extract a Zurg executable from the release asset" }
 
+    # A bare-exe asset used to leave $newExe as a STRING, so $newExe.FullName was
+    # empty and the swap failed with a null NewExePath.  Get-Item above keeps both
+    # branches returning a FileInfo.
+    $newExePath = $newExe.FullName
+
+    # Zurg reports Running while it is still in its network test; the WebDAV
+    # listener opens ~30 s after start.  Gate the swap on the port answering, so a
+    # release that starts but never serves is rolled back.
+    $zurgPort   = 9999
+    $webdavGate = {
+        param()
+        $deadline = (Get-Date).AddSeconds(90)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $null = Invoke-WebRequest -Uri "http://127.0.0.1:$zurgPort/" -Method Get `
+                    -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+                return $true
+            } catch {
+                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) { return $true }
+                Start-Sleep -Seconds 3
+            }
+        }
+        return $false
+    }
+
     $swap = Swap-SingleExeWithRollback -AppName $AppName -ExePath $ExePath `
-                -NewExePath $newExe.FullName -ServiceNames @($ServiceName) -HealthSeconds 10
+                -NewExePath $newExePath -ServiceNames @($ServiceName) -HealthSeconds 10 `
+                -PostHealthCheck $webdavGate
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
-    return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "verify rclone movies mount after Zurg updates" }
+    return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "exe swapped, WebDAV listener verified" }
 } catch {
     return [PSCustomObject]@{ App = $AppName; Status = "FAILED"; Installed = $installed; Target = $Version; Detail = $_.Exception.Message }
 }
