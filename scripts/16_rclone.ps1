@@ -197,7 +197,13 @@ Write-DebugLog "INFO" "rclone config written to $RcloneConf (Zurg WebDAV port=$Z
 $LogDir = Join-Path $InstallDir "logs"
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 
-$CommonFlags = "--skip-links --read-only --vfs-cache-mode off --dir-cache-time 5m --no-modtime --buffer-size 64M --transfers 4 --log-level ERROR --config `"$RcloneConf`""
+# --dir-cache-time is the only thing that can invalidate a cached directory
+# listing: the WebDAV backend reports ChangeNotify=false, so rclone polls nothing.
+# At 5m, a listing taken while Zurg was still compiling __all__ stayed EMPTY on
+# R:\ for five minutes after Zurg already had content.  One minute still
+# collapses the repeated listings of a Jellyfin scan but bounds how long a
+# stale/empty root can survive.
+$CommonFlags = "--skip-links --read-only --vfs-cache-mode off --dir-cache-time 1m --no-modtime --buffer-size 64M --transfers 4 --log-level ERROR --config `"$RcloneConf`""
 
 $MoviesSvc  = "rclone-rd-movies"
 $MoviesMountArgs = "mount zurg:__all__ ${MovieLetter}:\ $CommonFlags"
@@ -290,6 +296,57 @@ if (-not $zurgReady) {
     Write-DebugLog "WARN" "Zurg WebDAV at $zurgDavUrl not ready after ${zurgWaited}s"
 }
 
+# -- 7b. Wait until Zurg's __all__ can be enumerated ----------------------------
+# A listening port is not a ready mount.  Zurg opens the WebDAV listener as soon
+# as its network test finishes but keeps __all__ EMPTY until the manager has
+# fetched and compiled every torrent: measured ~31 s to listen versus 5m01s to
+# "Finished compiling 551 unique torrents" for 567 torrents.  rclone caches the
+# first listing of a directory for --dir-cache-time and the WebDAV backend has
+# no change notification, so mounting inside that window pinned an empty R:\ for
+# a full five minutes.  Layer 2's own 240 s wait starts later, so it expired
+# before the cache did and the Jellyfin scan was deferred.  Blocking here -- the
+# component that owns the mount -- is what lets the scan fire during the install.
+$zurgIndexUrl     = "http://127.0.0.1:$ZurgPort/dav/__all__/"
+$zurgIndexReady   = $false
+$zurgIndexEntries = 0
+$zurgIndexStart   = Get-Date
+if ($zurgReady) {
+    Write-Host "  -> Waiting for Zurg to build its __all__ listing..." -ForegroundColor Gray
+    $zurgIndexDeadline = $zurgIndexStart.AddSeconds(600)
+    $nextIndexLog      = 60
+    while (-not $zurgIndexReady -and (Get-Date) -lt $zurgIndexDeadline) {
+        try {
+            # GET on a WebDAV collection returns <d:multistatus> with one
+            # <d:response> per child plus one for the collection itself.
+            $indexResp    = Invoke-WebRequest -Uri $zurgIndexUrl -Method Get `
+                                -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+            $indexCount   = ([regex]::Matches($indexResp.Content, '<[Dd]:response')).Count
+            $zurgIndexEntries = if ($indexCount -gt 0) { $indexCount - 1 } else { 0 }
+            if ($zurgIndexEntries -gt 0) { $zurgIndexReady = $true }
+        } catch {
+            $zurgIndexEntries = 0
+        }
+        if (-not $zurgIndexReady) {
+            $indexWaited = [int]((Get-Date) - $zurgIndexStart).TotalSeconds
+            if ($indexWaited -ge $nextIndexLog) {
+                Write-Host "     ... Zurg is still compiling its torrent cache (${indexWaited}s elapsed)." -ForegroundColor DarkGray
+                Write-DebugLog "INFO" "Zurg __all__ still empty after ${indexWaited}s"
+                $nextIndexLog += 60
+            }
+            Start-Sleep -Seconds 5
+        }
+    }
+}
+$zurgIndexWaited = if ($zurgReady) { [int]((Get-Date) - $zurgIndexStart).TotalSeconds } else { 0 }
+Write-DebugLog "VAR Zurg __all__ ready=$zurgIndexReady entries=$zurgIndexEntries waited=${zurgIndexWaited}s"
+if ($zurgIndexReady) {
+    Write-Host "     OK Zurg __all__ lists $zurgIndexEntries entries (${zurgIndexWaited}s)." -ForegroundColor Green
+} elseif ($zurgReady) {
+    Write-Warning "     Zurg __all__ still empty after ${zurgIndexWaited}s. The mount will start empty, so the Jellyfin scan may be deferred until rclone's directory cache expires."
+    Write-Warning "     An empty Real-Debrid account looks the same; otherwise check $InstallDir\logs\zurg.log."
+    Write-DebugLog "WARN" "Zurg __all__ not enumerable after ${zurgIndexWaited}s"
+}
+
 # -- 8. Start service -----------------------------------------------------------
 Write-Host "  -> Starting $MoviesSvc..." -ForegroundColor Gray
 $null = Start-ServiceBounded -Name $MoviesSvc
@@ -309,32 +366,34 @@ Write-DebugLog "VAR $MoviesSvc status=$mSvcStatus"
 
 # Verify the mount actually works by listing its root.
 # Test-Path alone succeeds even while the WebDAV backend is still failing to
-# serve directory listings (e.g. Zurg still building __all__ right after its
-# network tests). That race made Jellyfin see an empty library during Layer 2.
-# A real readdir that does not throw is the reliable readiness signal.
+# serve directory listings, and an EMPTY readdir does not throw either -- the
+# previous "readdir did not throw" check passed on a mounted-but-empty root and
+# is how Jellyfin ended up scanning an empty library during Layer 2.  Waiting
+# for at least one entry is the reliable readiness signal.
 $mountOk       = $false
-$mountDeadline = (Get-Date).AddSeconds(60)
-$listingOk     = $false
-while (-not $listingOk -and (Get-Date) -lt $mountDeadline) {
+$mountItems    = 0
+$mountDeadline = (Get-Date).AddSeconds(90)
+while (-not $mountOk -and (Get-Date) -lt $mountDeadline) {
     try {
-        $null = Get-ChildItem -Path "${MovieLetter}:\" -ErrorAction Stop
-        $listingOk = $true
+        $mountItems = @(Get-ChildItem -Path "${MovieLetter}:\" -ErrorAction Stop).Count
+        if ($mountItems -gt 0) {
+            $mountOk = $true
+        } else {
+            Start-Sleep -Seconds 5
+        }
     } catch {
         Start-Sleep -Seconds 2
     }
 }
-if ($listingOk) {
-    $mountOk = (Test-Path "${MovieLetter}:\")
-}
-Write-DebugLog "VAR $MoviesSvc mount at ${MovieLetter}:\ ok=$mountOk"
+Write-DebugLog "VAR $MoviesSvc mount at ${MovieLetter}:\ ok=$mountOk items=$mountItems"
 
 $mSvcRunning = [bool]($mSvc -and $mSvc.Status -eq "Running")
 
 if ($mSvcRunning -and $mountOk) {
-    Write-Host "     OK $MoviesSvc running (${MovieLetter}:\)" -ForegroundColor Green
-    Write-DebugLog "INFO" "$MoviesSvc running, mount at ${MovieLetter}:\"
+    Write-Host "     OK $MoviesSvc running (${MovieLetter}:\, $mountItems entries)" -ForegroundColor Green
+    Write-DebugLog "INFO" "$MoviesSvc running, mount at ${MovieLetter}:\ lists $mountItems entries"
 } elseif ($mSvcRunning -and -not $mountOk) {
-    Write-Warning "     $MoviesSvc running but ${MovieLetter}:\ not visible from this session. Mount may need more time."
+    Write-Warning "     $MoviesSvc running but ${MovieLetter}:\ did not list a single entry. The mount may still be warming up, so the Jellyfin scan will be deferred."
     Write-Warning "     Note: a WinFsp drive letter belongs to the session that created it. The mount is created by the $MoviesSvc service in session 0, so it is visible to other services (Jellyfin) but not to an interactive desktop session."
     Write-DebugLog "WARN" "$MoviesSvc running but drive ${MovieLetter}:\ not found"
 } else {

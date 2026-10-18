@@ -53,6 +53,23 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     $zurgWebDavStatus = if ($zurgWebDav.ok) { 'PASS' } elseif ($listeners.Count -gt 0) { 'WARN' } else { 'FAIL' }
     $Script:Results.Add((New-TestResult $svc 1 'ZurgWebDav' $zurgWebDavStatus "Zurg WebDAV :$zurgPort" $zurgWebDav.latency_ms))
 
+    # The listener answers for minutes before __all__ has any entries: Zurg
+    # publishes the tree only after compiling its torrent cache.  A mount made in
+    # that window serves an empty root until rclone's directory cache expires, so
+    # "WebDAV responds" alone is not a usable-mount signal.
+    $zurgAllCount = 0
+    $zurgAllError = $null
+    try {
+        $zurgAllResp  = Invoke-WebRequest -Uri "http://127.0.0.1:$zurgPort/dav/__all__/" -Method Get `
+                            -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        $zurgAllCount = ([regex]::Matches($zurgAllResp.Content, '<[Dd]:response')).Count - 1
+        if ($zurgAllCount -lt 0) { $zurgAllCount = 0 }
+    } catch {
+        $zurgAllError = $_.Exception.Message
+    }
+    $zurgAllDetail = if ($zurgAllError) { "listing failed: $zurgAllError" } else { "$zurgAllCount entrie(s)" }
+    $Script:Results.Add((New-TestResult $svc 1 'ZurgAllEnumerated' $(if ($zurgAllCount -gt 0) { 'PASS' } else { 'WARN' }) "Zurg __all__: $zurgAllDetail"))
+
     $mMounted = Test-Path "$mDrive\"
     if ($mMounted) {
         $Script:Results.Add((New-TestResult $svc 1 "DriveMoviesMounted_$mDrive" 'PASS' "Movies drive $mDrive mounted"))
