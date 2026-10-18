@@ -8,8 +8,12 @@ is still downloading at that point. The season ends up detached from the
 series in Jellyfin's database — Shows/Seasons returns 0 and the web player
 crashes. A targeted Items/{id}/Refresh after the scan finishes resolves it.
 
-Sonarr calls this script as a Custom Script connect on the OnDownload event.
-It is launched as a background process and exits quickly; Sonarr does not wait.
+Sonarr calls this script as a Custom Script connect on the OnDownload event and
+RUNS IT SYNCHRONOUSLY: it waits for the exit code and does not import the next
+episode until it returns. The first process therefore re-launches this script as
+a detached child and exits at once; the child waits, then refreshes. Sleeping in
+the invoked process stalled every import for _WAIT_SECONDS (measured: exactly
+45 s between consecutive episodes of a season pack).
 
 Environment variables supplied by Sonarr:
   sonarr_series_title   — series name used to find it in Jellyfin
@@ -22,6 +26,7 @@ config.json is only read as a fallback for standalone/manual deployments.
 
 import json
 import os
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -40,6 +45,7 @@ _LEGACY_PATH  = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "config.json"))
 _WAIT_SECONDS = 45   # let Jellyfin finish its initial scan before refreshing
 _EMBY_HEADER  = ('MediaBrowser Client="sonarr-hook", Device="Python", '
                  'DeviceId="sonarr-jellyfin-hook", Version="1.0.0"')
+_DETACH_ENV   = "SEEDBOX_JELLYFIN_HOOK_DETACHED"
 
 # -- HTTP ---------------------------------------------------------------------
 # urllib, not requests: the wrapper Sonarr executes is built from the system
@@ -82,6 +88,36 @@ def _get(url, params=None, headers=None, timeout=10):
 
 def _post(url, params=None, headers=None, body=_NO_BODY, timeout=10):
     return _call("POST", url, params=params, headers=headers, body=body, timeout=timeout)
+
+
+def _relaunch_detached():
+    """Start the real work in a detached child and let the caller exit at once.
+
+    Sonarr treats a Custom Script notification as part of the import: the child
+    it executes must exit before the next episode is imported. DETACHED_PROCESS
+    plus CREATE_NEW_PROCESS_GROUP (and CREATE_NO_WINDOW, so no console flashes on
+    an interactive install) let the child outlive the wrapper .cmd that Sonarr is
+    waiting on. Returns False when the relaunch fails, so the caller can fall back
+    to doing the work inline instead of silently doing nothing.
+    """
+    env = dict(os.environ)
+    env[_DETACH_ENV] = "1"
+    flags = 0
+    if os.name == "nt":
+        flags = 0x00000008 | 0x00000200 | 0x08000000
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+        )
+        return True
+    except Exception:
+        return False
 
 
 def _load_sidecar():
@@ -146,6 +182,10 @@ def main():
     sidecar = _load_sidecar()
     legacy  = None if sidecar else _load_legacy_cfg()
     if not sidecar and not legacy:
+        sys.exit(0)
+
+    # Sonarr is blocked until this process exits, so hand the delay to a child.
+    if os.environ.get(_DETACH_ENV) != "1" and _relaunch_detached():
         sys.exit(0)
 
     # Wait for Jellyfin's initial scan to settle
