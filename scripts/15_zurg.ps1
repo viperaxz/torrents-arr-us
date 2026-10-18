@@ -220,7 +220,11 @@ nssm set $AppName AppRotateFiles 1 | Out-Null
 nssm set $AppName AppRotateBytes 5242880 | Out-Null
 nssm set $AppName Start SERVICE_AUTO_START | Out-Null
 nssm set $AppName ObjectName ".\$SvcUser" $SvcPass | Out-Null
-nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=info" | Out-Null
+# Zurg compares LOG_LEVEL case-sensitively: "info" is not recognised and leaves
+# DEBUG logging ON ("Debug logging is enabled; ... set LOG_LEVEL=INFO").  DEBUG
+# writes zurg's network-test detail and temporary Real-Debrid download links to
+# logs\zurg.log, and that directory inherits read access for Authenticated Users.
+nssm set $AppName AppEnvironmentExtra "LOG_LEVEL=INFO" | Out-Null
 nssm set $AppName AppExit Default Restart | Out-Null
 nssm set $AppName AppRestartDelay 5000 | Out-Null
 
@@ -244,9 +248,41 @@ if (-not $svc) { $svc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 $svcRunning = [bool]($svc -and $svc.Status -eq "Running")
 $svcStatus = if ($svc) { $svc.Status } else { "NOT FOUND" }
 Write-DebugLog "VAR service status=$svcStatus"
+
+# The SCM saying Running only proves the process exists: Zurg runs its network
+# test first and opens the WebDAV listener afterwards (about 30 s measured on a
+# 567-torrent account).  Probe the port before claiming WebDAV is up.  A Zurg
+# that never listens is almost always a rejected RealDebrid.ApiKey, which a
+# re-run cannot fix, so this warns instead of failing an otherwise installed
+# service.
+$davListening = $false
+$davWaited    = 0
 if ($svcRunning) {
-    Write-Host "     OK Zurg service running (WebDAV on port $ZurgPort)." -ForegroundColor Green
-    Write-DebugLog "INFO" "Zurg service running on port $ZurgPort"
+    $davDeadline = (Get-Date).AddSeconds(90)
+    $davStart    = Get-Date
+    while (-not $davListening -and (Get-Date) -lt $davDeadline) {
+        try {
+            $null = Invoke-WebRequest -Uri "http://127.0.0.1:$ZurgPort/" -Method Get `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $davListening = $true
+        } catch {
+            if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                $davListening = $true
+            } else {
+                Start-Sleep -Seconds 3
+            }
+        }
+    }
+    $davWaited = [int]((Get-Date) - $davStart).TotalSeconds
+}
+Write-DebugLog "VAR Zurg WebDAV listening=$davListening waited=${davWaited}s"
+
+if ($svcRunning -and $davListening) {
+    Write-Host "     OK Zurg service running, WebDAV listening on port $ZurgPort." -ForegroundColor Green
+    Write-DebugLog "INFO" "Zurg service running and listening on port $ZurgPort (${davWaited}s)"
+} elseif ($svcRunning) {
+    Write-Warning "     Zurg service is running but nothing answered on port $ZurgPort after ${davWaited}s. Check $LogDir\zurg.log -- an invalid RealDebrid.ApiKey leaves Zurg looping in its network test."
+    Write-DebugLog "WARN" "Zurg service running but WebDAV not listening on port $ZurgPort after ${davWaited}s"
 } else {
     Write-Warning "     Zurg service not running (status: $svcStatus). Check logs at $LogDir\zurg-error.log."
     Write-DebugLog "WARN" "Zurg service status=$svcStatus after start"
