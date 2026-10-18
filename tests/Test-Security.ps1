@@ -215,13 +215,18 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
         }
 
         # Active decisions -- informational, zero is normal on a fresh install.
+        # Deliberately the local list only: the Community Blocklist (origin CAPI) is
+        # thousands of entries and is counted by security_unban.ps1 instead.  Say
+        # "locally-sourced" so a healthy but quiet box does not read as "nothing is
+        # blocked" while the bouncer enforces the central list.
         try {
             $draw = (& $CsCli decisions list -o json 2>$null | Out-String).Trim()
             $banCount = 0
-            if ($draw -and $draw -ne 'null') {
+            if ($draw -and $draw -ne 'null' -and $draw -ne '[]') {
                 foreach ($a in @($draw | ConvertFrom-Json)) { if ($a.decisions) { $banCount += @($a.decisions).Count } }
             }
-            $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'PASS' "$banCount IP(s) currently banned by CrowdSec"))
+            $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'PASS' `
+                "$banCount locally-sourced ban(s); Community Blocklist decisions not counted here"))
         } catch {
             $Script:Results.Add((New-TestResult $svc 2 'ActiveDecisions' 'WARN' "cscli decisions list failed: $_"))
         }
