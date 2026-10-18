@@ -24,11 +24,8 @@ import json
 import os
 import sys
 import time
-
-try:
-    import requests
-except ImportError:
-    sys.exit(0)  # no requests = nothing to do, don't break Sonarr
+import urllib.parse
+import urllib.request
 
 # ── settings ──────────────────────────────────────────────────────────────────
 # PRIMARY: the sidecar written next to this script by
@@ -43,6 +40,48 @@ _LEGACY_PATH  = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "config.json"))
 _WAIT_SECONDS = 45   # let Jellyfin finish its initial scan before refreshing
 _EMBY_HEADER  = ('MediaBrowser Client="sonarr-hook", Device="Python", '
                  'DeviceId="sonarr-jellyfin-hook", Version="1.0.0"')
+
+# -- HTTP ---------------------------------------------------------------------
+# urllib, not requests: the wrapper Sonarr executes is built from the system
+# interpreter (C:\Python312), and that interpreter has no requests installed, so
+# every run used to die on the import and the hook was silently dead on every
+# download. The standard library is always present.
+_NO_BODY = object()
+# Jellyfin is always reached on 127.0.0.1 here, so never let a WinINET/env proxy
+# (urllib reads the Windows proxy settings, requests did not) sit in the path.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _call(method, url, params=None, headers=None, body=_NO_BODY, timeout=10):
+    """(ok, parsed_json) for one Jellyfin call. Never raises."""
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    hdrs = dict(headers or {})
+    hdrs["Accept"] = "application/json"
+    data = None
+    if body is not _NO_BODY:
+        data = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except Exception:
+        return False, None
+    if not raw:
+        return True, None
+    try:
+        return True, json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        return True, None
+
+
+def _get(url, params=None, headers=None, timeout=10):
+    return _call("GET", url, params=params, headers=headers, timeout=timeout)
+
+
+def _post(url, params=None, headers=None, body=_NO_BODY, timeout=10):
+    return _call("POST", url, params=params, headers=headers, body=body, timeout=timeout)
 
 
 def _load_sidecar():
@@ -83,7 +122,19 @@ def _load_legacy_cfg():
 def main():
     event = os.environ.get("sonarr_eventtype", "")
     if event == "Test":
-        print("sonarr_jellyfin_refresh.py: test OK")
+        # Report whether the hook can actually do its job: "test OK" alone hid a
+        # hook that was missing settings (and, before, missing requests) for weeks.
+        sidecar = _load_sidecar()
+        legacy  = None if sidecar else _load_legacy_cfg()
+        if sidecar:
+            print("sonarr_jellyfin_refresh.py: test OK (settings: secrets/jellyfin_hook.json, "
+                  f"base_url={sidecar[0]})")
+        elif legacy:
+            print("sonarr_jellyfin_refresh.py: test OK (settings: legacy config.json, "
+                  f"base_url={legacy[0]})")
+        else:
+            print("sonarr_jellyfin_refresh.py: test OK, but NO settings found -- "
+                  "downloads will be ignored")
         sys.exit(0)
     if event != "Download":
         sys.exit(0)
@@ -110,66 +161,56 @@ def main():
     else:
         # Legacy: authenticate with the admin credentials from config.json.
         base_url, admin_user, admin_pass = legacy
-        try:
-            r = requests.post(
-                f"{base_url}/Users/AuthenticateByName",
-                json={"Username": admin_user, "Pw": admin_pass},
-                headers={"Authorization": _EMBY_HEADER,
-                         "Content-Type": "application/json"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            token   = r.json().get("AccessToken", "")
-            user_id = r.json().get("User", {}).get("Id", "")
-        except Exception:
+        ok, body = _post(
+            f"{base_url}/Users/AuthenticateByName",
+            headers={"Authorization": _EMBY_HEADER},
+            body={"Username": admin_user, "Pw": admin_pass},
+            timeout=10,
+        )
+        if not ok or not isinstance(body, dict):
             sys.exit(0)
+        token   = body.get("AccessToken", "")
+        user_id = (body.get("User") or {}).get("Id", "")
         if not token or not user_id:
             sys.exit(0)
         auth_hdr = {"Authorization": f'{_EMBY_HEADER}, Token="{token}"'}
 
     # Find the series in Jellyfin by title
-    try:
-        r = requests.get(
-            f"{base_url}/Users/{user_id}/Items",
-            headers=auth_hdr,
-            params={"searchTerm": series_title, "Recursive": "true",
-                    "IncludeItemTypes": "Series", "Limit": 5, "Fields": "Id"},
-            timeout=10,
-        )
-        items = r.json().get("Items", []) if r.ok else []
-        if not items:
-            sys.exit(0)
-        series_id = items[0]["Id"]
-    except Exception:
+    ok, body = _get(
+        f"{base_url}/Users/{user_id}/Items",
+        headers=auth_hdr,
+        params={"searchTerm": series_title, "Recursive": "true",
+                "IncludeItemTypes": "Series", "Limit": 5, "Fields": "Id"},
+        timeout=10,
+    )
+    items = body.get("Items", []) if ok and isinstance(body, dict) else []
+    if not items:
+        sys.exit(0)
+    series_id = items[0].get("Id", "")
+    if not series_id:
         sys.exit(0)
 
     # Check if the season hierarchy is intact
-    try:
-        r = requests.get(
-            f"{base_url}/Shows/{series_id}/Seasons",
-            headers=auth_hdr,
-            params={"UserId": user_id},
-            timeout=10,
-        )
-        n_seasons = r.json().get("TotalRecordCount", 0) if r.ok else 0
-    except Exception:
-        n_seasons = 0
+    ok, body = _get(
+        f"{base_url}/Shows/{series_id}/Seasons",
+        headers=auth_hdr,
+        params={"UserId": user_id},
+        timeout=10,
+    )
+    n_seasons = body.get("TotalRecordCount", 0) if ok and isinstance(body, dict) else 0
 
     if n_seasons > 0:
         sys.exit(0)  # hierarchy is fine, nothing to do
 
-    # Hierarchy is broken — trigger a full metadata refresh
-    try:
-        requests.post(
-            f"{base_url}/Items/{series_id}/Refresh",
-            headers=auth_hdr,
-            params={"MetadataRefreshMode": "FullRefresh",
-                    "ImageRefreshMode":    "FullRefresh",
-                    "ReplaceAllMetadata":  "false"},
-            timeout=15,
-        )
-    except Exception:
-        pass
+    # Hierarchy is broken -- trigger a full metadata refresh
+    _post(
+        f"{base_url}/Items/{series_id}/Refresh",
+        headers=auth_hdr,
+        params={"MetadataRefreshMode": "FullRefresh",
+                "ImageRefreshMode":    "FullRefresh",
+                "ReplaceAllMetadata":  "false"},
+        timeout=15,
+    )
 
 
 if __name__ == "__main__":
