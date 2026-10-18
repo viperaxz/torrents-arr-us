@@ -66,9 +66,39 @@ function Remove-NssmService {
         Write-Host "  -> $Name : stopping..." -ForegroundColor Yellow
         Write-DebugLog "INFO" "Stopping service: $Name (current status: $($svc.Status))"
         $null = Stop-ServiceBounded -Name $Name
-        & nssm remove $Name confirm 2>$null | Out-Null
-        Write-Host "  -> $Name : removed." -ForegroundColor Yellow
-        Write-DebugLog "INFO" "Service removed: $Name"
+        if (-not $script:NssmExe) {
+            # The uninstaller's PATH is the one this shell started with; nssm is a
+            # Chocolatey shim that may not be on it. Removal used to fail silently
+            # (the error was redirected away) while the log still said "removed".
+            $script:NssmExe = (Get-Command nssm.exe -ErrorAction SilentlyContinue).Source
+            if (-not $script:NssmExe) {
+                $candidate = Join-Path $env:ProgramData "chocolatey\bin\nssm.exe"
+                if (Test-Path $candidate) { $script:NssmExe = $candidate }
+            }
+        }
+        if ($script:NssmExe) {
+            & $script:NssmExe remove $Name confirm 2>&1 | Out-Null
+        } else {
+            Write-Warning "  -> $Name : nssm.exe not found -- the service could not be removed."
+            Write-DebugLog "ERROR" "nssm.exe not found; cannot remove service $Name"
+        }
+        # Verify instead of claiming: a surviving service holds its port and its
+        # binary directory, which breaks the reinstall that follows. The short retry
+        # covers the moment the SCM needs to drop a service that was just marked
+        # for deletion -- it must not turn into a false warning on a healthy run.
+        $still = $null
+        for ($i = 0; $i -lt 4; $i++) {
+            $still = Get-Service -Name $Name -ErrorAction SilentlyContinue
+            if (-not $still) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($still) {
+            Write-Warning "  -> $Name : still present after removal (status=$($still.Status))."
+            Write-DebugLog "ERROR" "Service $Name still present after nssm remove"
+        } else {
+            Write-Host "  -> $Name : removed." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Service removed: $Name"
+        }
     } else {
         Write-DebugLog "VAR service not found (skip): $Name"
     }
