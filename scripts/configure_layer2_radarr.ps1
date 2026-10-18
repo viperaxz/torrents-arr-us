@@ -542,6 +542,156 @@ if ($Config.Apps.Jellyfin -eq $true) {
     }
 }
 
+# -- 9. Register the Jellyfin movie refresh hook ------------------------------
+# Mirrors Sonarr's hook, for a different reason: Sonarr repairs a broken season
+# hierarchy, Radarr only needs the discovery step. The library scan at install
+# time runs while the media folder is still empty, so Jellyfin logs
+# "inaccessible or empty, skipping"; the MediaBrowser notification's
+# Library/Media/Updated then only refreshes paths Jellyfin already knows, and a
+# movie imported afterwards stays invisible until the next full scan. The hook
+# triggers POST /Library/Refresh when Jellyfin does not know the movie. It
+# re-launches itself detached, so it cannot stall Radarr's import pipeline.
+if ($Config.Apps.Jellyfin -eq $true) {
+    $JellyfinKeyFile = Join-Path $Config.General.InstallDir "secrets\jellyfin_api_key.txt"
+    $HookSource      = Join-Path $PSScriptRoot "sonarr_jellyfin_refresh.py"
+    if (-not (Test-Path $JellyfinKeyFile) -or -not (Test-Path $HookSource)) {
+        Write-Host "  [WARN] Jellyfin API key or hook source missing  --  movie refresh hook skipped." -ForegroundColor Yellow
+        Write-DebugLog "WARN" "Movie refresh hook skipped (key=$(Test-Path $JellyfinKeyFile) source=$(Test-Path $HookSource))"
+    } else {
+        try {
+            $JellyfinApiKey  = (Get-Content $JellyfinKeyFile -Raw -Encoding UTF8).TrimStart([char]0xFEFF).Trim()
+            $JellyfinPort    = $Config.Ports.Jellyfin
+            $JellyfinUrlBase = if ($DomainMode -eq "duckdns") { "/jellyfin" } else { "" }
+            $JellyfinBase    = "http://127.0.0.1:$JellyfinPort$JellyfinUrlBase"
+            $InstallDir      = $Config.General.InstallDir
+
+            # Same interpreter rules as Sonarr's hook: the wrapper is executed by
+            # Radarr, which runs as seedbox-svc, so a per-user Python or the Store
+            # alias cannot be used.
+            $PythonExe = $null
+            foreach ($candidate in @("C:\Python312\python.exe")) {
+                if (Test-Path $candidate) { $PythonExe = $candidate; break }
+            }
+            if (-not $PythonExe) {
+                Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name -Descending | ForEach-Object {
+                        if ($PythonExe) { return }
+                        $p = Join-Path $_.FullName "python.exe"
+                        if (Test-Path $p) { $PythonExe = $p }
+                    }
+            }
+            if (-not $PythonExe) {
+                $gc = Get-Command python -ErrorAction SilentlyContinue
+                if ($gc -and $gc.Source -notlike "$env:SystemDrive\Users\*" -and $gc.Source -notlike '*\WindowsApps\*') {
+                    $PythonExe = $gc.Source
+                }
+            }
+            if (-not $PythonExe) { throw "no Python interpreter usable by the service account was found" }
+
+            # The sidecar is normally written by Sonarr's Layer 2; write it here when
+            # Sonarr is disabled or ran after this script.
+            $HookConfigPath = Join-Path $InstallDir "secrets\jellyfin_hook.json"
+            if (-not (Test-Path $HookConfigPath)) {
+                $jfClient = 'MediaBrowser Client="seedbox-install", Device="configure", DeviceId="seedbox-install", Version="1.0.0"'
+                $jfUsers  = Invoke-RestMethod -Uri "$JellyfinBase/Users" `
+                    -Headers @{"Authorization" = ($jfClient + ', Token="' + $JellyfinApiKey + '"')} `
+                    -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+                $JellyfinUserId = $null
+                foreach ($u in $jfUsers) {
+                    if ($u.Policy -and $u.Policy.IsAdministrator -eq $true) { $JellyfinUserId = [string]$u.Id; break }
+                }
+                if (-not $JellyfinUserId) { throw "no Jellyfin administrator account resolved at '$JellyfinBase'" }
+                $hookSettings = [ordered]@{ base_url = $JellyfinBase; api_key = $JellyfinApiKey; user_id = $JellyfinUserId }
+                [System.IO.File]::WriteAllText($HookConfigPath, ($hookSettings | ConvertTo-Json -Compress),
+                    (New-Object System.Text.UTF8Encoding($false)))
+                Write-DebugLog "INFO" "Jellyfin hook settings written by Radarr Layer 2: $HookConfigPath"
+            }
+
+            $RefreshPy  = Join-Path $InstallDir "radarr_jellyfin_refresh.py"
+            $RefreshCmd = Join-Path $InstallDir "radarr_jellyfin_refresh.cmd"
+            Copy-Item -LiteralPath $HookSource -Destination $RefreshPy -Force
+            [System.IO.File]::WriteAllText($RefreshCmd,
+                "@echo off`r`n`"$PythonExe`" `"%~dp0radarr_jellyfin_refresh.py`"`r`n",
+                [System.Text.Encoding]::ASCII)
+
+            # Radarr validates a CustomScript notification by executing it and
+            # requiring exit 0 -- prove the wrapper first, so registration cannot
+            # fail with a bare 400.
+            $probeOut  = & cmd.exe /c "`"$RefreshCmd`"" 2>&1
+            $probeCode = $LASTEXITCODE
+            if ($probeCode -ne 0) {
+                throw "generated hook wrapper exits $probeCode when Radarr tests it ($(($probeOut -join ' ').Trim()))"
+            }
+
+            $notifSchemas = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification/schema" `
+                -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+            $scriptSchema = $null
+            foreach ($s in $notifSchemas) {
+                if ($s.implementation -eq "CustomScript") { $scriptSchema = $s; break }
+            }
+            if (-not $scriptSchema) { throw "CustomScript not present in the Radarr notification schema" }
+
+            $existingScripts = Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
+                -Headers @{"X-Api-Key" = $ApiKey} -UseBasicParsing -ErrorAction Stop
+            $hookExists = $null
+            foreach ($n in $existingScripts) {
+                if ($n.implementation -eq "CustomScript" -and
+                    ($n.fields | Where-Object { $_.name -eq "path" -and $_.value -like "*radarr_jellyfin_refresh*" })) {
+                    $hookExists = $n; break
+                }
+            }
+
+            foreach ($field in $scriptSchema.fields) {
+                $v = if ($field.PSObject.Properties.Name -contains 'defaultValue') { $field.defaultValue } else { $null }
+                if ($field.name -eq "path") { $v = $RefreshCmd }
+                $field | Add-Member -MemberType NoteProperty -Name 'value' -Value $v -Force
+            }
+
+            $hookPayload = [ordered]@{
+                id                 = if ($hookExists) { $hookExists.id } else { 0 }
+                name               = "Jellyfin Movie Refresh"
+                enable             = $true
+                implementationName = [string]$scriptSchema.implementationName
+                implementation     = [string]$scriptSchema.implementation
+                configContract     = [string]$scriptSchema.configContract
+                infoLink           = [string]$scriptSchema.infoLink
+                fields             = @($scriptSchema.fields)
+                tags               = @()
+                onGrab             = $false
+                onDownload         = $true
+                onUpgrade          = $true
+                onRename           = $false
+                onMovieAdded       = $false
+                onMovieDelete      = $false
+                onMovieFileDelete  = $false
+                onMovieFileDeleteForUpgrade = $false
+                onHealthIssue      = $false
+                onHealthRestored   = $false
+                onApplicationUpdate = $false
+                onManualInteractionRequired = $false
+                includeHealthWarnings = $false
+            }
+            $hookBody = $hookPayload | ConvertTo-Json -Depth 10 -Compress
+
+            if ($hookExists) {
+                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification/$($hookExists.id)" `
+                    -Method Put -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
+                    -Body $hookBody -UseBasicParsing -ErrorAction Stop | Out-Null
+                Write-Host "     [OK] Jellyfin movie refresh hook updated." -ForegroundColor Green
+            } else {
+                Invoke-RestMethod -Uri "http://127.0.0.1:$Port$UrlBase/api/v3/notification" `
+                    -Method Post -Headers @{"X-Api-Key" = $ApiKey; "Content-Type" = "application/json"} `
+                    -Body $hookBody -UseBasicParsing -ErrorAction Stop | Out-Null
+                Write-Host "     [OK] Jellyfin movie refresh hook registered." -ForegroundColor Green
+            }
+            Write-DebugLog "INFO" "Jellyfin movie refresh hook registered: $RefreshCmd (settings=$HookConfigPath)"
+        } catch {
+            Write-Warning "[$AppName] Failed to register the Jellyfin movie refresh hook: $_"
+            Write-DebugLog "WARN" "Movie refresh hook registration failed: $_"
+        }
+    }
+}
+
 Write-Host "  [OK] $AppName Layer 2 configuration complete." -ForegroundColor Green
 Write-DebugLog "INFO" "configure_layer2_radarr.ps1 complete"
 
