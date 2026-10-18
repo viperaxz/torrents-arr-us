@@ -96,7 +96,11 @@ if (($LayerFilter -eq 0 -or $LayerFilter -eq 2) -and $password) {
         if ($statusRes.ok -and $statusRes.data.result) {
             $status = $statusRes.data.result[1]
             $ver    = $statusRes.data.result[2]
-            $Script:Results.Add((New-TestResult $svcDaemon 2 'AuthAccepted' 'PASS' "host=$status v$ver" $statusRes.ms))
+            # 'Connected' means the Web UI itself holds a daemon session; 'Online'
+            # only means the daemon answered a throwaway probe, so nothing is attached
+            # and daemon-bound calls (label.*, core.add_torrent_*) fail from this UI.
+            $verdict = if ($status -eq 'Connected') { 'PASS' } elseif ($status -eq 'Online') { 'WARN' } else { 'FAIL' }
+            $Script:Results.Add((New-TestResult $svcDaemon 2 'AuthAccepted' $verdict "host=$status v$ver" $statusRes.ms))
         } else {
             $Script:Results.Add((New-TestResult $svcDaemon 2 'AuthAccepted' 'FAIL' 'web.get_host_status failed'))
         }

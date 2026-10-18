@@ -225,6 +225,49 @@ if ($webSvc) {
         } else {
             Write-DebugLog "WARN" "hostlist.conf not found yet ($HostlistConf) -- auto-connect not configured"
         }
+
+        # default_daemon is only read when deluge-web starts, so verify the UI actually
+        # attached. A Web UI parked on its Connection Manager still answers JSON, but
+        # every daemon-bound call (a *arr adding a torrent, label.*) fails -- Layer 2
+        # would look configured while being unusable.
+        $verifySess     = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $verifyAuthBody = @{ method = "auth.login"; params = @($DelugePassword); id = 1 } | ConvertTo-Json -Compress
+        $verifyLogin    = $false
+        $daemonConnected = $false
+        try {
+            $verifyAuthRes = Invoke-RestMethod -Uri $rpcUrl -Method Post -Body $verifyAuthBody `
+                -ContentType "application/json" -WebSession $verifySess -TimeoutSec 10 -ErrorAction Stop
+            $verifyLogin = ($verifyAuthRes.result -eq $true)
+        } catch {
+            Write-DebugLog "WARN" "Deluge Web UI verification login failed: $_"
+        }
+        if ($verifyLogin) {
+            $connDeadline = (Get-Date).AddSeconds(20)
+            while (-not $daemonConnected -and (Get-Date) -lt $connDeadline) {
+                try {
+                    $vHostsBody = @{ method = "web.get_hosts"; params = @(); id = 2 } | ConvertTo-Json -Compress
+                    $vHostsRes  = Invoke-RestMethod -Uri $rpcUrl -Method Post -Body $vHostsBody `
+                        -ContentType "application/json" -WebSession $verifySess -TimeoutSec 10 -ErrorAction Stop
+                    if ($vHostsRes.result -and $vHostsRes.result.Count -gt 0) {
+                        $vStBody = @{ method = "web.get_host_status"; params = @($vHostsRes.result[0][0]); id = 3 } | ConvertTo-Json -Compress
+                        $vStRes  = Invoke-RestMethod -Uri $rpcUrl -Method Post -Body $vStBody `
+                            -ContentType "application/json" -WebSession $verifySess -TimeoutSec 10 -ErrorAction Stop
+                        if ($vStRes.result -and $vStRes.result.Count -ge 2 -and $vStRes.result[1] -eq "Connected") {
+                            $daemonConnected = $true
+                            break
+                        }
+                    }
+                } catch { }
+                Start-Sleep -Seconds 2
+            }
+        }
+        Write-DebugLog "VAR Deluge Web UI connected to daemon=$daemonConnected (login=$verifyLogin)"
+        if ($daemonConnected) {
+            Write-Host "  -> Web UI connected to the daemon" -ForegroundColor Green
+        } else {
+            Write-Warning "[$AppName] Web UI is running but not attached to the daemon -- grabs from Sonarr/Radarr will fail until it connects."
+            Write-DebugLog "WARN" "Deluge Web UI did not report a Connected host after Layer 1 configuration"
+        }
     } else {
         Write-Warning "[$AppName] Web UI not responding after 15s."
         Write-DebugLog "WARN" "Deluge Web UI not responding at $webUrl"
