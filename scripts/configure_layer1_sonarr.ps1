@@ -51,9 +51,11 @@ Write-Host "[$AppName] Configuring authentication..." -ForegroundColor Cyan
 $svc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $AppName service exists=$($null -ne $svc) status=$(if ($svc) { $svc.Status } else { 'N/A' })"
 if (-not $svc) {
+    # exit 1, not return: master_install.ps1 reads $LASTEXITCODE, and returning
+    # reported this app's Layer 1 as SUCCESS when its service did not exist.
     Write-Warning "[$AppName] Service not found. Run the installer first."
     Write-DebugLog "ERROR" "$AppName service not found"
-    return
+    exit 1
 }
 if ($svc.Status -ne "Running") {
     Write-Host "  -> Starting $AppName..." -ForegroundColor Gray

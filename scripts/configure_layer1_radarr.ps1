@@ -81,6 +81,14 @@ if (-not $ApiKey) {
 }
 
 # -- 3. Wait for API -----------------------------------------------------------
+# Every call in this script is built as http://127.0.0.1:$Port$UrlBase/api/v3/...
+# so a config.xml that disagrees with the mode answers nothing and the poll below
+# reports a generic timeout. Name the real cause instead.
+$CfgUrlBase = [string]$cfgXml.Config.UrlBase
+if ($CfgUrlBase -ne $UrlBase) {
+    Write-Warning "[$AppName] config.xml UrlBase is '$CfgUrlBase' but $DomainMode mode needs '$UrlBase'. The API calls below use that prefix."
+    Write-DebugLog "WARN" "config.xml UrlBase '$CfgUrlBase' does not match the $DomainMode prefix '$UrlBase'"
+}
 Write-Host "  -> Waiting for API on port $Port..." -ForegroundColor Gray
 $apiUrl = "http://127.0.0.1:$Port$UrlBase/api/v3/config/host"
 Write-DebugLog "INFO" "Polling API at $apiUrl (up to 30s)..."
