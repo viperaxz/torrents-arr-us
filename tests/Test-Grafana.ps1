@@ -37,7 +37,10 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
     $ds = Invoke-ApiCheck "http://127.0.0.1:3000${gfBase}/api/datasources" $authHdr -TimeoutSec 8
     if ($ds.ok) {
         $lokiDs = @($ds.data | Where-Object { $_.type -eq 'loki' })
-        $Script:Results.Add((New-TestResult $svc 2 'LokiDatasource' $(if ($lokiDs.Count -gt 0) { 'PASS' } else { 'FAIL' }) "$($lokiDs.Count) Loki datasource(s) in Grafana"))
+        # Every provisioned dashboard hardcodes uid "loki-seedbox"; a datasource with
+        # a different uid leaves all of them with a broken data source.
+        $uidDs  = @($lokiDs | Where-Object { $_.uid -eq 'loki-seedbox' })
+        $Script:Results.Add((New-TestResult $svc 2 'LokiDatasource' $(if ($uidDs.Count -gt 0) { 'PASS' } else { 'FAIL' }) "$($lokiDs.Count) Loki datasource(s); uid loki-seedbox present: $($uidDs.Count -gt 0)"))
     } else {
         $Script:Results.Add((New-TestResult $svc 2 'LokiDatasource' 'FAIL' "Grafana /api/datasources: $($ds.error)"))
     }
