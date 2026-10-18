@@ -20,6 +20,14 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     if (-not $apiKey) {
         $Script:Results.Add((New-TestResult $svc 1 'ApiKeyFound' 'FAIL' 'Cannot read config.xml'))
     } else {
+        # config.xml must carry exactly the prefix Caddy routes on ("/radarr" in
+        # DuckDNS mode, none in Cloudflare mode). The checks below build every URL
+        # from $base, so a mismatch still passes them while the app is unreachable
+        # through the proxy.
+        $xmlBase = ''
+        try { $xmlBase = [string]([xml](Get-Content 'C:\ProgramData\Radarr\config.xml' -Encoding UTF8 -ErrorAction Stop)).Config.UrlBase } catch {}
+        $Script:Results.Add((New-TestResult $svc 1 'UrlBaseMatchesMode' $(if ($xmlBase -eq $base) { 'PASS' } else { 'FAIL' }) "config.xml UrlBase='$xmlBase', expected '$base'"))
+
         $health = Invoke-ApiCheck "http://127.0.0.1:$port${base}/api/v3/system/status" $hdr -TimeoutSec 8
         $Script:Results.Add((New-TestResult $svc 1 'ApiHealth' $(if ($health.ok) { 'PASS' } else { 'FAIL' }) $health.error $health.latency_ms))
 
