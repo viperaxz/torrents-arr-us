@@ -167,7 +167,13 @@ if ($securityPending) {
     if ($manualApps.Count -gt 0)  { $parts += "manual: " + ($manualApps -join ", ") }
     $extra = if ($projectUpdateAvailable) { " + project scripts" } else { "" }
     $title = "win-seedbox - Updates available"
-    $body  = "$($parts -join ' | ')$extra. Run 'box update' to apply."
+    if ($pendingApps.Count -eq 0) {
+        # 'box update' cannot apply a manual update (NSSM, python312); it only has
+        # update_*.ps1 scripts to run, so pointing at it there is a dead end.
+        $body = "$($parts -join ' | ')$extra. Manual only: run .\master_install.ps1 -Force <AppName>."
+    } else {
+        $body = "$($parts -join ' | ')$extra. Run 'box update' to apply."
+    }
     Show-ToastNotification -Title $title -Body $body
 }
 
