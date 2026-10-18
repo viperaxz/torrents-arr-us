@@ -76,15 +76,26 @@ Write-DebugLog "VAR ExtraWhitelist=$($ExtraWhitelist -join ',') DoBlocklists=$Do
 # Service names differ slightly between CrowdSec releases; resolve them at runtime
 # instead of hardcoding, so an upstream rename does not silently break the install.
 function Resolve-ServiceName {
-    param([string[]]$Candidates)
+    # -Exclude rejects fuzzy candidates by substring.  Without it the engine lookup
+    # also matches "Crowdsec Windows Firewall Bouncer": on a partial uninstall (the
+    # engine service gone, its binary and config still there) the bouncer would be
+    # resolved as the engine, so the reinstall path is skipped and the *bouncer* is
+    # started/restarted in its place while the install reports the engine running.
+    param([string[]]$Candidates, [string[]]$Exclude)
     foreach ($c in $Candidates) {
         $s = Get-Service -Name $c -ErrorAction SilentlyContinue
         if ($s) { return $s.Name }
     }
     foreach ($c in $Candidates) {
-        $s = Get-Service -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "*$c*" -or $_.DisplayName -like "*$c*" } |
-            Select-Object -First 1
+        $s = Get-Service -ErrorAction SilentlyContinue | Where-Object {
+                $hn = $_.Name
+                $hd = $_.DisplayName
+                if (-not (($hn -like "*$c*") -or ($hd -like "*$c*"))) { return $false }
+                foreach ($ex in $Exclude) {
+                    if ($ex -and (($hn -like "*$ex*") -or ($hd -like "*$ex*"))) { return $false }
+                }
+                return $true
+            } | Select-Object -First 1
         if ($s) { return $s.Name }
     }
     return $null
@@ -180,7 +191,7 @@ try {
     $configYaml = Join-Path $CsConfigDir "config.yaml"
     $cscliPresent  = Test-Path $CsCli
     $configPresent = Test-Path $configYaml
-    $svcPresent    = (Resolve-ServiceName @("crowdsec", "CrowdSec")) -ne $null
+    $svcPresent    = (Resolve-ServiceName @("crowdsec", "CrowdSec") -Exclude @("bouncer")) -ne $null
     $needsInstall  = (-not $cscliPresent) -or (-not $configPresent) -or (-not $svcPresent)
 
     Write-DebugLog "VAR cscliPresent=$cscliPresent configPresent=$configPresent svcPresent=$svcPresent needsInstall=$needsInstall"
@@ -249,7 +260,7 @@ try {
 
     if (-not (Test-Path $CsCli)) { throw "cscli.exe not found at $CsCli after install" }
 
-    $CrowdSecSvc = Resolve-ServiceName @("crowdsec", "CrowdSec")
+    $CrowdSecSvc = Resolve-ServiceName @("crowdsec", "CrowdSec") -Exclude @("bouncer")
     Write-DebugLog "VAR CrowdSecSvc=$CrowdSecSvc"
     if (-not $CrowdSecSvc) { throw "CrowdSec Windows service not found after install" }
 
