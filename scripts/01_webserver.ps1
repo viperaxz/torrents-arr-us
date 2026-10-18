@@ -527,6 +527,12 @@ if (-not (Test-Path $TemplatePath)) {
 }
 
 # Build TLS block
+if (@("internal", "letsencrypt", "letsencrypt-staging") -notcontains $TlsMode) {
+    # The switch below falls back to 'tls internal'.  Say so: a typo here silently
+    # downgrades a public site to Caddy's local CA and every browser warns about it.
+    Write-Warning "[WebServer] Unrecognised TlsMode '$TlsMode' -- falling back to 'tls internal' (Caddy's local CA). Valid values: letsencrypt, letsencrypt-staging, internal."
+    Write-DebugLog "WARN" "Unrecognised TlsMode='$TlsMode'; rendering 'tls internal'"
+}
 $TlsBlock = switch ($TlsMode) {
     "internal"       { "tls internal" }
     "letsencrypt"    { "tls $($Config.General.TlsEmail)" }
@@ -777,8 +783,18 @@ Write-DebugLog "INFO" "Caddyfile written to $CaddyfilePath (size=$($Content.Leng
 # Normalize formatting so Caddy's startup warning ("not formatted") is suppressed.
 # caddy fmt tolerates syntactic errors (it always exits 0 on a malformed file), so the
 # exit code is only useful for "file missing"-class failures -- log it either way.
-& $caddyExe fmt --overwrite $CaddyfilePath 2>$null
-$fmtExit = $LASTEXITCODE
+# Caddy writes those failures to stderr, and with EAP=Stop (inherited from
+# master_install.ps1) a native stderr line becomes a terminating NativeCommandError:
+# the guard below is what makes the warning path reachable at all.
+$savedEap = $ErrorActionPreference
+$fmtExit  = 0
+try {
+    $ErrorActionPreference = "Continue"
+    & $caddyExe fmt --overwrite $CaddyfilePath 2>&1 | Out-Null
+    $fmtExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $savedEap
+}
 Write-DebugLog "INFO" "Caddyfile formatted (caddy fmt, exit=$fmtExit)"
 if ($fmtExit -ne 0) {
     Write-Warning "[WebServer] caddy fmt failed (exit $fmtExit). Check $CaddyfilePath."
