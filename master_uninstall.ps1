@@ -536,6 +536,16 @@ foreach ($sub in @("Caddy", "caddy-data", "Sonarr", "Radarr", "Prowlarr", "Bazar
     $path = Join-Path $InstallDir $sub
     $exists = Test-Path $path
     Write-DebugLog "VAR subdir '$sub' exists: $exists"
+    # <InstallDir>\scripts is the copy 12_security.ps1 drops for its whitelist
+    # refresher -- but when the project checkout IS InstallDir (a layout
+    # 00_service_account.ps1 warns about), it is this repo's own scripts folder.
+    # Deleting it would take the uninstaller's siblings with it.
+    if ($sub -eq "scripts" -and $PSScriptRoot -and
+        $PSScriptRoot.TrimEnd('\') -ieq $InstallDir.TrimEnd('\')) {
+        Write-Warning "  -> Keeping $path : the project checkout is InstallDir, so this is the repo's own directory."
+        Write-DebugLog "WARN" "Skipped removal of $path (project checkout lives inside InstallDir)"
+        continue
+    }
     if ($exists) {
         Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "  -> Removed: $path" -ForegroundColor Yellow
