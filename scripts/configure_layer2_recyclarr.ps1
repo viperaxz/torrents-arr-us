@@ -19,7 +19,14 @@ Write-DebugLog "INFO" "configure_layer2_recyclarr.ps1 started"
 $RecyclarrDir    = Join-Path $PSScriptRoot "..\recyclarr"
 $RecyclarrExe    = Join-Path $RecyclarrDir "recyclarr.exe"
 $ConfigFile      = Join-Path $RecyclarrDir "recyclarr.yml"
-$AppDataDir      = Join-Path $env:APPDATA "recyclarr"
+# Recyclarr resolves its app-data dir through the Windows Known Folder API, which
+# ignores an overridden %APPDATA% environment variable (verified: with APPDATA
+# pointed elsewhere, recyclarr still reported
+# "App Data Dir: <profile>\AppData\Roaming\recyclarr").  Resolve the same way so
+# secrets.yml is written exactly where recyclarr looks for it.
+$RoamingAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+if (-not $RoamingAppData) { $RoamingAppData = $env:APPDATA }
+$AppDataDir      = Join-Path $RoamingAppData "recyclarr"
 $SecretsFile     = Join-Path $AppDataDir "secrets.yml"
 $EffectiveConfig = Join-Path $AppDataDir "win-seedbox.yml"
 $DomainMode      = $Config.General.DomainMode
@@ -87,14 +94,16 @@ if (-not (Test-Path $RecyclarrExe)) {
 # -- 2. Read API keys from config.xml files ------------------------------------
 # An instance whose API key cannot be read (app disabled, config.xml missing or
 # unreadable) is left out of the generated config in step 4 and is never synced.
+$SonarrSettings = $null
+$RadarrSettings = $null
 $SonarrKey = $null
 $RadarrKey = $null
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 Write-DebugLog "VAR isAdmin=$isAdmin"
 
-function Get-ArrApiKey {
-    # API key out of an *arr config.xml, or $null when it cannot be read.
+function Get-ArrSettings {
+    # API key and UrlBase out of an *arr config.xml, or $null when it cannot be read.
     param([string]$AppName, [string]$ConfigXml)
     if (-not (Test-Path $ConfigXml)) {
         Write-DebugLog "VAR $AppName config.xml exists=False ($ConfigXml)"
@@ -102,7 +111,10 @@ function Get-ArrApiKey {
     }
     try {
         $xml = [xml](Get-Content -Raw -Path $ConfigXml -Encoding UTF8)
-        return [string]$xml.Config.ApiKey
+        return [PSCustomObject]@{
+            ApiKey  = [string]$xml.Config.ApiKey
+            UrlBase = [string]$xml.Config.UrlBase
+        }
     } catch {
         Write-Warning "[Recyclarr] Could not read the $AppName API key from '$ConfigXml': $_"
         Write-DebugLog "ERROR" "$AppName config.xml unreadable: $_"
@@ -110,17 +122,36 @@ function Get-ArrApiKey {
     }
 }
 
-if ($Config.Apps.Sonarr -eq $true) {
-    $SonarrKey = Get-ArrApiKey -AppName "Sonarr" -ConfigXml "C:\ProgramData\Sonarr\config.xml"
-    Write-DebugLog "VAR SonarrKey found=$((-not [string]::IsNullOrEmpty($SonarrKey)))"
-}
-if ($Config.Apps.Radarr -eq $true) {
-    $RadarrKey = Get-ArrApiKey -AppName "Radarr" -ConfigXml "C:\ProgramData\Radarr\config.xml"
-    Write-DebugLog "VAR RadarrKey found=$((-not [string]::IsNullOrEmpty($RadarrKey)))"
+function Get-ArrBasePath {
+    # The path the app actually answers on. Its config.xml is authoritative: the
+    # app installers set UrlBase=/<app> in DuckDNS mode and remove it in Cloudflare
+    # mode, so reading it stays correct when UrlBase was changed by hand (the
+    # troubleshooting guide tells the user to re-run this script for exactly that
+    # case) or when a mode switch did not re-run the app installer. DomainMode is
+    # only the fallback.
+    param([object]$Settings, [string]$Fallback)
+    if (-not $Settings) { return $Fallback }
+    $base = "$($Settings.UrlBase)".Trim().TrimEnd('/')
+    if ($base -eq "") { return "" }
+    if (-not $base.StartsWith("/")) { return "/$base" }
+    return $base
 }
 
-$SonarrBase  = if ($DomainMode -eq "duckdns") { "/sonarr" } else { "" }
-$RadarrBase  = if ($DomainMode -eq "duckdns") { "/radarr" } else { "" }
+if ($Config.Apps.Sonarr -eq $true) {
+    $SonarrSettings = Get-ArrSettings -AppName "Sonarr" -ConfigXml "C:\ProgramData\Sonarr\config.xml"
+    if ($SonarrSettings) { $SonarrKey = $SonarrSettings.ApiKey }
+    Write-DebugLog "VAR SonarrKey found=$((-not [string]::IsNullOrEmpty($SonarrKey))) UrlBase='$($SonarrSettings.UrlBase)'"
+}
+if ($Config.Apps.Radarr -eq $true) {
+    $RadarrSettings = Get-ArrSettings -AppName "Radarr" -ConfigXml "C:\ProgramData\Radarr\config.xml"
+    if ($RadarrSettings) { $RadarrKey = $RadarrSettings.ApiKey }
+    Write-DebugLog "VAR RadarrKey found=$((-not [string]::IsNullOrEmpty($RadarrKey))) UrlBase='$($RadarrSettings.UrlBase)'"
+}
+
+$SonarrFallback = if ($DomainMode -eq "duckdns") { "/sonarr" } else { "" }
+$RadarrFallback = if ($DomainMode -eq "duckdns") { "/radarr" } else { "" }
+$SonarrBase  = Get-ArrBasePath -Settings $SonarrSettings -Fallback $SonarrFallback
+$RadarrBase  = Get-ArrBasePath -Settings $RadarrSettings -Fallback $RadarrFallback
 $SonarrUrl   = "http://127.0.0.1:$($Config.Ports.Sonarr)$SonarrBase"
 $RadarrUrl   = "http://127.0.0.1:$($Config.Ports.Radarr)$RadarrBase"
 Write-DebugLog "VAR SonarrUrl=$SonarrUrl RadarrUrl=$RadarrUrl"
@@ -274,6 +305,7 @@ $snapshot = @(Get-ChildItem $logDir -Filter "*.debug.log" -ErrorAction SilentlyC
 Write-DebugLog "VAR recyclarr log dir=$logDir existing logs=$($snapshot.Count)"
 
 $logLines = @()
+$rawLogLines = @()
 try {
     $proc = Start-Process -FilePath $RecyclarrExe `
         -ArgumentList "sync", "-c", "`"$EffectiveConfig`"" `
@@ -285,7 +317,8 @@ try {
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
     Write-DebugLog "VAR new recyclarr log=$($newLog.FullName)"
     if ($newLog) {
-        $logLines = @(Get-Content $newLog.FullName |
+        $rawLogLines = @(Get-Content $newLog.FullName)
+        $logLines = @($rawLogLines |
             Where-Object { $_ -match '^\[[\d:]+ (INF|WRN|ERR)\]' })
         Write-DebugLog "INFO" "recyclarr log lines matching INF/WRN/ERR=$($logLines.Count)"
     }
@@ -293,12 +326,36 @@ try {
     if ($proc.ExitCode -ne 0) {
         throw "recyclarr exited with code $($proc.ExitCode)"
     }
-    # Recyclarr exits 0 after a config it cannot parse (unresolved !secret,
-    # invalid property, ...), so the exit code alone is not proof of a sync.
-    $fatal = @($logLines | Where-Object { $_ -match 'Config parsing failed|Exiting due to fatal error' })
+    # Recyclarr exits 0 for some config problems, so the exit code alone is not
+    # proof of a sync. Two shapes, both verified against 8.7.1 and 8.8.0:
+    #   * an unresolvable !secret / YAML error is logged at ERR as
+    #     "Config parsing failed in <file>" (exit code 1 as well);
+    #   * an invalid instance (unknown quality name, a profile whose
+    #     until_quality is not in its own qualities list, ...) is reported ONLY at
+    #     DBG as 'Invalid instances: [{"InstanceName":...}]'; Recyclarr skips that
+    #     instance, syncs the others and still exits 0, so the broken one would be
+    #     dropped without a word.
+    $fatal = @($rawLogLines | Where-Object {
+        $_ -match 'Config parsing failed|Exiting due to fatal error|Invalid instances:\s*\[\s*\{'
+    })
     if ($fatal.Count -gt 0) {
         Write-DebugLog "ERROR" "recyclarr reported a fatal error with exit code 0: $($fatal[0])"
         throw "recyclarr did not complete: $($fatal[0])"
+    }
+    # A clean exit code and no fatal marker is still not proof that anything was
+    # synced: Recyclarr 8.x also exits 0 without processing a single instance (the
+    # same-URL / no-instance case logs only 'Split instances: ...' at DBG). Every
+    # synced instance logs 'Processing <Service> server <name>' at INF, so require
+    # at least one.
+    $instancesExpected  = @($effectiveLines | Where-Object { $_ -match '^\s+base_url:\s' }).Count
+    $instancesProcessed = @($rawLogLines | Where-Object { $_ -match '^\[[\d:]+ INF\] [^:]+: Processing (Sonarr|Radarr) server ' }).Count
+    if ($instancesProcessed -eq 0) {
+        Write-DebugLog "ERROR" "recyclarr exited 0 but processed no instance (config defines $instancesExpected)"
+        throw "recyclarr exited 0 but did not process any instance (no 'Processing ... server' log line)"
+    }
+    if ($instancesExpected -gt 0 -and $instancesProcessed -lt $instancesExpected) {
+        Write-Warning "[Recyclarr] Only $instancesProcessed of $instancesExpected instance(s) were processed; check the log lines above."
+        Write-DebugLog "WARN" "recyclarr processed $instancesProcessed of $instancesExpected instances"
     }
     Write-Host "  [OK] Recyclarr sync complete." -ForegroundColor Green
     Write-DebugLog "INFO" "recyclarr sync completed successfully"
@@ -319,9 +376,8 @@ if (-not (Get-Command Set-InstalledVersion -ErrorAction SilentlyContinue)) {
 }
 if (-not $RecyclarrVersion -and (Test-Path $RecyclarrExe)) {
     # Layer 2 re-run with the binary already present: ask it for its version.
-    # --version goes through the same Spectre.Console console setup as sync, so a
-    # silent failure is expected when stdout is not a console; fall back to the
-    # version resource of the exe.
+    # --version can fail when stdout is not a real console (Spectre.Console), so
+    # the version resource of the exe is the fallback.
     $rcOut = (& $RecyclarrExe --version 2>$null | Select-Object -First 1)
     if ($rcOut -match '([0-9]+\.[0-9]+(?:\.[0-9]+)?)') {
         $RecyclarrVersion = $Matches[1]
