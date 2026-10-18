@@ -50,10 +50,31 @@ try {
     }
     if ($scExit -ne 0) { Write-Warning "sc.exe config failed (exit $scExit). Jellyfin may run under the wrong account." }
 
-    Restart-Service -Name $svcName -Force
-    Start-Sleep -Seconds 15
+    # Bounded restart. Restart-Service -Force throws when choco upgrade left the
+    # service stopped ("cannot be restarted because it is not started"), and it waits
+    # indefinitely on a service stuck in Stop Pending -- both report a successful
+    # upgrade as FAILED. Restart-ServiceBounded works from either state and returns
+    # $true only once the service actually reports Running.
+    if (-not (Get-Command Restart-ServiceBounded -ErrorAction SilentlyContinue)) {
+        . (Join-Path $PSScriptRoot "service_helpers.ps1")
+    }
+    $restarted = Restart-ServiceBounded -Name $svcName -StopTimeoutSeconds 60 -StartTimeoutSeconds 120
     $svcAfter = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "Jellyfin service not Running after restart" }
+    if (-not $restarted -or -not $svcAfter -or $svcAfter.Status -ne "Running") { throw "Jellyfin service not Running after restart" }
+
+    # SCM "Running" only proves the process exists. Poll the public API too, so an
+    # upgrade that leaves a broken listener is reported instead of recorded as OK.
+    $jfBase    = if ($Config.General.DomainMode -eq "duckdns") { "/jellyfin" } else { "" }
+    $healthUrl = "http://127.0.0.1:$($Config.Ports.Jellyfin)$jfBase/System/Info/Public"
+    $apiOk     = $false
+    $apiDeadline = (Get-Date).AddSeconds(120)
+    while (-not $apiOk -and (Get-Date) -lt $apiDeadline) {
+        try {
+            $resp = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 400) { $apiOk = $true }
+        } catch { Start-Sleep -Seconds 3 }
+    }
+    if (-not $apiOk) { throw "Jellyfin did not answer $healthUrl within 120s after the upgrade" }
 
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "" }

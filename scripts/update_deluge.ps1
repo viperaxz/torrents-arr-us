@@ -16,6 +16,13 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "update_common.ps1")
 $Config = Initialize-UpdateScript -Config $Config
 
+# Bounded service control: nssm services can sit in Stop/Start Pending and the
+# built-in cmdlets wait on that indefinitely. 07_deluge.ps1 uses the same helpers,
+# and this path stops/starts exactly those two services.
+if (-not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot "service_helpers.ps1")
+}
+
 $AppName     = "Deluge"
 $ServiceList = @("DelugeDaemon", "DelugeWeb")
 
@@ -282,7 +289,7 @@ function Stop-DelugeForInstall {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne "Stopped") {
             Write-DebugLog "INFO" "Stopping service $svcName (was $($svc.Status))"
-            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            $null = Stop-ServiceBounded -Name $svcName
         }
     }
     $deadline = (Get-Date).AddSeconds(30)
@@ -553,7 +560,7 @@ try {
         foreach ($svcName in $ServiceList) {
             $svcNow = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if ($svcNow -and $svcNow.Status -ne "Running") {
-                Start-Service -Name $svcName -ErrorAction SilentlyContinue
+                $null = Start-ServiceBounded -Name $svcName -TimeoutSeconds 90
             }
         }
     }

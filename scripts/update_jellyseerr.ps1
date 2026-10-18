@@ -127,8 +127,11 @@ try {
     if (-not (Test-Path $serverJs)) { throw "dist\index.js not found after build" }
 
     # -- 4. Swap with rollback --------------------------------------------------
+    # Never Stop-Service here: an nssm service wedged in Stop Pending blocks it
+    # forever (see service_helpers.ps1), and Jellyseerr -- which logs at debug and
+    # writes a lot to stdout -- is the worst offender in this suite.
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq "Running") { Stop-Service -Name $ServiceName -Force }
+    if ($svc -and $svc.Status -eq "Running") { $null = Stop-UpdateService -Name $ServiceName }
     Start-Sleep -Seconds 3
 
     $appBak = "$AppSrcDir.bak"
@@ -136,7 +139,7 @@ try {
     if (Test-Path $AppSrcDir) { Rename-Item -Path $AppSrcDir -NewName "app.bak" -Force }
     Rename-Item -Path $NewSrcDir -NewName "app" -Force
 
-    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $null = Start-ServiceBounded -Name $ServiceName
 
     # A running NSSM service proves nothing for Jellyseerr: the new bundle runs
     # database migrations on its first boot and can crash-loop afterwards. Poll the
@@ -167,16 +170,19 @@ try {
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "" }
 } catch {
+    # Capture before running anything else: the helpers below emit their own
+    # output and this message is what the operator sees in the update report.
+    $errMessage = $_.Exception.Message
     # Rollback: restore the previous app directory, but only when the backup
     # rename actually happened.  Failures during download or build leave the
     # live app directory untouched.
     $appBak = "$AppSrcDir.bak"
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    $null = Stop-UpdateService -Name $ServiceName
     Start-Sleep -Seconds 3
     if (Test-Path $appBak) {
         if (Test-Path $AppSrcDir) { Remove-Item $AppSrcDir -Recurse -Force -ErrorAction SilentlyContinue }
         Rename-Item -Path $appBak -NewName "app" -Force
     }
-    Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    return [PSCustomObject]@{ App = $AppName; Status = "FAILED"; Installed = $installed; Target = $Version; Detail = $_.Exception.Message }
+    $null = Start-ServiceBounded -Name $ServiceName
+    return [PSCustomObject]@{ App = $AppName; Status = "FAILED"; Installed = $installed; Target = $Version; Detail = $errMessage }
 }

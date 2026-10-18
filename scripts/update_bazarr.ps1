@@ -21,6 +21,22 @@ $AppName     = "Bazarr"
 $ServiceName = "Bazarr"
 $AppBinDir   = Join-Path $InstallDir $AppName
 
+function Stop-BazarrService {
+    # update_common dot-sources service_helpers.ps1, which exists because Stop-Service
+    # waits forever on an nssm service wedged in Stop Pending. Bazarr runs from Python
+    # and can take seconds to shut down, so the bounded helpers are mandatory here.
+    param([int]$TimeoutSeconds = 60)
+    if (Get-Command Stop-UpdateService -ErrorAction SilentlyContinue) {
+        return [bool](Stop-UpdateService -Name $ServiceName -TimeoutSeconds $TimeoutSeconds)
+    }
+    if (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue) {
+        return [bool](Stop-ServiceBounded -Name $ServiceName -TimeoutSeconds $TimeoutSeconds)
+    }
+    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    $s = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    return ((-not $s) -or $s.Status -eq "Stopped")
+}
+
 # Bazarr mounts its API under the base_url stored in config.yaml (/bazarr in
 # DuckDNS mode).  Read it so the health check can probe the real path.
 function Get-BazarrBaseUrl {
@@ -68,7 +84,11 @@ try {
     # Stop service, backup, extract new source.
     $appBinBak = "$AppBinDir.bak"
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq "Running") { Stop-Service -Name $ServiceName -Force }
+    if ($svc -and $svc.Status -eq "Running" -and -not (Stop-BazarrService)) {
+        # Renaming a directory the live Python process still holds fails halfway and
+        # leaves neither the old nor the new tree usable.
+        throw "Could not stop $ServiceName within the bound; the installed source tree was left untouched."
+    }
     Start-Sleep -Seconds 2
     if (Test-Path $appBinBak) { Remove-Item $appBinBak -Recurse -Force }
     if (Test-Path $AppBinDir) { Rename-Item -Path $AppBinDir -NewName "$AppName.bak" -Force }
@@ -138,7 +158,7 @@ try {
     # rename actually happened.  Failures before the backup (download,
     # service stop) leave the live directory untouched.
     $appBinBak = "$AppBinDir.bak"
-    Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+    $null = Stop-BazarrService
     Start-Sleep -Seconds 2
     if (Test-Path $appBinBak) {
         if (Test-Path $AppBinDir) { Remove-Item $AppBinDir -Recurse -Force -ErrorAction SilentlyContinue }
