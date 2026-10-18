@@ -359,10 +359,22 @@ function global:Install-FfmpegBuild {
     # fail a fully-cached reinstall for no reason.
     $zipPath = $null
     $asset   = $null
-    $patternFiles = @(Get-ChildItem -Path $BinDir -Filter $AssetPattern -File -ErrorAction SilentlyContinue)
+    # Get-ChildItem -Filter $null matches *every* file in bin\, which also holds the
+    # cached archives of the other apps (an ffmpeg install without versions.json, or
+    # with a manifest entry that has no "asset" key, passes $null here).  The newest
+    # of those would be mistaken for the ffmpeg archive and then deleted by the
+    # refetch below, so fall back to the same default Select-FfmpegAsset uses and
+    # never consider an arm64 build.
+    $cachePattern = if ($AssetPattern) { $AssetPattern } else { "*portable_win64*.zip" }
+    $patternFiles = @(Get-ChildItem -Path $BinDir -Filter $cachePattern -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -notlike "*arm64*" })
     if ($Tag) {
         $tagNumeric = $Tag.TrimStart('v')
-        $cachedZip  = @($patternFiles | Where-Object { $_.Name -like "*$tagNumeric*" } |
+        # Exact tag match, not a substring: a plain -like "*8.1.3-1*" also matches
+        # the 8.1.3-10 archive, and that archive would then be recorded under the
+        # pin.  The lookahead keeps a build number from matching a longer one.
+        $tagPattern = [regex]::Escape($tagNumeric) + '(?!\d)'
+        $cachedZip  = @($patternFiles | Where-Object { [regex]::IsMatch($_.Name, $tagPattern) } |
                         Sort-Object LastWriteTime -Descending | Select-Object -First 1)
     } else {
         $cachedZip  = @($patternFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 1)
@@ -428,11 +440,36 @@ function global:Install-FfmpegBuild {
     }
     Write-DebugLog "VAR resolvedTag=$resolvedTag"
     $staged  = $null
+    $extractError = ""
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         if ($attempt -gt 1 -and (Test-Path -LiteralPath $zipPath)) {
             # The cached copy did not extract: assume it is truncated and refetch.
             Write-DebugLog "WARN" "Discarding cached zip $zipPath and downloading again"
             Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
+        }
+        if (-not (Test-Path -LiteralPath $zipPath) -and -not $asset.browser_download_url) {
+            # A cached archive carries no download URL, so the refetch above would
+            # call Invoke-WebRequest with a null -Uri and fail with a misleading
+            # "download failed" while the real problem is a corrupt cache entry.
+            # Resolve the release now so the retry can really download it.
+            Write-DebugLog "WARN" "Cached archive $($asset.name) is unusable and has no download URL; resolving the release again"
+            try {
+                $release = Get-FfmpegRelease -Repo $Repo -Tag $Tag
+                $freshAsset = Select-FfmpegAsset -Release $release -AssetPattern $AssetPattern
+                if ($freshAsset) {
+                    $asset      = $freshAsset
+                    $zipPath    = Join-Path $BinDir $asset.name
+                    $resolvedTag = $release.tag_name
+                    Write-DebugLog "INFO" "Re-resolved $($asset.name) for the refetch (tag=$resolvedTag)"
+                }
+            } catch {
+                Write-DebugLog "WARN" "could not re-resolve a download URL for the discarded cached archive: $_"
+            }
+        }
+        if (-not (Test-Path -LiteralPath $zipPath) -and -not $asset.browser_download_url) {
+            $result.Detail = "the cached archive $($asset.name) could not be extracted and no download URL is available ($extractError)"
+            Write-DebugLog "ERROR" $result.Detail
+            return $result
         }
         if (Test-Path -LiteralPath $zipPath) {
             Write-Host "  -> Using cached $($asset.name)." -ForegroundColor Gray
@@ -453,12 +490,15 @@ function global:Install-FfmpegBuild {
             Write-DebugLog "INFO" "Download complete: $((Get-Item -LiteralPath $zipPath).Length) bytes"
         }
         try {
+            $extractError = ""
             $staged = Expand-FfmpegArchive -ZipPath $zipPath -StageDir $stageDir
         } catch {
+            $extractError = "$_"
             Write-DebugLog "WARN" "extracting $zipPath failed (attempt $attempt): $_"
             $staged = $null
         }
         if ($staged) { break }
+        if (-not $extractError) { $extractError = "no ffmpeg.exe in $($asset.name)" }
     }
     if (-not $staged) {
         # Explicit "tool missing" guard: nothing may be recorded as installed.
@@ -605,6 +645,30 @@ if ($Config.Apps.Ffmpeg -ne $true) {
 # binary lives somewhere else.  In that case migrate instead of skipping.
 $installedExe = Join-Path $AppBinDir "ffmpeg.exe"
 if ((Test-Path $LockFile) -and (Test-Path -LiteralPath $installedExe)) {
+    # The skip must still hold the contract the install path enforces: Jellyfin is
+    # a service and only sees the machine PATH, so a lock file plus a binary on disk
+    # does not prove it can execute *this* build.  A restored install tree, or any
+    # tool that rewrites the machine PATH, leaves both behind without the PATH
+    # entry, and the skip would then report a healthy install forever while Jellyfin
+    # transcodes with a stale build or none at all.
+    $skipResolved = Resolve-FfmpegOnMachinePath -ExeName "ffmpeg.exe"
+    if (-not $skipResolved -or ([System.IO.Path]::GetFullPath($skipResolved) -ine [System.IO.Path]::GetFullPath($installedExe))) {
+        try {
+            $repaired = Add-MachinePathEntryFirst -Dir $AppBinDir
+            if ($repaired.Changed) {
+                Write-Host "  -> Restored the machine PATH entry for $AppBinDir (it had been lost)." -ForegroundColor Yellow
+                Write-DebugLog "WARN" "ffmpeg was installed but not resolvable first on the machine PATH; entry re-added"
+            }
+            $skipResolved = Resolve-FfmpegOnMachinePath -ExeName "ffmpeg.exe"
+        } catch {
+            Write-DebugLog "WARN" "could not repair the machine PATH for $AppBinDir : $_"
+        }
+    }
+    if (-not $skipResolved -or ([System.IO.Path]::GetFullPath($skipResolved) -ine [System.IO.Path]::GetFullPath($installedExe))) {
+        $skipText = if ($skipResolved) { $skipResolved } else { "(nothing)" }
+        Write-Warning "  -> Jellyfin resolves ffmpeg.exe to $skipText instead of '$installedExe'. Re-run with -Force ffmpeg to reinstall it."
+        Write-DebugLog "ERROR" "ffmpeg skip check: machine PATH resolves ffmpeg.exe to $skipText, expected '$installedExe'"
+    }
     Write-Host "[ffmpeg] Already installed. Skipping." -ForegroundColor Green
     Write-DebugLog "INFO" "ffmpeg already installed (lock file present)"
     return
