@@ -38,9 +38,42 @@ if ($Config.Apps.Jellyfin -ne $true) {
     return
 }
 if (Test-Path $LockFile) {
-    Write-Host "[Jellyfin] Already installed. Skipping." -ForegroundColor Green
-    Write-DebugLog "INFO" "Jellyfin already installed (lock file exists). Skipping."
-    return
+    # The lock file stops a re-run from reinstalling, but it must not hide a BaseUrl or
+    # port that no longer matches config.json: switching DomainMode (cloudflare <->
+    # duckdns) changes Jellyfin's BaseUrl, and Layer 1/2 would then poll a path the
+    # server does not serve -- 300s of timeouts and a failed Jellyfin configuration.
+    # Dropping the lock when it has drifted re-runs the configuration steps below
+    # (choco sees the package and skips the install), so no path is duplicated.
+    $netConfigPath = "C:\ProgramData\Jellyfin\Server\config\network.xml"
+    $wantBase = if ($DomainMode -eq "duckdns") { "/jellyfin" } else { "" }
+    $wantPort = "$($Config.Ports.Jellyfin)"
+    $drifted  = $true
+    if (Test-Path $netConfigPath) {
+        try {
+            [xml]$driftXml = Get-Content -Path $netConfigPath -Encoding UTF8
+            $haveBase = "$($driftXml.NetworkConfiguration.BaseUrl)"
+            $havePort = "$($driftXml.NetworkConfiguration.InternalHttpPort)"
+            if ($haveBase -eq $wantBase -and $havePort -eq $wantPort) {
+                $drifted = $false
+            } else {
+                Write-Host "[Jellyfin] Installed network.xml does not match config.json (BaseUrl '$haveBase' -> '$wantBase', port $havePort -> $wantPort). Re-applying." -ForegroundColor Yellow
+                Write-DebugLog "WARN" "network.xml drift: BaseUrl='$haveBase' port=$havePort, config wants '$wantBase'/$wantPort"
+            }
+        } catch {
+            Write-Host "[Jellyfin] Could not read network.xml. Re-applying configuration." -ForegroundColor Yellow
+            Write-DebugLog "WARN" "network.xml unreadable while the lock file exists; re-applying configuration: $_"
+        }
+    } else {
+        Write-Host "[Jellyfin] network.xml is missing. Re-applying configuration." -ForegroundColor Yellow
+        Write-DebugLog "WARN" "network.xml missing while the lock file exists; re-applying configuration"
+    }
+    if (-not $drifted) {
+        Write-Host "[Jellyfin] Already installed. Skipping." -ForegroundColor Green
+        Write-DebugLog "INFO" "Jellyfin already installed (lock file exists). Skipping."
+        return
+    }
+    Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+    Write-DebugLog "INFO" "Lock file removed: re-running the configuration steps to re-align network.xml"
 }
 
 Write-Host "[Jellyfin] Installing..." -ForegroundColor Cyan
@@ -161,7 +194,16 @@ Write-DebugLog "VAR $ServiceName status before stop=$svcStatus"
 if ($svcStatus -eq "Running") {
     Write-Host "  -> Stopping service to configure..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Stopping $ServiceName to write network.xml..."
-    $null = Stop-ServiceBounded -Name $ServiceName
+    $stopped = Stop-ServiceBounded -Name $ServiceName
+    if (-not $stopped) {
+        # Editing network.xml under a running Jellyfin is pointless: it rewrites the file
+        # from memory when it finally stops, so the port and BaseUrl change silently
+        # vanishes and the reverse-proxy path stays broken. Fail the step instead, and
+        # leave the lock file and ledger unwritten so a re-run retries.
+        Write-Warning "[Jellyfin] $ServiceName did not stop. Not editing network.xml while it is running."
+        Write-DebugLog "ERROR" "$ServiceName did not reach Stopped; network.xml not edited (a running server overwrites it on exit)"
+        exit 1
+    }
     Start-Sleep -Seconds 3
     Write-DebugLog "INFO" "$ServiceName stopped"
 }
@@ -290,14 +332,20 @@ Write-Host "  -> Starting Jellyfin..." -ForegroundColor Yellow
 Write-DebugLog "INFO" "Starting $ServiceName..."
 $null = Start-ServiceBounded -Name $ServiceName
 Start-Sleep -Seconds 3
-$svc = Get-Service -Name $ServiceName
+$svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR $ServiceName status after start=$($svc.Status)"
-if ($svc.Status -eq "Running") {
+if ($svc -and $svc.Status -eq "Running") {
     Write-Host "  -> Jellyfin running on port $($Config.Ports.Jellyfin)." -ForegroundColor Green
     Write-DebugLog "INFO" "Jellyfin is Running on port $($Config.Ports.Jellyfin)"
 } else {
-    Write-Warning "  -> Jellyfin may not have started. Status: $($svc.Status)"
-    Write-DebugLog "WARN" "Jellyfin status=$($svc.Status)  --  may not have started"
+    # Do NOT record success for a service that never started. Writing the lock file
+    # and the ledger entry here made a broken Jellyfin permanent: the next run saw
+    # "Already installed. Skipping." and never repaired it. Leaving both unwritten
+    # means a re-run genuinely retries, and exit 1 makes master_install.ps1 report
+    # Jellyfin as failed instead of silently green. Same contract as 03_sonarr.ps1.
+    Write-Warning "  -> Jellyfin did not start. Status: $(if ($svc) { $svc.Status } else { 'NOT FOUND' })"
+    Write-DebugLog "ERROR" "Jellyfin status=$(if ($svc) { $svc.Status } else { 'NOT FOUND' }) after start; lock file and ledger entry not written"
+    exit 1
 }
 
 # Record what Chocolatey reports as installed, not the manifest pin: a machine that
