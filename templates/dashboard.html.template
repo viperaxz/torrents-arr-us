@@ -191,7 +191,7 @@ function renderStats(d) {
     d.drives.forEach(function(dr) {
       var pct = dr.percent_used || 0;
       html += '<div class="drive">';
-      html += '<div class="drive-header"><span class="drive-label">' + dr.drive.replace(/\\$/, '') + '</span><span class="drive-size">' + fmt(dr.free_gb, 1) + ' GB free / ' + fmt(dr.total_gb, 0) + ' GB</span></div>';
+      html += '<div class="drive-header"><span class="drive-label">' + esc(dr.drive).replace(/\\$/, '') + '</span><span class="drive-size">' + fmt(dr.free_gb, 1) + ' GB free / ' + fmt(dr.total_gb, 0) + ' GB</span></div>';
       html += '<div class="bar-track"><div class="bar-fill ' + barClass(pct) + '" style="width:' + pct + '%"></div></div>';
       html += '</div>';
     });
@@ -219,7 +219,7 @@ function renderStats(d) {
   if (dl) {
     html += '<div class="stat-card"><div class="stat-card-title">Downloads</div>';
     if (dl.error) {
-      html += '<span class="stats-msg">' + (dl.error || 'Deluge unavailable') + '</span>';
+      html += '<span class="stats-msg">' + esc(dl.error || 'Deluge unavailable') + '</span>';
     } else {
       html += '<div class="dl-summary">';
       html += '<div class="dl-stat"><div class="dl-num">' + (dl.active != null ? dl.active : '--') + '</div><div class="dl-lbl">Active</div></div>';
@@ -236,7 +236,7 @@ function renderStats(d) {
       if (dl.active_items && dl.active_items.length) {
         dl.active_items.forEach(function(item) {
           html += '<div class="dl-item">';
-          html += '<div class="dl-item-name" title="' + item.name + '">' + item.name + '</div>';
+          html += '<div class="dl-item-name" title="' + esc(item.name) + '">' + esc(item.name) + '</div>';
           html += '<div class="dl-item-bar"><div class="bar-track"><div class="bar-fill bar-ok" style="width:' + item.progress + '%"></div></div><span class="dl-pct">' + item.progress + '%</span></div>';
           html += '</div>';
         });
@@ -265,8 +265,39 @@ function renderStats(d) {
     } else if (sec.blocklist_active === false) {
       blTxt = 'Inactive';
     }
-    html += '<div class="sec-item"><span class="sec-key">Abuse blocklist</span><span class="sec-val ' + (sec.blocklist_active ? 'sec-ok' : 'sec-warn') + '">' + blTxt + '</span></div>';
+    html += '<div class="sec-item"><span class="sec-key">Abuse blocklist</span><span class="sec-val ' + (sec.blocklist_active ? 'sec-ok' : 'sec-warn') + '">' + esc(blTxt) + '</span></div>';
     html += '</div></div>';
+  }
+
+  // Test suite (test_results.json, written by test-suite.ps1; absent until the
+  // first scheduled run, so the whole card is skipped when the fetch failed)
+  var t = tests;
+  if (t && t.summary && t.summary.total != null) {
+    var sm = t.summary;
+    var fails = t.results ? t.results.filter(function(r) { return r.status === 'FAIL'; }) : [];
+    var headColor = (sm.fail > 0) ? 'var(--red)' : 'var(--green)';
+    var note = [];
+    if (sm.pass != null) note.push(sm.pass + ' pass');
+    if (sm.fail != null) note.push(sm.fail + ' fail');
+    if (sm.warn != null) note.push(sm.warn + ' warn');
+    if (sm.skip != null) note.push(sm.skip + ' skip');
+    html += '<div class="stat-card"><div class="stat-card-title">Test Suite</div>';
+    html += '<div class="media-row">';
+    html += '<div class="media-stat"><div class="media-num" style="color:' + headColor + '">' + esc(sm.total) + '</div><div class="media-lbl">Checks</div></div>';
+    html += '<div class="media-stat"><div class="media-num" style="color:var(--red)">' + esc(fails.length) + '</div><div class="media-lbl">Failing</div></div>';
+    html += '</div>';
+    html += '<div class="media-lbl" style="margin-top:.55rem">' + note.join(' \u00b7 ') + '</div>';
+    html += '<div class="media-lbl">' + (t.suite_duration_s != null ? esc(t.suite_duration_s) + 's ' + '\u00b7 ' : '') + timeSince(t.timestamp) + '</div>';
+    fails.slice(0, 5).forEach(function(r) {
+      html += '<div class="media-lbl" style="margin-top:.35rem;color:var(--red)">' + esc(r.service) + ' \u00b7 ' + esc(r.test) + (r.message ? ': ' + esc(r.message) : '') + '</div>';
+    });
+    if (fails.length > 5) {
+      html += '<div class="media-lbl" style="margin-top:.35rem">and ' + (fails.length - 5) + ' more failing check(s)</div>';
+    }
+    if (typeof t.loki_push === 'string' && t.loki_push.indexOf('failed') === 0) {
+      html += '<div class="media-lbl" style="margin-top:.35rem;color:var(--yellow)">Grafana push ' + esc(t.loki_push) + '</div>';
+    }
+    html += '</div>';
   }
 
   html += '</div>';
