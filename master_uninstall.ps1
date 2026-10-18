@@ -654,8 +654,13 @@ if ($svcExists) {
 
     # Try to unload the registry hives (services are already stopped so they may be
     # free). A still-loaded hive keeps UsrClass.dat open, which is what stops the
-    # profile directory from being deleted -- so report the failure instead of
-    # hiding it and then blaming a generic "kernel lock" later.
+    # profile directory from being deleted -- so record the outcome instead of
+    # hiding it. This is INFO, not WARN: on a healthy uninstall it is the normal
+    # result (reg unload returns Access denied for profiles created in this or a
+    # previous session), it needs no action beyond the reboot the queue below
+    # already arranges, and a WARN that fires on every run trains the operator to
+    # ignore WARN. Whatever could not be cleaned up is reported where it matters:
+    # on the "locked until reboot / deletion queued" line for the folder itself.
     foreach ($hive in @("HKU\$svcSid", "HKU\${svcSid}_Classes")) {
         $unloaded = $false
         for ($attempt = 1; $attempt -le 3 -and -not $unloaded; $attempt++) {
@@ -670,7 +675,7 @@ if ($svcExists) {
         if ($unloaded) {
             Write-DebugLog "INFO" "Registry hive unloaded: $hive"
         } else {
-            Write-DebugLog "WARN" "Registry hive $hive is still loaded and cannot be unloaded until reboot"
+            Write-DebugLog "INFO" "Registry hive $hive stays loaded until reboot (expected: the profile is still mapped); its folder is queued for deletion below"
         }
     }
 
@@ -681,15 +686,7 @@ if ($svcExists) {
     Write-DebugLog "VAR $svcUser profile found: $($null -ne $svcProfile) path=$profileDir"
     if ($svcProfile) {
         $svcProfile | Remove-CimInstance -ErrorAction SilentlyContinue
-        $stillRegistered = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-                           Where-Object { $_.LocalPath -like "*$svcUser*" }
-        if ($stillRegistered) {
-            Write-Warning "  -> seedbox-svc profile entry could not be removed from WMI."
-            Write-DebugLog "WARN" "Win32_UserProfile entry for $svcUser still present after Remove-CimInstance"
-        } else {
-            Write-Host "  -> seedbox-svc profile removed ($profileDir)." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "WMI profile removed for $svcUser"
-        }
+        Write-DebugLog "INFO" "Remove-CimInstance attempted for $svcUser profile ($profileDir)"
     }
 
     # Remove ProfileList registry key (survives WMI removal on some Windows builds).
@@ -699,6 +696,24 @@ if ($svcExists) {
     if ($plKeyExists) {
         Remove-Item $plKey -Recurse -Force -ErrorAction SilentlyContinue
         Write-DebugLog "INFO" "Removed ProfileList key: $plKey"
+    }
+
+    # Verified *after* both removal paths have run. Checking between them used to
+    # report "still present" before the ProfileList fallback -- the step the comment
+    # above says exists precisely for builds where Remove-CimInstance does not
+    # stick -- so a healthy uninstall logged a WARN for an entry it then removed.
+    $stillRegistered = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
+                       Where-Object { $_.LocalPath -like "*$svcUser*" }
+    if ($stillRegistered) {
+        # Same reasoning as the hive message: the profile entry cannot go away
+        # while the profile is mapped, and it is harmless once the account and the
+        # folder are gone -- Windows just creates the profile again on next use.
+        Write-DebugLog "INFO" "Win32_UserProfile entry for $svcUser survives until reboot (expected while the profile is mapped)"
+    } elseif ($svcProfile) {
+        Write-Host "  -> seedbox-svc profile entry removed ($profileDir)." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Win32_UserProfile entry for $svcUser removed"
+    } else {
+        Write-DebugLog "INFO" "No Win32_UserProfile entry was registered for $svcUser"
     }
 
     # Delete folder directly if still present (hive unload succeeded).
@@ -733,9 +748,63 @@ if ($svcExists) {
         Write-DebugLog "INFO" "Profile folder deleted: $profileDir"
     }
 
+    # Strip our account from the logon rights before deleting it. Windows otherwise
+    # leaves a dangling SID behind: 21 install/uninstall cycles had accumulated 21
+    # orphaned SIDs in SeServiceLogonRight and SeBatchLogonRight (RIDs …1004-…1024),
+    # which secedit then reports as unresolvable "*S-1-5-21-…" entries.
+    try {
+        $secInf = Join-Path $env:TEMP "seedbox_uninstall_secedit.inf"
+        & secedit /export /cfg $secInf /quiet 2>&1 | Out-Null
+        if (Test-Path $secInf) {
+            $secLines   = [System.IO.File]::ReadAllLines($secInf)
+            $secOut     = New-Object System.Collections.Generic.List[string]
+            $secChanged = 0
+            foreach ($ln in $secLines) {
+                if ($ln -match '^(SeServiceLogonRight|SeBatchLogonRight)\s*=\s*(.*)$') {
+                    $rightName = $matches[1]
+                    $entries   = @($matches[2] -split ',' | Where-Object { $_.Trim() -ne '' })
+                    $kept      = @($entries | Where-Object {
+                        $e = $_.Trim().TrimStart('*')
+                        -not ($e -eq $svcSid -or $e -eq $svcUser)
+                    })
+                    if ($kept.Count -ne $entries.Count) {
+                        $secChanged++
+                        $secOut.Add("$rightName = " + ($kept -join ','))
+                        Write-DebugLog "INFO" "Logon right ${rightName}: removed $svcUser ($($entries.Count) -> $($kept.Count) entries)"
+                    } else {
+                        $secOut.Add($ln)
+                    }
+                } else {
+                    $secOut.Add($ln)
+                }
+            }
+            if ($secChanged -gt 0) {
+                [System.IO.File]::WriteAllLines($secInf, $secOut.ToArray(), [System.Text.Encoding]::Unicode)
+                $secDb = Join-Path $env:TEMP 'seedbox_uninstall_secedit.sdb'
+                & secedit /configure /db $secDb /cfg $secInf /areas USER_RIGHTS /quiet 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Write-DebugLog "INFO" "Logon rights cleaned of $svcUser"
+                } else {
+                    Write-DebugLog "WARN" "secedit /configure for the logon rights returned $LASTEXITCODE"
+                }
+                Remove-Item $secDb -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item $secInf -Force -ErrorAction SilentlyContinue
+    } catch {
+        Write-DebugLog "WARN" "Could not strip $svcUser from the logon rights: $_"
+    }
+
     Remove-LocalUser -Name $svcUser -ErrorAction SilentlyContinue
-    Write-Host "  -> seedbox-svc account removed." -ForegroundColor Yellow
-    Write-DebugLog "INFO" "Local user account removed: $svcUser"
+    if (Get-LocalUser -Name $svcUser -ErrorAction SilentlyContinue) {
+        # A surviving account still holds ServiceAccountPassword from config.json,
+        # and its profile folders keep being created on every service start.
+        Write-Warning "  -> seedbox-svc account could NOT be removed (it still exists)."
+        Write-DebugLog "ERROR" "Local user account $svcUser still present after Remove-LocalUser"
+    } else {
+        Write-Host "  -> seedbox-svc account removed." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Local user account removed: $svcUser"
+    }
 }
 
 # Every cycle leaves the previous profile behind: its hive stays mapped until the
@@ -743,22 +812,53 @@ if ($svcExists) {
 # .001, and so on. Handling only the current profile therefore leaves one dead
 # 2.6 MB tree per cycle (measured: five of them after five cycles). Sweep every
 # one, including the ones earlier cycles created.
+#
+# The sweep must never touch a profile that belongs to a logged-on human. Comparing
+# only $env:USERPROFILE covers the account this process runs as, which is NOT
+# always the interactive one: the uninstaller is normally elevated from a different
+# administrator account, so the console user has to be resolved and protected
+# explicitly.
+$protectedProfiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($protectedPath in @($env:USERPROFILE, [Environment]::GetFolderPath('UserProfile'), $profileDir)) {
+    if (-not [string]::IsNullOrWhiteSpace($protectedPath)) { [void]$protectedProfiles.Add($protectedPath.TrimEnd('\')) }
+}
+$consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+if ($consoleUser) {
+    try {
+        $consoleSid = (New-Object System.Security.Principal.NTAccount($consoleUser)).Translate(
+                          [System.Security.Principal.SecurityIdentifier]).Value
+        $consoleKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$consoleSid"
+        $consolePath = (Get-ItemProperty -Path $consoleKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+        if (-not [string]::IsNullOrWhiteSpace($consolePath)) { [void]$protectedProfiles.Add($consolePath.TrimEnd('\')) }
+        Write-DebugLog "VAR console user $consoleUser profile $consolePath is protected from the sweep"
+    } catch {
+        Write-DebugLog "VAR console user $consoleUser profile could not be resolved: $_"
+    }
+}
 $leftoverProfiles = @(Get-ChildItem -Path 'C:\Users' -Directory -Filter "$svcUser*" -Force -ErrorAction SilentlyContinue |
-                      Where-Object { $_.FullName -ne $profileDir -and $_.FullName -ne $env:USERPROFILE })
+                      Where-Object { -not $protectedProfiles.Contains($_.FullName.TrimEnd('\')) })
 if ($leftoverProfiles.Count -gt 0) {
     $sweepDeleted = 0
     $sweepQueued  = 0
+    $sweepPending = 0
     foreach ($dir in $leftoverProfiles) {
         if (-not (Test-Path -LiteralPath $dir.FullName)) { continue }
         Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $dir.FullName) {
-            try { $sweepQueued += Register-PathForDeletionAtReboot -Path $dir.FullName } catch { }
+            try {
+                $registration = Register-PathForDeletionAtReboot -Path $dir.FullName
+                $sweepQueued  += $registration.Queued
+                $sweepPending += $registration.AlreadyQueued
+            } catch { }
         } else {
             $sweepDeleted++
         }
     }
-    Write-Host "  -> Removed $sweepDeleted stale $svcUser profile folder(s) from earlier cycles$(if ($sweepQueued -gt 0) { "; queued $sweepQueued entries for the remaining locked one(s)" })." -ForegroundColor Yellow
-    Write-DebugLog "INFO" "Stale $svcUser profile sweep: deleted=$sweepDeleted queuedEntries=$sweepQueued of $($leftoverProfiles.Count) folder(s)"
+    $sweepNote = ""
+    if ($sweepQueued -gt 0)  { $sweepNote = "; queued $sweepQueued entries for the remaining locked one(s)" }
+    elseif ($sweepPending -gt 0) { $sweepNote = "; the remaining one(s) were already queued by an earlier run" }
+    Write-Host "  -> Removed $sweepDeleted stale $svcUser profile folder(s) from earlier cycles$sweepNote." -ForegroundColor Yellow
+    Write-DebugLog "INFO" "Stale $svcUser profile sweep: deleted=$sweepDeleted queuedEntries=$sweepQueued alreadyQueuedEntries=$sweepPending of $($leftoverProfiles.Count) folder(s)"
 }
 
 # -- Done ----------------------------------------------------------------------
