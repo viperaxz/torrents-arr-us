@@ -220,6 +220,19 @@ function Find-ExistingPython {
     return ($found | Select-Object -Unique)
 }
 
+# 3.12 is the pinned version: pre-built wheels exist for every Bazarr dependency
+# on cp312. A newer 3.x elsewhere on the machine must not win merely for being
+# newer -- it is only a fallback when no 3.12 is installed.
+function Test-PythonPreferred {
+    param($Candidate, $Current)
+    if (-not $Current) { return $true }
+    $candPinned = ($Candidate.Minor -eq 12)
+    $currPinned = ($Current.Minor -eq 12)
+    if ($candPinned -ne $currPinned) { return $candPinned }
+    if ($Candidate.Minor -ne $Current.Minor) { return ($Candidate.Minor -gt $Current.Minor) }
+    return ($Candidate.Patch -gt $Current.Patch)
+}
+
 # Step 1: Check C:\Python312 (Chocolatey default)
 $candidate = Test-PythonCandidate "C:\Python312\python.exe"
 if ($candidate) { $PythonExe = $candidate.Path; Write-DebugLog "INFO" "Found Python $($candidate.VersionStr) at $PythonExe (Chocolatey default)" }
@@ -227,22 +240,20 @@ if ($candidate) { $PythonExe = $candidate.Path; Write-DebugLog "INFO" "Found Pyt
 # Step 2: Scan C:\Python3* directories (user-installed, winget, etc.)
 # Compare parsed versions (minor/patch) rather than directory names: a plain
 # descending name sort puts "Python39" ahead of "Python310"/"Python312" and
-# would silently select an older interpreter.
+# would silently select an older interpreter. 3.12 outranks any other version.
 if (-not $PythonExe) {
     $bestCandidate = $null
     Get-ChildItem "C:\Python3*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
         $candidate = Test-PythonCandidate (Join-Path $_.FullName "python.exe")
         if ($candidate) {
-            if (-not $bestCandidate -or
-                $candidate.Minor -gt $bestCandidate.Minor -or
-                ($candidate.Minor -eq $bestCandidate.Minor -and $candidate.Patch -gt $bestCandidate.Patch)) {
+            if (Test-PythonPreferred $candidate $bestCandidate) {
                 $bestCandidate = $candidate
             }
         }
     }
     if ($bestCandidate) {
         $PythonExe = $bestCandidate.Path
-        Write-DebugLog "INFO" "Found Python $($bestCandidate.VersionStr) at $PythonExe (C:\Python3* scan, newest)"
+        Write-DebugLog "INFO" "Found Python $($bestCandidate.VersionStr) at $PythonExe (C:\Python3* scan, 3.12 preferred)"
     }
 }
 
@@ -413,7 +424,14 @@ $existingSvc = Get-Service -Name $AppName -ErrorAction SilentlyContinue
 Write-DebugLog "VAR existing $AppName service=$(if ($existingSvc) { $existingSvc.Status } else { 'NOT FOUND' })"
 if ($existingSvc) {
     Write-DebugLog "INFO" "Stopping existing $AppName service before extraction..."
-    $null = Stop-ServiceBounded -Name $AppName
+    if (-not (Stop-ServiceBounded -Name $AppName)) {
+        # The source tree is about to be deleted. Extracting over a directory that
+        # a live Python process still holds would leave a half-old/half-new tree
+        # that then starts and reports Running.
+        Write-Warning "[$AppName] Service did not stop; its files were left untouched. Re-run once it has stopped."
+        Write-DebugLog "ERROR" "$AppName did not stop within the bound before extraction; aborting"
+        exit 1
+    }
     Start-Sleep -Seconds 3
 }
 $appBinExists = Test-Path $AppBinDir
@@ -564,7 +582,7 @@ Write-DebugLog "INFO" "Firewall rule added for $AppName port=$AppPort"
 # Bazarr performs multiple config.yaml writes during startup (initial create,
 # then a defaults-fill pass). We must wait for the API to be up before stopping,
 # otherwise our base_url edit gets overwritten on the next start.
-Write-Host "  -> Starting Bazarr for first-run config generation (up to 180s)..." -ForegroundColor Gray
+Write-Host "  -> Starting Bazarr for first-run config generation (config 120s + API 90s)..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Starting $AppName service for first-run initialization..."
 $null = Start-ServiceBounded -Name $AppName
 $svcAfterStart = Get-Service -Name $AppName -ErrorAction SilentlyContinue
@@ -609,11 +627,23 @@ if (-not (Test-Path $ConfigFile)) {
     }
 
     Write-DebugLog "INFO" "Stopping $AppName before config.yaml edit..."
-    $null = Stop-ServiceBounded -Name $AppName
-    Start-Sleep -Seconds 3
+    $stoppedForEdit = Stop-ServiceBounded -Name $AppName
+    if ($stoppedForEdit) {
+        Start-Sleep -Seconds 3
+    } else {
+        # Bazarr rewrites config.yaml from memory while it runs, so an edit made
+        # behind a live process is overwritten on the next restart.
+        Write-Warning "[$AppName] Service did not stop; config.yaml was not edited."
+        Write-DebugLog "ERROR" "$AppName did not stop within the bound before the config.yaml edit"
+    }
 
     # -- 9. Set base_url for DuckDNS path routing ------------------------------
     if ($DomainMode -eq "duckdns") {
+        if (-not $stoppedForEdit) {
+            Write-Warning "  -> base_url NOT set. Re-run .\master_install.ps1 once Bazarr stops cleanly."
+            Write-DebugLog "ERROR" "base_url edit skipped: $AppName never reached Stopped"
+            exit 1
+        }
         Write-DebugLog "INFO" "DuckDNS mode: setting base_url=/$AppLower in $ConfigFile"
         $placed = @(Set-YamlKey -Path $ConfigFile -Section "general" -Key "base_url" -Value "/$AppLower") -contains $true
         if ($placed) {
