@@ -188,6 +188,8 @@ CrowdSec splits into two independent components, and **both are required** — t
 ### Sonarr → Jellyfin Auto-Repair Hook
 - `scripts/sonarr_jellyfin_refresh.py` is a Sonarr Custom Script connection that fires on `OnDownload` events.
 - Detects the broken-season-hierarchy bug (Jellyfin scans before TVDB metadata is ready, leaving `Shows/Seasons` returning 0 and the web player crashing) and fixes it by triggering a targeted `Items/{id}/Refresh`.
+- **Runs detached**: Sonarr executes a Custom Script synchronously and waits for its exit code, so the invoked process re-launches itself with `DETACHED_PROCESS` and exits immediately; the child owns the 45 s settle delay. Sleeping inline stalled the import pipeline at exactly 45 s per episode (a 9-season pack sat in the queue as `importPending` for hours).
+- **Discovers new series**: when the series is not in Jellyfin at all, it triggers `POST /Library/Refresh`. The installer's first scan runs while the media folder is still empty, so Jellyfin logs `inaccessible or empty, skipping`; Sonarr's `Library/Media/Updated` only refreshes paths Jellyfin already knows, so without this the TV library stayed at 0 series even with files on disk.
 - Configured in Sonarr `Settings → Connect → Custom Script` pointing at this file.
 
 ### Hardware-Accelerated Transcoding (Jellyfin)
