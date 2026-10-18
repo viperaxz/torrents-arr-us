@@ -491,7 +491,9 @@ if (-not (Test-Path $DashTemplatePath)) {
         $cards += "      <div class=`"app-name`">$($a.Name)</div>"
         $cards += "    </a>"
     }
-    if ($LlmEnabled -and $DomainMode -eq "cloudflare") {
+    if ($LlmEnabled -and $DomainMode -eq "cloudflare" -and $LlmExposeUi) {
+        # Only when the UI is published: with LLM.ExposeUi=false the site answers
+        # nothing but /v1/*, so a card would only land on the 404 catch-all.
         $llmUrl = "https://$($LlmSubdomain.ToLower()).$cfgDomain"
         $cards += "    <a href=`"$llmUrl`" class=`"card`" target=`"_blank`">"
         $cards += "      <div class=`"badge`" style=`"background:#00d26a33;color:#00d26a`">LLM</div>"
