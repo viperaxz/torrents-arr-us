@@ -287,8 +287,11 @@ if ($DomainMode -eq "cloudflare") {
         Write-DebugLog "VAR Cloudflare token file=$TokenFile"
 
         # Build subdomain list from enabled apps (Flaresolverr is internal-only)
+        # Grafana belongs here even though 14_grafana.ps1 also appends it: that script
+        # exits early once its lock file exists, so this regenerated updater is the only
+        # thing that keeps the grafana record fresh on every later install run.
         $cfSubdomains = @('""')
-        foreach ($k in @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr")) {
+        foreach ($k in @("Jellyfin","Sonarr","Radarr","Prowlarr","Deluge","Bazarr","Jellyseerr","Grafana")) {
             if ($Config.Apps.$k -eq $true) { $cfSubdomains += "`"$($k.ToLower())`"" }
         }
         if ($LlmEnabled) { $cfSubdomains += "`"$($LlmSubdomain.ToLower())`"" }
@@ -382,7 +385,7 @@ try {
     `$raw = (Invoke-WebRequest -Uri `$url -UseBasicParsing).Content
     `$res = if (`$raw -is [byte[]]) { [Text.Encoding]::UTF8.GetString(`$raw).Trim() } else { ([string]`$raw).Trim() }
     if (`$res -eq "OK") { Write-Output "DuckDNS updated: `$domain -> `$ip" }
-    else { Write-Error "DuckDNS returned: `$res" }
+    else { Write-Error "DuckDNS returned: `$res"; exit 1 }
 } catch { Write-Error "DuckDNS update failed: `$_"; exit 1 }
 "@
         Set-Content -Path $UpdaterPath -Value $UpdaterContent -Encoding UTF8
