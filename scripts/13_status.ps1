@@ -23,6 +23,17 @@ Write-DebugLog "INFO" "=== Registering Status Collector ==="
 $collectScript = Join-Path $PSScriptRoot "collect_status.ps1"
 Write-DebugLog "VAR collectScript=$collectScript"
 
+# Registering a task that points at a missing script would report success now and
+# freeze the dashboard on whatever JSON was written last, so fail before the task
+# exists.  exit 1 (not just a warning) so master_install records the failure and
+# a later run retries -- the lock file is never written on this path either.
+if (-not (Test-Path $collectScript)) {
+    Write-Host "  -> ERROR: collect_status.ps1 not found next to 13_status.ps1 ($collectScript)." -ForegroundColor Red
+    Write-Host "     Status collector NOT scheduled; the dashboard would never update." -ForegroundColor Yellow
+    Write-DebugLog "ERROR" "collect_status.ps1 missing at $collectScript -- task not registered"
+    exit 1
+}
+
 $taskName = "Seedbox_Status_Collector"
 $action   = New-ScheduledTaskAction -Execute "powershell.exe" `
               -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$collectScript`""
@@ -60,17 +71,26 @@ try {
     if ($taskOk) { Write-Host "  -> Using the existing '$taskName' task." -ForegroundColor DarkGray }
 }
 
-# Run immediately so the dashboard has data on first load
+# Run immediately so the dashboard has data on first load.  A stale file from a
+# previous install must not be reported as a fresh write, so the result is checked
+# against the moment the child process started (and against its exit code).
+$outPath        = Join-Path $InstallDir "dashboard\current_status.json"
+$collectStarted = Get-Date
 Write-Host "  -> Running initial status collection..." -ForegroundColor DarkGray
 try {
+    $global:LASTEXITCODE = 0
     & powershell.exe -ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden `
         -File $collectScript
-    $outPath = Join-Path $InstallDir "dashboard\current_status.json"
-    if (Test-Path $outPath) {
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        Write-DebugLog "WARN" "collect_status.ps1 exited with code $LASTEXITCODE"
+        Write-Host "  -> Warning: status collection exited with code $LASTEXITCODE." -ForegroundColor Yellow
+    }
+    if ((Test-Path $outPath) -and ((Get-Item $outPath -ErrorAction SilentlyContinue).LastWriteTime -ge $collectStarted)) {
         Write-Host "  -> current_status.json written." -ForegroundColor Green
         Write-DebugLog "INFO" "Initial status collection complete: $outPath"
     } else {
-        Write-DebugLog "WARN" "collect_status.ps1 ran but output file not found: $outPath"
+        Write-Host "  -> Warning: current_status.json was not refreshed (the scheduled task retries in 5 minutes)." -ForegroundColor Yellow
+        Write-DebugLog "WARN" "collect_status.ps1 did not refresh $outPath"
     }
 } catch {
     Write-DebugLog "WARN" "Initial status collection failed: $_"
