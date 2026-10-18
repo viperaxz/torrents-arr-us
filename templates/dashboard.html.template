@@ -122,6 +122,19 @@ footer{text-align:center;padding:2.5rem 1rem 1.5rem;color:var(--muted);font-size
 
 <script>
 var _lastData = null;
+var _lastTests = null;
+
+// Every value below is interpolated into innerHTML, and the one attacker-reachable
+// string the collector publishes is a Deluge torrent name (a release name from a
+// public indexer can contain quotes and angle brackets). Escape before injecting.
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function fmt(n, decimals) {
   if (n == null) return '--';
@@ -129,8 +142,11 @@ function fmt(n, decimals) {
 }
 
 function timeSince(isoStr) {
+  if (!isoStr) return 'unknown';
   var d = new Date(isoStr);
+  if (isNaN(d.getTime())) return 'unknown';
   var sec = Math.round((Date.now() - d.getTime()) / 1000);
+  if (sec < 0) sec = 0;
   if (sec < 5) return 'just now';
   if (sec < 60) return sec + 's ago';
   var min = Math.round(sec / 60);
@@ -145,7 +161,7 @@ function barClass(pct) {
 }
 
 function svcDot(s) {
-  if (s.state === 'Running') return s.api_ok === false ? 'dot-yellow' : 'dot-green';
+  if (s.state === 'Running') return (s.api_ok === false || s.port_open === false) ? 'dot-yellow' : 'dot-green';
   if (s.state === 'Stopped') return 'dot-red';
   return 'dot-yellow';
 }
@@ -153,20 +169,30 @@ function svcDot(s) {
 function svcTitle(s) {
   var parts = [s.name];
   if (s.state && s.state !== 'Running') parts.push('service ' + s.state.toLowerCase());
+  if (s.port_open === false) parts.push('port closed');
+  if (s.drive) parts.push(s.drive + (s.drive_mounted === false ? ' not mounted' : ' mounted'));
   if (s.api_ok === false) parts.push('API unreachable');
-  else if (s.api_ok === true) parts.push('API OK' + (s.api_latency_ms ? ' (' + s.api_latency_ms + ' ms)' : '') + (s.consecutive_ok ? ', ' + s.consecutive_ok + ' consecutive checks' : ''));
+  else if (s.api_ok === true) parts.push('API OK' + (s.api_latency_ms ? ' (' + s.api_latency_ms + ' ms)' : ''));
   else parts.push('API status unknown');
-  return parts.join(': ');
+  if (s.consecutive_ok != null) parts.push(s.consecutive_ok + ' consecutive OK');
+  if (s.queue_count != null) parts.push(s.queue_count + ' queued');
+  if (s.wanted_count != null) parts.push(s.wanted_count + ' missing');
+  if (s.indexers_enabled != null) parts.push(s.indexers_enabled + ' indexers' + (s.indexers_failed ? ', ' + s.indexers_failed + ' failing' : ''));
+  if (s.wanted_episodes != null) parts.push(s.wanted_episodes + ' episodes without subtitles');
+  if (s.wanted_movies != null) parts.push(s.wanted_movies + ' movies without subtitles');
+  if (s.active_downloads != null) parts.push(s.active_downloads + ' downloading');
+  return parts.join(' \u00b7 ');
 }
 
-function renderStats(d) {
+function renderStats(d, tests) {
+  if (!d) return;
   var html = '<div class="stats-grid">';
 
   // Services
   html += '<div class="stat-card"><div class="stat-card-title">Services</div><div class="svc-list">';
   if (d.services && d.services.length) {
     d.services.forEach(function(s) {
-      html += '<span class="svc" title="' + svcTitle(s) + '"><span class="dot ' + svcDot(s) + '"></span>' + s.name + '</span>';
+      html += '<span class="svc" title="' + esc(svcTitle(s)) + '"><span class="dot ' + svcDot(s) + '"></span>' + esc(s.name) + '</span>';
     });
   } else {
     html += '<span class="stats-msg">No service data</span>';
@@ -309,15 +335,22 @@ function refreshStats() {
   var icon = document.getElementById('refresh-icon');
   icon.classList.add('spin');
   document.getElementById('btn-refresh').disabled = true;
-  fetch('./current_status.json?' + Date.now())
-    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    .then(function(data) {
-      _lastData = data;
-      renderStats(data);
+  // test_results.json only appears after the first scheduled suite run (and only
+  // when it could be written), so a missing/invalid file must never fail the panel.
+  var statusReq = fetch('./current_status.json?' + Date.now())
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+  var testsReq = fetch('./test_results.json?' + Date.now())
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .catch(function() { return null; });
+  Promise.all([statusReq, testsReq])
+    .then(function(res) {
+      _lastData = res[0];
+      if (res[1]) _lastTests = res[1];
+      renderStats(_lastData, _lastTests);
     })
     .catch(function() {
       if (_lastData) {
-        renderStats(_lastData);
+        renderStats(_lastData, _lastTests);
       } else {
         document.getElementById('stats-content').innerHTML = '<p class="stats-msg">Status data not yet available. The collector runs every 5 minutes.</p>';
       }
