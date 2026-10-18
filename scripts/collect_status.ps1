@@ -240,6 +240,9 @@ if ($prowlarrKey) {
 }
 
 # Deluge (shared data reused in downloads section below)
+# Skipped entirely when Apps.Deluge is disabled: the probe would otherwise add two
+# permanently-red rows to the status panel for an app the installer never installed.
+$delugeEnabled   = ($Config.Apps.Deluge -ne $false)
 $delugeAuthPath  = Join-Path $InstallDir 'secrets\deluge_auth.txt'
 $delugePassword  = $null
 $delugeLoggedIn  = $false
@@ -296,8 +299,11 @@ if ($delugePassword -and $delugeWebOpen) {
         download_speed_mbps = if ($dlStats) { [math]::Round([double]$dlStats.stats.download_rate / 1MB, 3) } else { $null }
         upload_speed_mbps   = if ($dlStats) { [math]::Round([double]$dlStats.stats.upload_rate / 1MB, 3) } else { $null }
     }))
-} else {
-    $svcs.Add((SvcEntry 'DelugeDaemon' 'Deluge Daemon' $false $false 0))
+} elseif ($delugeEnabled) {
+    # No stored Web UI password (or the Web UI port is closed): the daemon entry
+    # still has to report the daemon's own port, not a hardcoded $false, or a
+    # healthy daemon shows up as "port closed" and resets its consecutive_ok.
+    $svcs.Add((SvcEntry 'DelugeDaemon' 'Deluge Daemon' $delugePortOpen $false 0))
 }
 
 # Deluge Web UI (separate entry -- serves the browser interface)
@@ -308,18 +314,22 @@ if ($delugeWebOpen) {
         $delugeWebOk = ($webCheck.StatusCode -eq 200)
     } catch {}
 }
-$svcs.Add((SvcEntry 'DelugeWeb' 'Deluge Web UI' $delugeWebOpen $delugeWebOk 0))
+if ($delugeEnabled) {
+    $svcs.Add((SvcEntry 'DelugeWeb' 'Deluge Web UI' $delugeWebOpen $delugeWebOk 0))
+}
 
 # Bazarr
 if ($bazarrKey) {
     $bPort  = TcpOpen $bazarrPort
     $bBase  = UBase 'bazarr'
-    $bCheck = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/system/ping" @{'X-Api-Key'=$bazarrKey}
-    $bWantE = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/wanted/episode?rows=1" @{'X-Api-Key'=$bazarrKey}
-    $bWantM = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/wanted/movie?rows=1"   @{'X-Api-Key'=$bazarrKey}
+    $bCheck = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/system/ping" @{'X-Api-Key'=$bazarrKey} 5 -JsonOnly
+    # Bazarr exposes the wanted-subtitle counters on /api/badges (episodes/movies).
+    # /api/wanted/episode and /api/wanted/movie do not exist: Bazarr answers them
+    # with its SPA (200 + text/html), so the old probes returned null forever.
+    $bBadges = QuickGet "http://127.0.0.1:$bazarrPort${bBase}/api/badges" @{'X-Api-Key'=$bazarrKey} 5 -JsonOnly
     $svcs.Add((SvcEntry 'Bazarr' 'Bazarr' $bPort $bCheck.ok $bCheck.ms @{
-        wanted_episodes = if ($bWantE.ok -and $bWantE.data.total) { [int]$bWantE.data.total } else { $null }
-        wanted_movies   = if ($bWantM.ok -and $bWantM.data.total) { [int]$bWantM.data.total } else { $null }
+        wanted_episodes = if ($bBadges.ok -and $null -ne $bBadges.data.episodes) { [int]$bBadges.data.episodes } else { $null }
+        wanted_movies   = if ($bBadges.ok -and $null -ne $bBadges.data.movies)   { [int]$bBadges.data.movies }   else { $null }
     }))
 }
 
@@ -388,7 +398,10 @@ if ($Config.LLM -and $Config.LLM.PSObject.Properties["Enabled"] -and $Config.LLM
 
 # -- System --------------------------------------------------------------------
 $status = [ordered]@{
-    timestamp = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')
+    # UTC with an explicit Z: the dashboard runs timeSince() in the browser, and a
+    # bare "yyyy-MM-ddTHH:mm:ss" is parsed as the *browser's* local time, so a phone
+    # in another timezone showed a wrong (sometimes negative) "updated X ago".
+    timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     system    = [ordered]@{}
     drives    = @()
     services  = $svcs.ToArray()
@@ -440,8 +453,13 @@ try {
     $jfKey      = $null
     $jfSettings = 'C:\ProgramData\Jellyseerr\settings.json'
     if (Test-Path $jfSettings) {
-        $js = Get-Content $jfSettings -Raw -ErrorAction Stop | ConvertFrom-Json
-        if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = ([string]$js.jellyfin.apiKey).Trim() }
+        # Jellyseerr rewrites settings.json at runtime, so a half-written file must
+        # not abort the whole block -- the secrets\jellyfin_api_key.txt fallback
+        # below is still usable.
+        try {
+            $js = Get-Content $jfSettings -Raw -ErrorAction Stop | ConvertFrom-Json
+            if ($js.jellyfin -and $js.jellyfin.apiKey) { $jfKey = ([string]$js.jellyfin.apiKey).Trim() }
+        } catch {}
     }
     if (-not $jfKey) {
         $jfKeyFile = Join-Path $InstallDir 'secrets\jellyfin_api_key.txt'
@@ -521,7 +539,7 @@ if ($dlStats) {
 } elseif ($delugePassword -and $delugeLoggedIn) {
     $status.downloads = [ordered]@{ active = $null; error = 'Deluge session failed' }
 } else {
-    $status.downloads = [ordered]@{ active = $null; error = 'Deluge unavailable' }
+    $status.downloads = [ordered]@{ active = $null; error = $(if ($delugeEnabled) { 'Deluge unavailable' } else { 'Deluge disabled in config' }) }
 }
 
 # -- Security ------------------------------------------------------------------
