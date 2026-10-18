@@ -460,14 +460,35 @@ statics:
         Write-DebugLog "WARN" "Could not enumerate local IPs for whitelist: $_"
     }
 
+    # Security.ExtraWhitelistIps is user-supplied and is written verbatim into the
+    # parser file below.  CrowdSec will not load a parser containing a malformed
+    # address, and the whole anti-lockout guarantee lives in that one file (a broken
+    # parser also stops the engine from starting), so invalid entries are dropped
+    # with a warning instead of being written.
+    $wlRejected = 0
     foreach ($extra in $ExtraWhitelist) {
-        $e = [string]$extra
+        $e = ([string]$extra).Trim()
         if (-not $e) { continue }
+        $parsedAddr = $null
         if ($e -match '/') {
-            if (-not $wlCidrs.Contains($e)) { $wlCidrs.Add($e) }
-        } elseif (-not $wlIps.Contains($e)) {
-            $wlIps.Add($e)
+            $parts  = $e -split '/', 2
+            $prefix = 0
+            $addrOk = [System.Net.IPAddress]::TryParse($parts[0], [ref]$parsedAddr)
+            $maxPrefix = if ($addrOk -and $parsedAddr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { 128 } else { 32 }
+            if ($addrOk -and [int]::TryParse($parts[1], [ref]$prefix) -and $prefix -ge 0 -and $prefix -le $maxPrefix) {
+                if (-not $wlCidrs.Contains($e)) { $wlCidrs.Add($e) }
+            } else {
+                $wlRejected++
+            }
+        } elseif ([System.Net.IPAddress]::TryParse($e, [ref]$parsedAddr)) {
+            if (-not $wlIps.Contains($e)) { $wlIps.Add($e) }
+        } else {
+            $wlRejected++
         }
+    }
+    if ($wlRejected -gt 0) {
+        Write-Warning "     Security.ExtraWhitelistIps: $wlRejected invalid entr(y/ies) ignored (not written to the whitelist parser)."
+        Write-DebugLog "WARN" "ExtraWhitelistIps: $wlRejected invalid entries ignored"
     }
 
     $wlIpYaml   = ($wlIps | ForEach-Object {
