@@ -225,6 +225,13 @@ def main():
     )
     items = body.get("Items", []) if ok and isinstance(body, dict) else []
     if not items:
+        # The series is not in Jellyfin at all. That is the normal state after an
+        # install: the library scan ran while the media folder was still empty, so
+        # Jellyfin logged "inaccessible or empty, skipping", and every later
+        # Library/Media/Updated from Sonarr only refreshes paths it already
+        # knows -- so nothing ever appears and the whole library stays empty.
+        # A full scan is the only thing that discovers the new folder.
+        _post(f"{base_url}/Library/Refresh", headers=auth_hdr, timeout=15)
         sys.exit(0)
     series_id = items[0].get("Id", "")
     if not series_id:
