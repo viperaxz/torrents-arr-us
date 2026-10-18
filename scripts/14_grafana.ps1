@@ -317,7 +317,9 @@ $lokiYaml = @"
 auth_enabled: false
 
 server:
+  http_listen_address: 127.0.0.1
   http_listen_port: $LokiPort
+  grpc_listen_address: 127.0.0.1
   grpc_listen_port: 9096
   log_level: warn
 
@@ -1020,10 +1022,10 @@ $LokiLog  = Join-Path $LokiDir "loki.log"
 $AlloyLog = Join-Path $AlloyDir "alloy.log"
 
 # Loki readiness.
-# loki-config.yml sets server.http_listen_port ($LokiPort) but no
-# server.http_listen_address, so Loki binds all interfaces and is reachable on
-# 127.0.0.1:$LokiPort. Loki answers GET /ready with 200 once ready and 503 while
-# it is still starting.
+# loki-config.yml binds Loki (HTTP $LokiPort and gRPC 9096) to 127.0.0.1 -- it has
+# no authentication, and both Alloy and the Grafana data source reach it over
+# loopback -- so probe the loopback address. Loki answers GET /ready with 200 once
+# ready and 503 while it is still starting.
 if (Get-Service "Loki" -ErrorAction SilentlyContinue) {
     Start-Sleep -Seconds 5
     $lokiState = (Get-Service "Loki" -ErrorAction SilentlyContinue).Status
@@ -1201,9 +1203,32 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe) {
         # BOM-free -- parsed by Caddy (Go), see 01_webserver.ps1.
         [System.IO.File]::WriteAllText($CaddyfilePath, $caddyContent, (New-Object System.Text.UTF8Encoding($false)))
         try { & $caddyExe fmt --overwrite $CaddyfilePath 2>&1 | Out-Null } catch {}
-        try { & $caddyExe reload --config $CaddyfilePath 2>&1 | Out-Null } catch {}
-        Write-Host "  -> Caddyfile updated and reloaded." -ForegroundColor Green
-        Write-DebugLog "INFO" "Caddy reloaded with Grafana route"
+        # A rejected reload leaves the running Caddy on its previous config, so the
+        # route is on disk but not live. Report that instead of claiming success.
+        # Caddy writes JSON logs to stderr on success too, so relax EAP for the call
+        # (same pattern as the tar extraction above) and judge by exit code.
+        $reloadOk   = $false
+        $reloadNote = ""
+        $savedEap   = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = "Continue"
+            $reloadOut = & $caddyExe reload --config $CaddyfilePath 2>&1 | Out-String
+            $reloadOk  = ($LASTEXITCODE -eq 0)
+            if (-not $reloadOk) {
+                $reloadNote = "exit {0}: {1}" -f $LASTEXITCODE, $reloadOut.Trim()
+            }
+        } catch {
+            $reloadNote = $_.Exception.Message
+        } finally {
+            $ErrorActionPreference = $savedEap
+        }
+        if ($reloadOk) {
+            Write-Host "  -> Caddyfile updated and reloaded." -ForegroundColor Green
+            Write-DebugLog "INFO" "Caddy reloaded with Grafana route"
+        } else {
+            Write-Warning "  -> Caddyfile has the Grafana route but Caddy refused to reload it: $reloadNote"
+            Write-DebugLog "WARN" "Caddy reload failed after the Grafana patch: $reloadNote"
+        }
     } else {
         Write-DebugLog "INFO" "Grafana route already present in Caddyfile - skipping"
     }
@@ -1231,10 +1256,20 @@ if ($DomainMode -eq "cloudflare") {
             Write-Host "  -> Running immediate DNS update for grafana..." -ForegroundColor DarkGray
             try {
                 $prevEap = $ErrorActionPreference
-                $ErrorActionPreference = "Continue"
-                & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterPath 2>&1 | Out-Null
-                $ErrorActionPreference = $prevEap
-                Write-DebugLog "INFO" "Immediate DNS update for grafana triggered"
+                try {
+                    $ErrorActionPreference = "Continue"
+                    $dnsOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterPath 2>&1 | Out-String
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+                # Without the A record the new subdomain resolves nowhere; the
+                # scheduled updater retries, but say so instead of reporting success.
+                if ($LASTEXITCODE -eq 0) {
+                    Write-DebugLog "INFO" "Immediate DNS update for grafana succeeded"
+                } else {
+                    Write-Warning "  -> Immediate DNS update failed (exit $LASTEXITCODE). The scheduled updater will retry."
+                    Write-DebugLog "WARN" "Immediate DNS update for grafana failed (exit=$LASTEXITCODE): $($dnsOut.Trim())"
+                }
             } catch {
                 Write-DebugLog "WARN" "Immediate DNS update for grafana failed (will retry on schedule): $_"
             }
