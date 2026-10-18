@@ -155,8 +155,25 @@ def _load_legacy_cfg():
         return None
 
 
+def _invocation():
+    """(event, item_type, title) for whichever app invoked the hook.
+
+    The same script is deployed by both Layer 2 scripts: Sonarr sets
+    sonarr_eventtype / sonarr_series_title, Radarr sets radarr_eventtype /
+    radarr_movie_title, and each app only ever sets its own pair.
+    """
+    event = os.environ.get("sonarr_eventtype") or os.environ.get("radarr_eventtype") or ""
+    series = os.environ.get("sonarr_series_title", "").strip()
+    movie  = os.environ.get("radarr_movie_title", "").strip()
+    if series:
+        return event, "Series", series
+    if movie:
+        return event, "Movie", movie
+    return event, None, ""
+
+
 def main():
-    event = os.environ.get("sonarr_eventtype", "")
+    event, item_type, item_title = _invocation()
     if event == "Test":
         # Report whether the hook can actually do its job: "test OK" alone hid a
         # hook that was missing settings (and, before, missing requests) for weeks.
@@ -172,11 +189,7 @@ def main():
             print("sonarr_jellyfin_refresh.py: test OK, but NO settings found -- "
                   "downloads will be ignored")
         sys.exit(0)
-    if event != "Download":
-        sys.exit(0)
-
-    series_title = os.environ.get("sonarr_series_title", "").strip()
-    if not series_title:
+    if event != "Download" or not item_type:
         sys.exit(0)
 
     sidecar = _load_sidecar()
@@ -215,24 +228,29 @@ def main():
             sys.exit(0)
         auth_hdr = {"Authorization": f'{_EMBY_HEADER}, Token="{token}"'}
 
-    # Find the series in Jellyfin by title
+    # Find the series/movie in Jellyfin by title
     ok, body = _get(
         f"{base_url}/Users/{user_id}/Items",
         headers=auth_hdr,
-        params={"searchTerm": series_title, "Recursive": "true",
-                "IncludeItemTypes": "Series", "Limit": 5, "Fields": "Id"},
+        params={"searchTerm": item_title, "Recursive": "true",
+                "IncludeItemTypes": item_type, "Limit": 5, "Fields": "Id"},
         timeout=10,
     )
     items = body.get("Items", []) if ok and isinstance(body, dict) else []
     if not items:
-        # The series is not in Jellyfin at all. That is the normal state after an
+        # The item is not in Jellyfin at all. That is the normal state after an
         # install: the library scan ran while the media folder was still empty, so
         # Jellyfin logged "inaccessible or empty, skipping", and every later
-        # Library/Media/Updated from Sonarr only refreshes paths it already
+        # Library/Media/Updated from the *arr apps only refreshes paths it already
         # knows -- so nothing ever appears and the whole library stays empty.
         # A full scan is the only thing that discovers the new folder.
+        # Radarr has no season hierarchy to repair, so this is its whole job.
         _post(f"{base_url}/Library/Refresh", headers=auth_hdr, timeout=15)
         sys.exit(0)
+
+    if item_type == "Movie":
+        sys.exit(0)  # present already: nothing to repair
+
     series_id = items[0].get("Id", "")
     if not series_id:
         sys.exit(0)
