@@ -44,4 +44,12 @@ Write-Host "Installing Grafana + Loki + Alloy..." -ForegroundColor Cyan
 Write-Host ""
 
 & (Join-Path $PSScriptRoot "scripts\14_grafana.ps1") -Config $Config
+# 14_grafana.ps1 exits 1 when Grafana never reached Running and deliberately leaves
+# the lock file unwritten so the install can be retried. Propagate that instead of
+# reporting success to the operator.
+$grafanaExit = $LASTEXITCODE
+if ($grafanaExit -ne 0) {
+    Write-Warning "Grafana install failed (exit $grafanaExit). Re-run this script to retry."
+    exit $grafanaExit
+}
 exit 0

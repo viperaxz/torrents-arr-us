@@ -23,17 +23,36 @@ if (-not (Test-Path $LockFile)) {
     exit 0
 }
 
+# Bounded service control: nssm services wedge in Stop/Start Pending and the
+# built-in cmdlets wait indefinitely. See scripts\service_helpers.ps1.
+$serviceHelpers = Join-Path $PSScriptRoot "scripts\service_helpers.ps1"
+if ((Test-Path $serviceHelpers) -and -not (Get-Command Stop-ServiceBounded -ErrorAction SilentlyContinue)) {
+    . $serviceHelpers
+}
+
 Write-Host ""
 Write-Host "Disabling Grafana + Loki + Alloy..." -ForegroundColor Cyan
 Write-Host ""
 
 # -- 1. Stop and remove NSSM services -----------------------------------------
+# Stop all three in one bounded wait (an NSSM service can sit in Stop Pending for
+# minutes and Stop-Service never returns), then remove them.
+$grafanaServices = @(@("Grafana", "Loki", "Alloy") | Where-Object { Get-Service $_ -ErrorAction SilentlyContinue })
+if ($grafanaServices.Count -gt 0) {
+    Write-Host "  -> stopping $($grafanaServices -join ', ')..." -ForegroundColor Yellow
+    if (Get-Command Stop-ServicesBounded -ErrorAction SilentlyContinue) {
+        $null = Stop-ServicesBounded -Names $grafanaServices -TimeoutSeconds 60
+    } else {
+        foreach ($svcName in $grafanaServices) { Stop-Service $svcName -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+    }
+}
 foreach ($svcName in @("Grafana", "Loki", "Alloy")) {
     $svc = Get-Service $svcName -ErrorAction SilentlyContinue
     if ($svc) {
-        Write-Host "  -> $svcName : stopping..." -ForegroundColor Yellow
-        Stop-Service $svcName -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 2
+        if ($svc.Status -ne "Stopped") {
+            Write-Warning "  -> $svcName : still $($svc.Status) after the bounded stop; removing it anyway."
+        }
         & nssm remove $svcName confirm 2>$null | Out-Null
         # Confirm the removal: the app directories are deleted below, so a
         # service left behind would only fail on the next boot.
@@ -83,6 +102,8 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe -and $Config) {
         $caddyContent = ($out -join "`r`n")
         if ($caddyContent.Length -ne $before) {
             Write-Host "  -> Grafana subdomain block removed from Caddyfile." -ForegroundColor Yellow
+        } else {
+            Write-Warning "  -> No '# Grafana' block found in the Caddyfile. If grafana.$Domain still has a server block, remove it manually."
         }
     } else {
         $before = $caddyContent.Length
@@ -94,6 +115,8 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe -and $Config) {
         )
         if ($caddyContent.Length -ne $before) {
             Write-Host "  -> Grafana handle removed from Caddyfile." -ForegroundColor Yellow
+        } else {
+            Write-Warning "  -> No 'handle /grafana*' block found in the Caddyfile. If it is still there, remove it manually."
         }
     }
 
@@ -106,7 +129,11 @@ if ((Test-Path $CaddyfilePath) -and $caddyExe -and $Config) {
     try { & $caddyExe reload --config $CaddyfilePath 2>&1 | Out-Null } catch {}
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "  -> Caddy reload failed (exit $LASTEXITCODE). Restarting Caddy service instead..."
-        Restart-Service -Name "Caddy" -Force -ErrorAction SilentlyContinue
+        if (Get-Command Restart-ServiceBounded -ErrorAction SilentlyContinue) {
+            $null = Restart-ServiceBounded -Name "Caddy"
+        } else {
+            Restart-Service -Name "Caddy" -Force -ErrorAction SilentlyContinue
+        }
         $caddySvc = Get-Service -Name "Caddy" -ErrorAction SilentlyContinue
         if ($caddySvc -and $caddySvc.Status -eq "Running") {
             Write-Host "  -> Caddy restarted successfully." -ForegroundColor Yellow
