@@ -111,12 +111,55 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
 
     # Operator-IP auto-refresh -- keeps the WAN IP entry current on dynamic IPs
     # (DuckDNS lines rotate), so a stale whitelist can never lock the operator out.
+    # Present-but-Disabled is not armed: the task shows up in every query and never
+    # runs, which is exactly how the missing tasks went unnoticed for a whole cycle.
     $wlTask = Get-ScheduledTask -TaskName 'Seedbox_CrowdSecWhitelistRefresh' -ErrorAction SilentlyContinue
+    $wlArmed = [bool]($wlTask -and ($wlTask.State -in @('Ready', 'Running')))
     $Script:Results.Add((New-TestResult $svc 2 'WhitelistRefreshTask' `
-        $(if ($wlTask) { 'PASS' } else { 'WARN' }) 'Scheduled task keeps the operator WAN IP whitelisted'))
+        $(if ($wlArmed) { 'PASS' } else { 'WARN' }) `
+        "Scheduled task keeps the operator WAN IP whitelisted (state: $(if ($wlTask) { $wlTask.State } else { 'not registered' }))"))
     $wlContent = if (Test-Path $wlPath) { Get-Content $wlPath -Raw -ErrorAction SilentlyContinue } else { '' }
     $Script:Results.Add((New-TestResult $svc 2 'WhitelistOperatorMarker' `
         $(if ($wlContent -match 'seedbox-operator-wan-ip') { 'PASS' } else { 'WARN' }) 'Operator WAN IP entry marked for auto-refresh'))
+
+    # Event-log export task: without it security-4625.xml never grows and the windows
+    # collection sees nothing, while acquis.yaml still looks perfectly configured.
+    $evtTask = Get-ScheduledTask -TaskName 'Seedbox_SecurityEventExport' -ErrorAction SilentlyContinue
+    $evtArmed = [bool]($evtTask -and ($evtTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'EventExportTask' `
+        $(if ($evtArmed) { 'PASS' } else { 'WARN' }) `
+        "4625 export task registered (state: $(if ($evtTask) { $evtTask.State } else { 'not registered' }))"))
+
+    # 6-hourly blocklist refresh. A missing task is WARN, not FAIL: the blocklists
+    # may be deliberately disabled via Security.AbuseBlocklists.
+    $blTask = Get-ScheduledTask -TaskName 'Seedbox_Blocklist_Update' -ErrorAction SilentlyContinue
+    $blArmed = [bool]($blTask -and ($blTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'BlocklistTask' `
+        $(if ($blArmed) { 'PASS' } else { 'WARN' }) `
+        "Blocklist refresh task registered (state: $(if ($blTask) { $blTask.State } else { 'not registered' }))"))
+
+    # Every task helper must live in the install tree. A task pointing back at the
+    # source clone keeps working until that clone is moved or deleted, and then
+    # fails forever with nothing left in the install tree to run by hand.
+    # Seedbox_CaddyLogRelay is included because a dead relay silently stops all
+    # HTTP attack detection: acquis.yaml stays valid, the engine looks healthy.
+    $relayTask = Get-ScheduledTask -TaskName 'Seedbox_CaddyLogRelay' -ErrorAction SilentlyContinue
+    $relayArmed = [bool]($relayTask -and ($relayTask.State -in @('Ready', 'Running')))
+    $Script:Results.Add((New-TestResult $svc 2 'CaddyLogRelayTask' `
+        $(if ($relayArmed) { 'PASS' } else { 'FAIL' }) `
+        "Caddy log relay task armed (state: $(if ($relayTask) { $relayTask.State } else { 'not registered' }))"))
+
+    $taskScripts = @()
+    foreach ($t in @($evtTask, $wlTask, $blTask, $relayTask)) {
+        if (-not $t) { continue }
+        $taskArgs = ($t.Actions | ForEach-Object { $_.Arguments }) -join ' '
+        $m = [regex]::Match($taskArgs, '-File\s+"?([^"]+\.ps1)"?')
+        if ($m.Success) { $taskScripts += [pscustomobject]@{ Task = $t.TaskName; Path = $m.Groups[1].Value } }
+    }
+    $missingScripts = @($taskScripts | Where-Object { -not (Test-Path -LiteralPath $_.Path) })
+    $Script:Results.Add((New-TestResult $svc 2 'TaskScriptsPresent' `
+        $(if ($missingScripts.Count -gt 0) { 'FAIL' } elseif ($taskScripts.Count -gt 0) { 'PASS' } else { 'SKIP' }) `
+        $(if ($missingScripts.Count -gt 0) { "Missing: $($missingScripts.Path -join '; ')" } else { "$($taskScripts.Count) scheduled-task script(s) present on disk" })))
 
     # Bouncer must be registered against the local LAPI with a real key.
     $bouncerPath = if (Test-Path $BouncerYaml) { $BouncerYaml } elseif (Test-Path $BouncerYamlLegacy) { $BouncerYamlLegacy } else { $null }
