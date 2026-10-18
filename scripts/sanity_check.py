@@ -124,19 +124,20 @@ def load_config(sanity_cfg_path: str) -> Dict[str, Any]:
             paths.get("Downloads"), paths.get("Movies"), paths.get("TV")
         ) if v]
 
-    if cfg["domain_mode"] == "duckdns":
-        cfg["url_bases"].update({
-            "Radarr": "/radarr", "Sonarr": "/sonarr", "Prowlarr": "/prowlarr",
-            "Jellyfin": "/jellyfin", "Bazarr": "/bazarr",
-        })
-
     # Environment variable overrides (highest priority)
     for env, key in [("ADMIN_USER","admin_user"), ("ADMIN_PASS","admin_pass"),
                      ("SANITY_MOVIE","sanity_movie"), ("SANITY_SERIES","sanity_series"),
                      ("DOMAIN_MODE","domain_mode"), ("INSTALL_DIR","install_dir")]:
         if os.environ.get(env):
             cfg[key] = os.environ[env]
-    if os.environ.get("DOMAIN_MODE") == "duckdns":
+
+    # URL prefixes follow the FINAL domain mode, so both the config value and a
+    # DOMAIN_MODE override are honoured — including an override that switches back
+    # to cloudflare, which used to keep the /sonarr-style prefixes from config.json.
+    # DuckDNS path mode puts every app behind a prefix in its own config; Cloudflare
+    # serves each app at its own host, so no prefix is used.
+    cfg["url_bases"] = {k: "" for k in cfg["url_bases"]}
+    if str(cfg["domain_mode"]).strip().lower() == "duckdns":
         cfg["url_bases"].update({
             "Radarr": "/radarr", "Sonarr": "/sonarr", "Prowlarr": "/prowlarr",
             "Jellyfin": "/jellyfin", "Bazarr": "/bazarr",

@@ -79,13 +79,23 @@ function global:Initialize-DebugLog {
     try {
         $allLines = Get-Content -Path $global:SeedboxDebugLogFile -Encoding UTF8 -ErrorAction SilentlyContinue
         if ($allLines -and $allLines.Count -gt 0) {
-            $firstOurLine = $allLines | Select-String -Pattern '\*\*\* Seedbox debug logging started \*\*\*' -SimpleMatch | Select-Object -First 1
-            if ($firstOurLine -and $firstOurLine.LineNumber -gt 1) {
-                $cleanLines = $allLines[($firstOurLine.LineNumber - 1)..($allLines.Count - 1)]
+            # Regex, not -SimpleMatch: the marker contains '*' characters, and with
+            # -SimpleMatch the escaped pattern was compared literally (backslashes
+            # included), so this cleanup never matched and a same-second collision
+            # kept the previous session's lines in front of the new ones.
+            #
+            # The LAST match is ours -- the first one belongs to the earlier session
+            # appended above -- and the line before it is the separator that opens
+            # the block, so keep from there.
+            $markers = @($allLines | Select-String -Pattern '\*\*\* Seedbox debug logging started \*\*\*')
+            if ($markers.Count -gt 1) {
+                $markerIdx  = $markers[$markers.Count - 1].LineNumber - 1
+                $startIdx   = if ($markerIdx -gt 0) { $markerIdx - 1 } else { 0 }
+                $cleanLines = $allLines[$startIdx..($allLines.Count - 1)]
                 [System.IO.File]::WriteAllText($global:SeedboxDebugLogFile,
                     ($cleanLines -join "`r`n") + "`r`n",
                     [System.Text.Encoding]::UTF8)
-                Write-DebugLog "INFO" "[debug_logger] Cleared $($firstOurLine.LineNumber - 1) stale line(s) from previous session"
+                Write-DebugLog "INFO" "[debug_logger] Cleared $startIdx stale line(s) from previous session(s)"
             }
         }
     } catch {
