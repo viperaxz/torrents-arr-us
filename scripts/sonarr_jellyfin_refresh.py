@@ -8,16 +8,18 @@ is still downloading at that point. The season ends up detached from the
 series in Jellyfin's database — Shows/Seasons returns 0 and the web player
 crashes. A targeted Items/{id}/Refresh after the scan finishes resolves it.
 
-Sonarr calls this script as a Custom Script connect on the OnDownload event and
-RUNS IT SYNCHRONOUSLY: it waits for the exit code and does not import the next
-episode until it returns. The first process therefore re-launches this script as
-a detached child and exits at once; the child waits, then refreshes. Sleeping in
-the invoked process stalled every import for _WAIT_SECONDS (measured: exactly
-45 s between consecutive episodes of a season pack).
+Both Sonarr and Radarr call this script as a Custom Script connect on the
+OnDownload event (Sonarr deployed as sonarr_jellyfin_refresh.py, Radarr as
+radarr_jellyfin_refresh.py) and RUN IT SYNCHRONOUSLY: they wait for the exit
+code and do not import the next episode/movie until it returns. The first
+process therefore re-launches this script as a detached child and exits at
+once; the child waits, then refreshes. Sleeping in the invoked process stalled
+every import for _WAIT_SECONDS (measured: exactly 45 s between consecutive
+episodes of a season pack).
 
-Environment variables supplied by Sonarr:
-  sonarr_series_title   — series name used to find it in Jellyfin
-  sonarr_eventtype      — "Download", "Test", etc.
+Environment variables supplied by the caller:
+  sonarr_series_title / radarr_movie_title   — item name used to find it in Jellyfin
+  sonarr_eventtype / radarr_eventtype        — "Download", "Test", etc.
 
 Settings come from secrets/jellyfin_hook.json, written next to this script by
 scripts/configure_layer2_sonarr.ps1 (base URL, Jellyfin API key, admin user id).
@@ -46,6 +48,12 @@ _WAIT_SECONDS = 45   # let Jellyfin finish its initial scan before refreshing
 _EMBY_HEADER  = ('MediaBrowser Client="sonarr-hook", Device="Python", '
                  'DeviceId="sonarr-jellyfin-hook", Version="1.0.0"')
 _DETACH_ENV   = "SEEDBOX_JELLYFIN_HOOK_DETACHED"
+
+# A scan request cancels whatever scan is already running, so a season pack or a
+# batch of movies must not fire one per imported file. Both hooks deploy into
+# InstallDir and therefore share this stamp, whichever app wrote it.
+_REFRESH_COOLDOWN_SECONDS = 300
+_REFRESH_STAMP = os.path.join(_SCRIPT_DIR, ".jellyfin_refresh_last")
 
 # -- HTTP ---------------------------------------------------------------------
 # urllib, not requests: the wrapper Sonarr executes is built from the system
@@ -155,6 +163,28 @@ def _load_legacy_cfg():
         return None
 
 
+def _request_library_refresh(base_url, auth_hdr):
+    """Full scan, at most once per cooldown window.
+
+    Jellyfin cancels the scan it is already running when a new one is requested,
+    so without this every unknown item in a batch restarted the scan (observed:
+    an in-progress scan was cancelled on each import). Once the first scan
+    registers the folder, later items are found and stop asking.
+    """
+    try:
+        if (time.time() - os.path.getmtime(_REFRESH_STAMP)) < _REFRESH_COOLDOWN_SECONDS:
+            return False
+    except OSError:
+        pass
+    try:
+        with open(_REFRESH_STAMP, "w") as fh:
+            fh.write(str(int(time.time())))
+    except OSError:
+        pass
+    _post(f"{base_url}/Library/Refresh", headers=auth_hdr, timeout=15)
+    return True
+
+
 def _invocation():
     """(event, item_type, title) for whichever app invoked the hook.
 
@@ -245,7 +275,7 @@ def main():
         # knows -- so nothing ever appears and the whole library stays empty.
         # A full scan is the only thing that discovers the new folder.
         # Radarr has no season hierarchy to repair, so this is its whole job.
-        _post(f"{base_url}/Library/Refresh", headers=auth_hdr, timeout=15)
+        _request_library_refresh(base_url, auth_hdr)
         sys.exit(0)
 
     if item_type == "Movie":
