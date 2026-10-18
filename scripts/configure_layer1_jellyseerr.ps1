@@ -263,22 +263,28 @@ if ($Config.Apps.Sonarr -eq $true) {
 
             # Check if Sonarr is already configured in Jellyseerr
             $existingSonarr = $null
+            $sonarrLookupOk = $false
             try {
                 $existingSonarr = Invoke-JellyseerrApi -Path "/api/v1/settings/sonarr" -Method Get
+                $sonarrLookupOk = $true
                 Write-DebugLog "VAR existing Sonarr instances=$($existingSonarr.Count)"
             } catch {
                 Write-DebugLog "WARN" "Could not get existing Sonarr config: $_"
             }
 
             $alreadyConfigured = ($existingSonarr -and $existingSonarr.Count -gt 0)
-            Write-DebugLog "VAR Sonarr alreadyConfigured=$alreadyConfigured"
+            Write-DebugLog "VAR Sonarr alreadyConfigured=$alreadyConfigured lookupOk=$sonarrLookupOk"
 
+            # DVRSettings names the prefix `baseUrl`; SonarrAPI.buildUrl reads
+            # settings.baseUrl, so a payload carrying `urlBase` (as this script used
+            # to) is stored but ignored.  In DuckDNS mode that drops the /sonarr
+            # prefix and every request Jellyseerr sends to Sonarr 404s.
             $sonarrPayload = @{
                 name                = "Sonarr"
                 hostname            = "127.0.0.1"
                 port                = $SonarrPort
                 apiKey              = $sonarrApiKey
-                urlBase             = $SonarrBase
+                baseUrl             = $SonarrBase
                 useSsl              = $false
                 is4k                = $false
                 isDefault           = $true
@@ -286,6 +292,11 @@ if ($Config.Apps.Sonarr -eq $true) {
                 activeProfileName   = $sonarrActiveProfileName
                 activeDirectory     = if ($TVPath) { $TVPath } else { "" }
                 enableSeasonFolders = $true
+                seriesType          = "standard"
+                animeSeriesType     = "standard"
+                monitorNewItems     = "all"
+                tags                = @()
+                tagRequests         = $false
                 externalUrl         = ""
                 syncEnabled         = $false
                 preventSearch       = $false
@@ -298,10 +309,15 @@ if ($Config.Apps.Sonarr -eq $true) {
                     Invoke-JellyseerrApi -Path "/api/v1/settings/sonarr/$existingId" -Method Put -Body $sonarrPayload | Out-Null
                     Write-Host "  -> Sonarr connection updated (id=$existingId)." -ForegroundColor Green
                     Write-DebugLog "INFO" "Sonarr connection updated id=$existingId"
+                } elseif (-not $sonarrLookupOk) {
+                    # A failed GET is not proof that no instance exists. Posting here
+                    # would add a second Sonarr on every re-run whose lookup hiccuped.
+                    Write-Warning "[$AppName] Could not read the existing Sonarr connections. Skipping so a duplicate is not created."
+                    Write-DebugLog "WARN" "Skipped Sonarr connection: existing settings could not be read"
                 } else {
                     Invoke-JellyseerrApi -Path "/api/v1/settings/sonarr" -Method Post -Body $sonarrPayload | Out-Null
                     Write-Host "  -> Sonarr connected (127.0.0.1:$SonarrPort$SonarrBase)." -ForegroundColor Green
-                    Write-DebugLog "INFO" "Sonarr connection created port=$SonarrPort urlBase=$SonarrBase"
+                    Write-DebugLog "INFO" "Sonarr connection created port=$SonarrPort baseUrl=$SonarrBase"
                 }
             } catch {
                 Write-Warning "[$AppName] Could not configure Sonarr connection: $_"
@@ -347,22 +363,25 @@ if ($Config.Apps.Radarr -eq $true) {
             }
 
             $existingRadarr = $null
+            $radarrLookupOk = $false
             try {
                 $existingRadarr = Invoke-JellyseerrApi -Path "/api/v1/settings/radarr" -Method Get
+                $radarrLookupOk = $true
                 Write-DebugLog "VAR existing Radarr instances=$($existingRadarr.Count)"
             } catch {
                 Write-DebugLog "WARN" "Could not get existing Radarr config: $_"
             }
 
             $alreadyConfigured = ($existingRadarr -and $existingRadarr.Count -gt 0)
-            Write-DebugLog "VAR Radarr alreadyConfigured=$alreadyConfigured"
+            Write-DebugLog "VAR Radarr alreadyConfigured=$alreadyConfigured lookupOk=$radarrLookupOk"
 
+            # Same field-name trap as Sonarr above: RadarrAPI.buildUrl reads baseUrl.
             $radarrPayload = @{
                 name                = "Radarr"
                 hostname            = "127.0.0.1"
                 port                = $RadarrPort
                 apiKey              = $radarrApiKey
-                urlBase             = $RadarrBase
+                baseUrl             = $RadarrBase
                 useSsl              = $false
                 is4k                = $false
                 isDefault           = $true
@@ -370,6 +389,8 @@ if ($Config.Apps.Radarr -eq $true) {
                 activeProfileName   = $radarrActiveProfileName
                 activeDirectory     = if ($MoviesPath) { $MoviesPath } else { "" }
                 minimumAvailability = "released"
+                tags                = @()
+                tagRequests         = $false
                 externalUrl         = ""
                 syncEnabled         = $false
                 preventSearch       = $false
@@ -382,10 +403,13 @@ if ($Config.Apps.Radarr -eq $true) {
                     Invoke-JellyseerrApi -Path "/api/v1/settings/radarr/$existingId" -Method Put -Body $radarrPayload | Out-Null
                     Write-Host "  -> Radarr connection updated (id=$existingId)." -ForegroundColor Green
                     Write-DebugLog "INFO" "Radarr connection updated id=$existingId"
+                } elseif (-not $radarrLookupOk) {
+                    Write-Warning "[$AppName] Could not read the existing Radarr connections. Skipping so a duplicate is not created."
+                    Write-DebugLog "WARN" "Skipped Radarr connection: existing settings could not be read"
                 } else {
                     Invoke-JellyseerrApi -Path "/api/v1/settings/radarr" -Method Post -Body $radarrPayload | Out-Null
                     Write-Host "  -> Radarr connected (127.0.0.1:$RadarrPort$RadarrBase)." -ForegroundColor Green
-                    Write-DebugLog "INFO" "Radarr connection created port=$RadarrPort urlBase=$RadarrBase"
+                    Write-DebugLog "INFO" "Radarr connection created port=$RadarrPort baseUrl=$RadarrBase"
                 }
             } catch {
                 Write-Warning "[$AppName] Could not configure Radarr connection: $_"
@@ -435,7 +459,9 @@ if (-not (Test-Path $SecretsDir)) {
         $mainSettings = Invoke-JellyseerrApi -Path "/api/v1/settings/main" -Method Get
         $jsApiKey     = $mainSettings.apiKey
         if ($jsApiKey) {
-            [System.IO.File]::WriteAllText($ApiKeyFile, $jsApiKey, [System.Text.Encoding]::UTF8)
+            # BOM-free: consumers put this value straight into an X-Api-Key header,
+            # and PS 5.1's [Text.Encoding]::UTF8 would prepend EF BB BF.
+            [System.IO.File]::WriteAllText($ApiKeyFile, $jsApiKey, (New-Object System.Text.UTF8Encoding($false)))
             Write-Host "  -> API key stored in $ApiKeyFile." -ForegroundColor Green
             Write-DebugLog "INFO" "Jellyseerr API key written to $ApiKeyFile"
         } else {
