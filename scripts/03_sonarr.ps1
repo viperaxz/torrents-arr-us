@@ -223,7 +223,13 @@ Write-DebugLog "VAR target sonarr.db exists=$(Test-Path $ArrDbFile)"
 if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
     Write-Host "  -> Restoring Sonarr data from previous install..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Restoring Sonarr data from $ArrBackupDir -> $DataDir"
-    Copy-Item -Path (Join-Path $ArrBackupDir "*") -Destination $DataDir -Force -ErrorAction SilentlyContinue
+    try {
+        Copy-Item -Path (Join-Path $ArrBackupDir "*") -Destination $DataDir -Force -ErrorAction Stop
+    } catch {
+        # SilentlyContinue used to hide this, and the backup was deleted regardless.
+        Write-Warning "  -> Could not restore Sonarr data from '$ArrBackupDir': $_"
+        Write-DebugLog "ERROR" "Sonarr data restore failed: $_"
+    }
 
     # Re-align the restored config.xml with the current config.json: the
     # port and URL base may have changed since the backup was taken.
@@ -259,8 +265,16 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
         }
     }
 
-    Remove-Item -Path $ArrBackupDir -Recurse -Force -ErrorAction SilentlyContinue
-    Write-DebugLog "INFO" "Sonarr backup cleaned up after restore"
+    # Keep the only copy of the previous library until the restore demonstrably
+    # worked: deleting it after a failed Copy-Item destroys the user's shows with
+    # no way back. sonarr.db is what the restore was for.
+    if (Test-Path $ArrDbFile) {
+        Remove-Item -Path $ArrBackupDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-DebugLog "INFO" "Sonarr backup cleaned up after restore"
+    } else {
+        Write-Warning "  -> Restore did not produce sonarr.db. Keeping the backup at $ArrBackupDir"
+        Write-DebugLog "WARN" "Restore did not produce $ArrDbFile -- backup left in place at $ArrBackupDir"
+    }
 } elseif (Test-Path $ArrBackupDir) {
     Write-DebugLog "INFO" "Sonarr backup found but sonarr.db already exists -- skip restore"
 } else {

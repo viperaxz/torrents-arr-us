@@ -161,6 +161,11 @@ if ((Test-Path $ArrBackupDir) -and -not (Test-Path $ArrDbFile)) {
             $xml.Save($ConfigXml)
             Write-DebugLog "INFO" "Restored config.xml re-aligned: port=$AppPort"
         } catch {
+            # Write-DebugLog is a no-op unless General.DebugLogging is on, so warn
+            # on the console too: an unaligned config.xml (wrong port / stale
+            # UrlBase) leaves Radarr unreachable through Caddy and no other step
+            # re-checks it.
+            Write-Warning "  -> Could not re-align the restored config.xml: $_"
             Write-DebugLog "WARN" "config.xml re-align failed: $_"
         }
     }
