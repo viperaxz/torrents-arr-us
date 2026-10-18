@@ -14,6 +14,47 @@ if (-not (Get-Command Start-ServiceBounded -ErrorAction SilentlyContinue)) {
 Initialize-DebugLog -Config $Config
 Write-DebugLog "INFO" "03_sonarr.ps1 started"
 
+# -- config.xml helpers --------------------------------------------------------
+# PowerShell's XML adapter cannot create a missing element by assignment (it
+# throws "property cannot be found"), and it hands back an element's text rather
+# than the node itself, so RemoveChild($xml.Config.UrlBase) fails. Both the
+# restore re-align and the post-first-run alignment below need to add or drop
+# nodes, so they go through these helpers.
+function Set-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name, [string]$Value)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $node.InnerText = $Value }
+    else {
+        $node = $Xml.CreateElement($Name)
+        $node.InnerText = $Value
+        $Xml.Config.AppendChild($node) | Out-Null
+    }
+}
+
+function Remove-ConfigXmlValue {
+    param([System.Xml.XmlDocument]$Xml, [string]$Name)
+    $node = $Xml.Config.SelectSingleNode($Name)
+    if ($node) { $Xml.Config.RemoveChild($node) | Out-Null }
+}
+
+function Test-ZipArchive {
+    # A download interrupted mid-transfer leaves a truncated file in bin/, and the
+    # cache lookup runs before the download on every later run -- so a partial zip
+    # would be retried forever instead of being fetched again.
+    param([string]$Path)
+    try {
+        if (-not ("System.IO.Compression.ZipFile" -as [type])) {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        }
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+        try { $entryCount = $archive.Entries.Count } finally { $archive.Dispose() }
+        return ($entryCount -gt 0)
+    } catch {
+        Write-DebugLog "WARN" "Zip validation failed for '$Path': $_"
+        return $false
+    }
+}
+
 $AppName     = "Sonarr"
 $AppLower    = "sonarr"
 $AppPort     = $Config.Ports.Sonarr
@@ -67,6 +108,15 @@ $CachedZip = if ($VersionNumeric) {
 }
 Write-DebugLog "VAR cached zip found=$($null -ne $CachedZip) name=$($CachedZip.Name)"
 
+# Validate a cached zip before trusting it: an interrupted download leaves a
+# truncated file behind and the cache is consulted before GitHub on every run.
+if ($CachedZip -and -not (Test-ZipArchive -Path $CachedZip.FullName)) {
+    Write-Warning "  -> Cached $($CachedZip.Name) is incomplete. Removing it and downloading again."
+    Write-DebugLog "WARN" "Cached zip failed validation, deleting: $($CachedZip.FullName)"
+    Remove-Item -Path $CachedZip.FullName -Force -ErrorAction SilentlyContinue
+    $CachedZip = $null
+}
+
 if ($CachedZip) {
     Write-Host "  -> Using cached $($CachedZip.Name)..." -ForegroundColor Gray
     $ZipPath = $CachedZip.FullName
@@ -98,7 +148,17 @@ if ($CachedZip) {
     $ZipPath = Join-Path $BinDir $Asset.name
     Write-Host "  -> Downloading $AppName $($Release.tag_name)..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Downloading $($Asset.browser_download_url) -> $ZipPath"
-    Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $ZipPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        # Never leave a partial file in the cache: the cached-zip branch above runs
+        # first on the next attempt, so a truncated download would be reused and
+        # every later run would die in Expand-Archive instead of downloading again.
+        if (Test-Path $ZipPath) { Remove-Item -Path $ZipPath -Force -ErrorAction SilentlyContinue }
+        Write-Warning "  -> Download failed: $_"
+        Write-DebugLog "ERROR" "Download failed from $($Asset.browser_download_url): $_"
+        exit 1
+    }
     $zipSize = (Get-Item $ZipPath).Length
     Write-DebugLog "INFO" "Download complete. File=$ZipPath size=$zipSize bytes"
     if (-not $PinnedVersion) { $PinnedVersion = $Release.tag_name }
@@ -111,8 +171,33 @@ if (-not (Test-Path $AppBinDir)) {
 }
 Write-Host "  -> Extracting..." -ForegroundColor Gray
 Write-DebugLog "INFO" "Extracting $ZipPath -> $AppBinDir"
-Expand-Archive -Path $ZipPath -DestinationPath $AppBinDir -Force
+try {
+    Expand-Archive -Path $ZipPath -DestinationPath $AppBinDir -Force -ErrorAction Stop
+} catch {
+    # A cached zip can be corrupt past its central directory (the part Test-ZipArchive
+    # checks); drop it so the next run re-downloads rather than failing on the same
+    # file forever.
+    Write-Warning "  -> Extraction failed: $_"
+    Write-DebugLog "ERROR" "Extraction failed for '$ZipPath': $_"
+    if (Test-Path $ZipPath) { Remove-Item -Path $ZipPath -Force -ErrorAction SilentlyContinue }
+    exit 1
+}
 Write-DebugLog "INFO" "Extraction complete"
+
+# The release zip wraps everything in a single "Sonarr" folder. Flatten it, the
+# way 09_bazarr.ps1 and 10_flaresolverr.ps1 do, because update_sonarr.ps1 swaps
+# this directory with Swap-AppDirectoryWithRollback -- which flattens
+# single-directory zips. Leaving the install nested meant the registered NSSM
+# Application (<InstallDir>\Sonarr\Sonarr\Sonarr.exe) stopped existing after the
+# first update, so the new build could never start.
+$NestedExe = Join-Path $AppBinDir "$AppName\$AppName.exe"
+if ((Test-Path $NestedExe) -and -not (Test-Path (Join-Path $AppBinDir "$AppName.exe"))) {
+    $NestedDir = Join-Path $AppBinDir $AppName
+    Write-DebugLog "INFO" "Flattening single-directory archive: $NestedDir -> $AppBinDir"
+    Get-ChildItem -Path $NestedDir -Force | ForEach-Object { Move-Item -Path $_.FullName -Destination $AppBinDir -Force }
+    Remove-Item -Path $NestedDir -Recurse -Force
+    Write-DebugLog "INFO" "Archive flattened"
+}
 
 $AppExe = Get-ChildItem -Path $AppBinDir -Recurse -Filter "$AppName.exe" | Select-Object -First 1
 Write-DebugLog "VAR AppExe=$($AppExe.FullName)"
@@ -203,6 +288,23 @@ if (-not $ExistingService) {
     Write-DebugLog "INFO" "NSSM service '$AppName' created. AppDirectory=$($AppExe.DirectoryName)"
 } else {
     Write-DebugLog "INFO" "NSSM service '$AppName' already exists. Skipping creation."
+    # Keep the registered path in step with the directory just extracted: the
+    # archive is flattened above, so a service left over from an older (nested)
+    # install would still point at <AppName>\<AppName>\<AppName>.exe, which no
+    # longer exists, and the service would fail to start.
+    $nssmCmd = (Get-Command nssm -ErrorAction SilentlyContinue).Source
+    if ($nssmCmd) {
+        $nssmCurrentApp = (& $nssmCmd get $AppName Application 2>$null | Out-String).Trim().Trim('"')
+        if ($nssmCurrentApp -ne $AppExe.FullName) {
+            Write-Host "  -> Re-pointing existing $AppName service at $($AppExe.FullName)..." -ForegroundColor Gray
+            Write-DebugLog "INFO" "NSSM Application re-pointed: '$nssmCurrentApp' -> '$($AppExe.FullName)'"
+            & $nssmCmd set $AppName Application $AppExe.FullName | Out-Null
+            & $nssmCmd set $AppName AppDirectory $AppExe.DirectoryName | Out-Null
+        }
+    } else {
+        Write-Warning "  -> nssm not found on PATH; cannot verify the exe path registered for the existing $AppName service."
+        Write-DebugLog "WARN" "nssm not found on PATH; existing $AppName service path not verified"
+    }
 }
 
 # 6. Firewall
