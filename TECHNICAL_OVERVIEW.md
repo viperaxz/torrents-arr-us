@@ -477,7 +477,7 @@ The most complex installer — sets up the entire public-facing layer.
 Identical pattern to `03_sonarr.ps1` but for Radarr. Fetches from `github.com/Radarr/Radarr`, filters for `windows-core-x64` zip, sets `UrlBase=/radarr` in DuckDNS mode.
 
 #### `scripts/05_prowlarr.ps1`
-Identical pattern to Sonarr/Radarr. Fetches from `github.com/Prowlarr/Prowlarr`, sets `UrlBase=/prowlarr` in DuckDNS mode.
+Identical pattern to Sonarr/Radarr. Fetches from `github.com/Prowlarr/Prowlarr`, creates the NSSM service, then aligns the first-run `config.xml` with `config.json`: `Port` always (Prowlarr always writes its default 9696), and `UrlBase=/prowlarr` only in DuckDNS mode — in Cloudflare mode a leftover `UrlBase` (from a retry after a failed DuckDNS install) is removed. The edit is verified after the restart.
 
 #### `scripts/07_deluge.ps1`
 - Installs `deluge` via Chocolatey, locates `deluged.exe` and `deluge-web.exe`.
