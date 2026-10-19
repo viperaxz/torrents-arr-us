@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "updated": "2026-10-16",
+  "updated": "2026-10-19",
   "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
   "apps": {
     "Sonarr": {
@@ -33,7 +33,6 @@
       "repo": "FlareSolverr/FlareSolverr",
       "asset": "flaresolverr_windows_x64.zip"
     },
-
     "Jellyseerr": {
       "version": "v3.5.0",
       "source": "github_source",
@@ -103,7 +102,7 @@
       "asset": "loki-windows-amd64.exe.zip"
     },
     "Alloy": {
-      "version": "v1.20.1",
+      "version": "v1.21.0",
       "source": "github",
       "repo": "grafana/alloy",
       "asset": "alloy-windows-amd64.exe.zip",
