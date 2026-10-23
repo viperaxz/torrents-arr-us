@@ -170,6 +170,12 @@ function Get-LeanLibraryChanges {
 function Apply-LeanLibraryOptions {
     param($Options, $Changes, [string]$JellyfinType)
 
+    if ($Changes.Lean) {
+        # A lean library is video-only. Photo scanning walks image files on the
+        # mount; nothing consumes them, so keep it off.
+        Set-LibraryOptionProperty -Options $Options -Name 'EnablePhotos' -Value $false
+    }
+
     if ($Changes.DisableVideo) {
         # Jellyfin 10.9+ exposes trickplay per library; 'EnableTrickplay' itself is not
         # a LibraryOptions property and is silently dropped by the JSON binder.
@@ -215,6 +221,7 @@ function Apply-LeanLibraryOptions {
 function Test-LeanLibraryOptions {
     param($Options, $Changes, [string]$JellyfinType)
     if (-not $Options) { return $false }
+    if ($Changes.Lean -and $Options.PSObject.Properties['EnablePhotos'] -and $Options.EnablePhotos -ne $false) { return $false }
     if ($Changes.DisableVideo) {
         foreach ($n in @('EnableChapterImageExtraction', 'ExtractChapterImagesDuringLibraryScan',
                          'EnableTrickplayImageExtraction', 'ExtractTrickplayImagesDuringLibraryScan')) {
@@ -394,6 +401,32 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
             Write-Warning "     Failed to create library '$libName': $_"
             Write-DebugLog "ERROR" "Failed to create library '$libName': $_"
         }
+    }
+}
+
+# -- 5a. Bound image extraction when a lean (mount-backed) library exists ------
+# Jellyfin 12.x has no per-library switch for the embedded-artwork extractor:
+# EmbeddedImageProvider is an IDynamicImageProvider and runs on every metadata
+# refresh for an item without a primary image. On an rclone/WebDAV mount each
+# attempt reads the media file and hits the global 10s default -- that is what
+# produced the "ffmpeg image extraction timed out after 10000ms" errors on the
+# RD library's first scan. One second is ample for a local disk and far too
+# short for the mount, so mount items give up almost immediately.
+$anyLeanLibrary = @($Layer2Config.MediaLibraries | Where-Object { $_.PSObject.Properties['Lean'] -and $_.Lean }).Count -gt 0
+if ($anyLeanLibrary) {
+    try {
+        $serverCfg = Invoke-RestMethod -Uri "$ApiBase/System/Configuration" -Headers $UserAuth -UseBasicParsing -ErrorAction Stop
+        if ([int]$serverCfg.ImageExtractionTimeoutMs -ne 1000) {
+            $serverCfg.ImageExtractionTimeoutMs = 1000
+            $cfgBody = $serverCfg | ConvertTo-Json -Depth 20 -Compress
+            Invoke-RestMethod -Uri "$ApiBase/System/Configuration" -Method Post -Body $cfgBody `
+                -ContentType "application/json" -Headers $UserAuth -UseBasicParsing -ErrorAction Stop | Out-Null
+            Write-Host "     OK Capped Jellyfin image extraction at 1000ms (lean library present)" -ForegroundColor Green
+            Write-DebugLog "INFO" "Set Jellyfin ImageExtractionTimeoutMs=1000 (lean library present)"
+        }
+    } catch {
+        Write-Warning "     Could not cap Jellyfin image extraction timeout: $_"
+        Write-DebugLog "WARN" "Failed to set ImageExtractionTimeoutMs: $_"
     }
 }
 

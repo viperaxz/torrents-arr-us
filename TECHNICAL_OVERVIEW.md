@@ -217,7 +217,7 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Enabled when `Apps.RealDebrid = true` and `RealDebrid.ApiKey` is set.
 - **Zurg** (`scripts/15_zurg.ps1`) — downloads the latest release from `debridmediamanager/zurg-public`; generates `config.yml` pointing at the RD API; creates an NSSM service under `seedbox-svc`. The rclone mount uses `zurg:__all__` to expose all torrents at the drive root — Jellyfin classifies movies vs shows by filename pattern. The generated `config.yml` pins `host: 127.0.0.1` (Zurg's WebDAV endpoint is unauthenticated, so it is deliberately loopback-only) and gets an explicit ACL — full control for Administrators/SYSTEM, modify for `seedbox-svc` — because the file holds the Real-Debrid API token.
 - **rclone** (`scripts/16_rclone.ps1`) — installs WinFsp (required for FUSE-style mounts on Windows) via Chocolatey; downloads rclone from GitHub; creates one NSSM service: `rclone-rd-movies` mounts `zurg:__all__` at `<MountLetter>:\` (default `R:\`). TV shows are not provisioned as a separate mount because Zurg's WebDAV layer cannot reliably separate shows from movies — Jellyfin classifies the mounted content by filename pattern instead.
-- **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads).
+- **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads). Lean libraries also get photo scanning disabled, and Layer 2 caps the **global** `ImageExtractionTimeoutMs` at 1000 ms: Jellyfin 12.x exposes no per-library switch for its embedded-artwork extractor (`EmbeddedImageProvider` is an `IDynamicImageProvider`), which otherwise reads each image-less item over WebDAV for up to the 10 s default during a scan.
 - **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`).
 
 ### Optional LLM Reverse Proxy (bring-your-own backend)
@@ -349,6 +349,7 @@ CrowdSec splits into two independent components, and **both are required** — t
         // Real-Debrid lean libraries (optional)
         {
           "Name": "RD Movies", "Path": "R:\\", "Type": "movies",
+          // Lean always disables photos and caps embedded-artwork extraction at 1s
           "Lean": {
             "DisableVideoExtraction": true,  // skip chapter images + trickplay
             "DisableMetadata":        false, // set true to skip TMDb fetchers
