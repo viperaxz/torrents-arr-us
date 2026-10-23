@@ -98,12 +98,40 @@ try {
         Remove-Item $srcSub.FullName -Recurse -Force
     }
 
-    # -- 3. Build --------------------------------------------------------------
+    # -- 3. Swap with rollback --------------------------------------------------
+    # Never Stop-Service here: an nssm service wedged in Stop Pending blocks it
+    # forever (see service_helpers.ps1), and Jellyseerr -- which logs at debug and
+    # writes a lot to stdout -- is the worst offender in this suite.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -eq "Running") { $null = Stop-UpdateService -Name $ServiceName }
+    Start-Sleep -Seconds 3
+
+    # Swap the staged runtime first: the service points at node\node.exe, so the
+    # path stays valid and the new bundle boots on the patched Node.
+    if ($stageNode -and (Test-Path $NodeStageDir)) {
+        $nodeBak = "$NodeDir.bak"
+        if (Test-Path $nodeBak) { Remove-Item $nodeBak -Recurse -Force }
+        if (Test-Path $NodeDir) { Rename-Item -Path $NodeDir -NewName "node.bak" -Force }
+        Rename-Item -Path $NodeStageDir -NewName "node" -Force
+        Write-Host "  -> Node.js runtime refreshed to $nodeWant." -ForegroundColor Gray
+    }
+
+    $appBak = "$AppSrcDir.bak"
+    if (Test-Path $appBak) { Remove-Item $appBak -Recurse -Force }
+    if (Test-Path $AppSrcDir) { Rename-Item -Path $AppSrcDir -NewName "app.bak" -Force }
+    Rename-Item -Path $NewSrcDir -NewName "app" -Force
+
+    # -- 4. Build in place ------------------------------------------------------
+    # pnpm links dependencies with absolute directory junctions on Windows
+    # (node_modules\<pkg> -> <project>\node_modules\.pnpm\...).  Building in
+    # app-new and renaming it to app leaves every junction pointing at the old
+    # path, so the service boots with "Cannot find module '<first dep>'" and
+    # crash-loops.  Build only after the directory sits at its final path.
     $logsDir = Join-Path $InstallDir "logs"
     if (-not (Test-Path $logsDir)) { New-Item -Path $logsDir -ItemType Directory -Force | Out-Null }
     $buildLog = Join-Path $logsDir "jellyseerr_update_build.log"
 
-    $npmrcFile = Join-Path $NewSrcDir ".npmrc"
+    $npmrcFile = Join-Path $AppSrcDir ".npmrc"
     try {
         # Merge instead of overwrite: the source archive ships .npmrc with
         # engine-strict=true and its allow-list in package.json#pnpm.onlyBuiltDependencies.
@@ -115,7 +143,7 @@ try {
                 Where-Object { $_ -notmatch '^\s*onlyBuiltDependencies(\[\])?\s*=' })
         }
         $buildDeps = @("unrs-resolver")
-        $pkgJson = Join-Path $NewSrcDir "package.json"
+        $pkgJson = Join-Path $AppSrcDir "package.json"
         if (Test-Path $pkgJson) {
             try {
                 $pkg = Get-Content -Raw -Path $pkgJson | ConvertFrom-Json
@@ -131,14 +159,14 @@ try {
 
     Write-Host "  -> Building Jellyseerr (5-10 min, please wait)..." -ForegroundColor Gray
     $savedPath  = $env:PATH
-    # Build with the runtime that will actually serve the app, not the stale one.
-    $BuildNodeDir = if ($stageNode) { $NodeStageDir } else { $NodeDir }
-    $env:PATH   = "$BuildNodeDir;" + $env:PATH
+    # $NodeDir now holds the refreshed runtime (swapped in above), which is also
+    # the one the service will use -- build and serve on the same Node.
+    $env:PATH   = "$NodeDir;" + $env:PATH
     $env:PNPM_HOME = $PnpmHome
     $env:CI     = "true"
     $env:NODE_OPTIONS = "--max-old-space-size=4096"
 
-    Push-Location $NewSrcDir
+    Push-Location $AppSrcDir
     $savedEAP = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
@@ -163,31 +191,8 @@ try {
         Remove-Item Env:\NODE_OPTIONS  -ErrorAction SilentlyContinue
     }
 
-    $serverJs = Join-Path $NewSrcDir "dist\index.js"
+    $serverJs = Join-Path $AppSrcDir "dist\index.js"
     if (-not (Test-Path $serverJs)) { throw "dist\index.js not found after build" }
-
-    # -- 4. Swap with rollback --------------------------------------------------
-    # Never Stop-Service here: an nssm service wedged in Stop Pending blocks it
-    # forever (see service_helpers.ps1), and Jellyseerr -- which logs at debug and
-    # writes a lot to stdout -- is the worst offender in this suite.
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($svc -and $svc.Status -eq "Running") { $null = Stop-UpdateService -Name $ServiceName }
-    Start-Sleep -Seconds 3
-
-    # Swap the staged runtime first: the service points at node\node.exe, so the
-    # path stays valid and the new bundle boots on the patched Node.
-    if ($stageNode -and (Test-Path $NodeStageDir)) {
-        $nodeBak = "$NodeDir.bak"
-        if (Test-Path $nodeBak) { Remove-Item $nodeBak -Recurse -Force }
-        if (Test-Path $NodeDir) { Rename-Item -Path $NodeDir -NewName "node.bak" -Force }
-        Rename-Item -Path $NodeStageDir -NewName "node" -Force
-        Write-Host "  -> Node.js runtime refreshed to $nodeWant." -ForegroundColor Gray
-    }
-
-    $appBak = "$AppSrcDir.bak"
-    if (Test-Path $appBak) { Remove-Item $appBak -Recurse -Force }
-    if (Test-Path $AppSrcDir) { Rename-Item -Path $AppSrcDir -NewName "app.bak" -Force }
-    Rename-Item -Path $NewSrcDir -NewName "app" -Force
 
     $null = Start-ServiceBounded -Name $ServiceName
 

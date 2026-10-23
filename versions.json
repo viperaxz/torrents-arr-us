@@ -74,7 +74,7 @@
       "package": "caddy"
     },
     "NSSM": {
-      "version": "2.24.101",
+      "version": "2.24.101.20180116",
       "source": "chocolatey",
       "package": "nssm"
     },
