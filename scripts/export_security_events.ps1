@@ -70,7 +70,8 @@ $scannedThrough = $fresh[-1].RecordId
 # lines and a leaked bucket that never produces a decision.  Drop them here.
 $exportable = @($fresh | Where-Object {
     $xml = $_.ToXml()
-    $ipText = if ($xml -match "<Data Name='IpAddress'>([^<]*)</Data>") { $Matches[1] } else { '' }
+    # ToXml() uses single-quoted attributes today; accept double quotes too.
+    $ipText = if ($xml -match '<Data Name=[''"]IpAddress[''"]>([^<]*)</Data>') { $Matches[1] } else { '' }
     $parsed = $null
     if (-not $ipText -or -not [System.Net.IPAddress]::TryParse($ipText, [ref]$parsed)) { return $false }
     -not [System.Net.IPAddress]::IsLoopback($parsed)
