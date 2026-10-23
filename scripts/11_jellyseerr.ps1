@@ -61,7 +61,7 @@ if (-not (Test-Path $BinDir)) { New-Item -Path $BinDir -ItemType Directory -Forc
 
 Write-Host "  -> Querying latest Jellyseerr version..." -ForegroundColor Gray
 try {
-    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/Fallenbagel/jellyseerr/releases/latest" `
+    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/seerr-team/seerr/releases/latest" `
         -UseBasicParsing
     $Version = $Release.tag_name -replace '^v', ''
     Write-DebugLog "VAR Jellyseerr version=$Version"
@@ -151,7 +151,7 @@ if (-not (Test-Path $PnpmInNode)) {
 $SrcZip = Join-Path $BinDir "jellyseerr-v$Version-source.zip"
 Write-DebugLog "VAR SrcZip=$SrcZip (cached=$(Test-Path $SrcZip))"
 if (-not (Test-Path $SrcZip)) {
-    $srcUrl = "https://github.com/Fallenbagel/jellyseerr/archive/refs/tags/v$Version.zip"
+    $srcUrl = "https://github.com/seerr-team/seerr/archive/refs/tags/v$Version.zip"
     Write-Host "  -> Downloading Jellyseerr v$Version source..." -ForegroundColor Gray
     Write-DebugLog "INFO" "Downloading: $srcUrl"
     Invoke-WebRequest -Uri $srcUrl -OutFile $SrcZip -UseBasicParsing

@@ -656,9 +656,9 @@ Imports Jellyfin users into Jellyseerr so they can log in with their existing cr
 ### Jellyseerr Installers
 
 #### `scripts/11_jellyseerr.ps1`
-Jellyseerr v3.3.0 ships no pre-built Windows binary, so the installer builds from source:
-- Downloads Node.js v22 portable zip and pnpm into `bin/` (cached by version).
-- Downloads the Jellyseerr source zip from GitHub (also cached).
+Jellyseerr (upstream now `seerr-team/seerr`) ships no pre-built Windows binary, so the installer builds from source:
+- Downloads the newest Node.js v22 LTS portable zip and pnpm into `bin/` (cached by version).
+- Downloads the source zip from GitHub (also cached).
 - Extracts to `InstallDir\Jellyseerr\app\`, installs dependencies with `pnpm install --frozen-lockfile`, then runs `pnpm build` to produce the Next.js production bundle.
 - The pnpm/Next.js build writes to stderr; stderr is intentionally not treated as errors (the build succeeds if `exit 0`).
 - Creates an NSSM service running `node server.js` with `CONFIG_DIRECTORY`, `PORT`, and `NODE_ENV=production` environment variables set.
@@ -733,7 +733,7 @@ Building blocks:
 
 - `scripts\choco_helpers.ps1` — `Resolve-ChocoExe` / `Invoke-Choco` / `Get-ChocoInstalledVersion`. Every choco call site in the project (installers, updaters, `master_install.ps1` and `master_uninstall.ps1`) routes through these, so neither a stale `$env:Path` nor a transient `community.chocolatey.org` feed failure can abort a run. `Invoke-Choco` retries the transient class with exponential backoff (`MaxAttempts` 6 by default) and always returns the captured output; `Get-ChocoInstalledVersion` preserves the `list --local-only --exact` contract the installers depend on.
 - `scripts\update_common.ps1` — shared helpers: `Read-InstalledLedger` / `Set-InstalledVersion`, tolerant `Compare-Versions`, data-driven `Get-UpdatePlan` (states: `current`, `update`, `manual`, `notinstalled`, `unknown`, `unresolved`), `Invoke-GitHubReleaseDownload`, `Invoke-ChocoUpgrade`, `Swap-AppDirectoryWithRollback`, `Swap-SingleExeWithRollback`, `Detect-InstalledVersion` (self-heals legacy lock values like timestamps or `installed`). It dot-sources `choco_helpers.ps1` defensively, because every `update_<App>.ps1` runs as a child process and must not depend on `master_update.ps1` having loaded the helpers first.
-- `scripts\update_<App>.ps1` — one script per app (18 total). Contract: `-Version -InstallDir -BinDir -Config [-WhatIf]`, returns one result object (`App/Status/Installed/Target/Detail`), writes the ledger only after a verified success. Dir swaps for Sonarr/Radarr/Prowlarr/Flaresolverr/Grafana; exe-only swaps for Zurg/rclone/Loki/Alloy (config files live next to the binary); Bazarr re-runs `pip install -r requirements.txt` after the swap; Jellyseerr rebuilds from source via pnpm; choco upgrades for Jellyfin (re-applies the `seedbox-svc` service account), Deluge, ffmpeg, Caddy (reloads the Caddyfile), CrowdSec + bouncer; Recyclarr replaces the CLI exe. NSSM and Python312 are deliberately manual.
+- `scripts\update_<App>.ps1` — one script per app (18 total). Contract: `-Version -InstallDir -BinDir -Config [-WhatIf]`, returns one result object (`App/Status/Installed/Target/Detail`), writes the ledger only after a verified success. Dir swaps for Sonarr/Radarr/Prowlarr/Flaresolverr/Grafana; exe-only swaps for Zurg/rclone/Loki/Alloy (config files live next to the binary); Bazarr re-runs `pip install -r requirements.txt` after the swap; Jellyseerr refreshes the bundled Node.js 22 LTS and rebuilds from source via pnpm; choco upgrades for Jellyfin (re-applies the `seedbox-svc` service account), Deluge, ffmpeg, Caddy (reloads the Caddyfile), CrowdSec + bouncer; Recyclarr replaces the CLI exe. NSSM and Python312 are deliberately manual.
 - `master_update.ps1` — thin data-driven orchestrator: self-update via git pull, remote manifest fetch, ledger migration, `Get-UpdatePlan`, then per-app script invocation with the summary table. Supports `-AutoApprove`, `-App <Name>`, `-WhatIf`.
 - `box.ps1` — `box check` (read-only plan) and `box update` (auto-elevates) both consume the same plan; no hardcoded app list exists anywhere.
 

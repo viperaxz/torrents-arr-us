@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "updated": "2026-10-16",
+  "updated": "2026-10-23",
   "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
   "apps": {
     "Sonarr": {
@@ -35,10 +35,12 @@
     },
 
     "Jellyseerr": {
-      "version": "v3.5.0",
+      "version": "v3.5.1",
       "source": "github_source",
-      "repo": "Fallenbagel/jellyseerr",
-      "note": "Built from source (Node.js + pnpm). Updated by scripts\\update_jellyseerr.ps1 (rebuild from source)."
+      "repo": "seerr-team/seerr",
+      "security": true,
+      "securityNote": "CVE-2026-113470 - distrusted eMudhra intermediate CAs; requires the bundled Node.js 22.23.4 runtime.",
+      "note": "Built from source (Node.js + pnpm). Updated by scripts\\update_jellyseerr.ps1 (rebuild from source, refreshes the bundled Node 22 LTS). Upstream renamed the project to Seerr."
     },
     "Recyclarr": {
       "version": "v8.8.0",
@@ -97,13 +99,13 @@
       "note": "Pinned stable version. scripts\\bump_versions.ps1 refreshes this pin from grafana.com/api/grafana/versions/stable. Binaries at dl.grafana.com/oss/release/"
     },
     "Loki": {
-      "version": "v3.7.8",
+      "version": "v3.7.9",
       "source": "github",
       "repo": "grafana/loki",
       "asset": "loki-windows-amd64.exe.zip"
     },
     "Alloy": {
-      "version": "v1.20.1",
+      "version": "v1.21.2",
       "source": "github",
       "repo": "grafana/alloy",
       "asset": "alloy-windows-amd64.exe.zip",

@@ -1,8 +1,9 @@
 ﻿# update_jellyseerr.ps1
 # Per-app update script: Jellyseerr (source rebuild).
 # Jellyseerr has no prebuilt Windows binary.  This script downloads the source
-# archive for the pinned tag, rebuilds it with the installed portable
-# Node.js + pnpm, and swaps the app directory with rollback.
+# archive for the pinned tag (upstream repo is seerr-team/seerr), refreshes the
+# bundled portable Node.js 22 LTS, rebuilds with pnpm, and swaps the app
+# directory with rollback.
 #
 # NOTE: This takes several minutes (pnpm install + Next.js build).
 param(
@@ -22,6 +23,8 @@ $AppName     = "Jellyseerr"
 $ServiceName = "Jellyseerr"
 $AppBinDir   = Join-Path $InstallDir $AppName
 $NodeDir     = Join-Path $AppBinDir "node"
+$NodeExe     = Join-Path $NodeDir "node.exe"
+$NodeStageDir = Join-Path $AppBinDir "node-new"
 $PnpmExe     = Join-Path $AppBinDir "pnpm.exe"
 $PnpmHome    = Join-Path $AppBinDir "pnpm-home"
 $AppSrcDir   = Join-Path $AppBinDir "app"
@@ -40,12 +43,47 @@ try {
     if (-not (Test-Path $PnpmExe)) { throw "pnpm.exe not found at $PnpmExe -- reinstall Jellyseerr first" }
     if (-not (Test-Path $NodeDir)) { throw "portable Node.js not found at $NodeDir -- reinstall Jellyseerr first" }
 
+    # -- 0. Stage the newest portable Node.js 22 LTS ---------------------------
+    # The installer always resolves the newest 22.x LTS, but an in-place update
+    # used to keep whatever runtime was bundled at install time -- so Node
+    # security fixes (22.23.4 distrusted the compromised eMudhra intermediate
+    # CAs, shipped with Seerr 3.5.1) never reached an existing install.  Stage
+    # the runtime here; it is built with below and swapped in while the service
+    # is stopped.  A failed index lookup keeps the bundled runtime.
+    $nodeHave = if (Test-Path $NodeExe) { (& $NodeExe --version 2>$null) } else { "" }
+    $nodeWant = $null
+    try {
+        $nodeIndex = Invoke-RestMethod "https://nodejs.org/dist/index.json" -UseBasicParsing -ErrorAction Stop
+        $node22    = $nodeIndex | Where-Object { $_.version -like "v22.*" -and $_.lts } | Select-Object -First 1
+        if ($node22) { $nodeWant = $node22.version }
+    } catch {
+        Write-Warning "  -> Node.js release index unavailable; keeping the bundled runtime."
+    }
+    $stageNode = [bool]($nodeWant -and $nodeHave -ne $nodeWant)
+    if ($stageNode) {
+        Write-Host "  -> Staging Node.js $nodeWant (bundled: $(if ($nodeHave) { $nodeHave } else { 'unknown' }))..." -ForegroundColor Gray
+        $nodeZip = Join-Path $BinDir "node-$nodeWant-win-x64.zip"
+        if (-not (Test-Path $nodeZip)) {
+            Invoke-WebRequest -Uri "https://nodejs.org/dist/$nodeWant/node-$nodeWant-win-x64.zip" -OutFile $nodeZip -UseBasicParsing -ErrorAction Stop
+        }
+        if (Test-Path $NodeStageDir) { Remove-Item $NodeStageDir -Recurse -Force }
+        Expand-Archive -Path $nodeZip -DestinationPath $NodeStageDir -Force
+        $nodeSub = Get-ChildItem $NodeStageDir -Directory | Select-Object -First 1
+        if ($nodeSub) {
+            Get-ChildItem $nodeSub.FullName | Move-Item -Destination $NodeStageDir
+            Remove-Item $nodeSub.FullName -Recurse -Force
+        }
+        # The installer also drops pnpm.exe beside node.exe so build sub-scripts
+        # find it on PATH; keep that invariant in the refreshed runtime.
+        if (Test-Path $PnpmExe) { Copy-Item $PnpmExe (Join-Path $NodeStageDir "pnpm.exe") -Force }
+    }
+
     $vNum = $Version -replace '^v', ''
 
     # -- 1. Download source archive -------------------------------------------
     $srcZip = Join-Path $BinDir "jellyseerr-v$vNum-source.zip"
     if (-not (Test-Path $srcZip)) {
-        $srcUrl = "https://github.com/Fallenbagel/jellyseerr/archive/refs/tags/v$vNum.zip"
+        $srcUrl = "https://github.com/seerr-team/seerr/archive/refs/tags/v$vNum.zip"
         Write-Host "  -> Downloading Jellyseerr v$vNum source..." -ForegroundColor Gray
         Invoke-WebRequest -Uri $srcUrl -OutFile $srcZip -UseBasicParsing -ErrorAction Stop
     }
@@ -93,7 +131,9 @@ try {
 
     Write-Host "  -> Building Jellyseerr (5-10 min, please wait)..." -ForegroundColor Gray
     $savedPath  = $env:PATH
-    $env:PATH   = "$NodeDir;" + $env:PATH
+    # Build with the runtime that will actually serve the app, not the stale one.
+    $BuildNodeDir = if ($stageNode) { $NodeStageDir } else { $NodeDir }
+    $env:PATH   = "$BuildNodeDir;" + $env:PATH
     $env:PNPM_HOME = $PnpmHome
     $env:CI     = "true"
     $env:NODE_OPTIONS = "--max-old-space-size=4096"
@@ -134,6 +174,16 @@ try {
     if ($svc -and $svc.Status -eq "Running") { $null = Stop-UpdateService -Name $ServiceName }
     Start-Sleep -Seconds 3
 
+    # Swap the staged runtime first: the service points at node\node.exe, so the
+    # path stays valid and the new bundle boots on the patched Node.
+    if ($stageNode -and (Test-Path $NodeStageDir)) {
+        $nodeBak = "$NodeDir.bak"
+        if (Test-Path $nodeBak) { Remove-Item $nodeBak -Recurse -Force }
+        if (Test-Path $NodeDir) { Rename-Item -Path $NodeDir -NewName "node.bak" -Force }
+        Rename-Item -Path $NodeStageDir -NewName "node" -Force
+        Write-Host "  -> Node.js runtime refreshed to $nodeWant." -ForegroundColor Gray
+    }
+
     $appBak = "$AppSrcDir.bak"
     if (Test-Path $appBak) { Remove-Item $appBak -Recurse -Force }
     if (Test-Path $AppSrcDir) { Rename-Item -Path $AppSrcDir -NewName "app.bak" -Force }
@@ -167,6 +217,8 @@ try {
     if (-not $svcAfter -or $svcAfter.Status -ne "Running") { throw "Jellyseerr service not Running after swap" }
 
     if (Test-Path $appBak) { Remove-Item $appBak -Recurse -Force }
+    $nodeBak = "$NodeDir.bak"
+    if (Test-Path $nodeBak) { Remove-Item $nodeBak -Recurse -Force -ErrorAction SilentlyContinue }
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "" }
 } catch {
@@ -183,6 +235,14 @@ try {
         if (Test-Path $AppSrcDir) { Remove-Item $AppSrcDir -Recurse -Force -ErrorAction SilentlyContinue }
         Rename-Item -Path $appBak -NewName "app" -Force
     }
+    # Restore the previous runtime too: the rollback must leave both halves of
+    # the update at the versions that were known to work together.
+    $nodeBak = "$NodeDir.bak"
+    if (Test-Path $nodeBak) {
+        if (Test-Path $NodeDir) { Remove-Item $NodeDir -Recurse -Force -ErrorAction SilentlyContinue }
+        Rename-Item -Path $nodeBak -NewName "node" -Force
+    }
+    if (Test-Path $NodeStageDir) { Remove-Item $NodeStageDir -Recurse -Force -ErrorAction SilentlyContinue }
     $null = Start-ServiceBounded -Name $ServiceName
     return [PSCustomObject]@{ App = $AppName; Status = "FAILED"; Installed = $installed; Target = $Version; Detail = $errMessage }
 }
