@@ -56,6 +56,30 @@ if ($newest -and $newest -lt $lastId) { $lastId = 0 }
 $fresh = @($events | Where-Object { $_.RecordId -gt $lastId } | Sort-Object RecordId)
 if ($fresh.Count -eq 0) { exit 0 }
 
+# Advance past everything that was scanned, including the events skipped below.
+# Keeping the last *exported* id would re-scan the same unusable events forever.
+$scannedThrough = $fresh[-1].RecordId
+
+# Only events with a routable source IP can ever yield an IP-scoped decision.
+# Local logon failures carry IpAddress '-' (the FlareSolverr service account is
+# the loudest source) and loopback clients cannot be banned.  crowdsecurity/
+# windows-auth still stores that raw value as meta.source_ip, after which
+# crowdsecurity/windows-bf fails every batch with
+#   "scope is Ip but '-' isn't a valid ip"
+# and geoip-enrich logs "failed to parse source_ip -" -- thousands of error
+# lines and a leaked bucket that never produces a decision.  Drop them here.
+$exportable = @($fresh | Where-Object {
+    $xml = $_.ToXml()
+    $ipText = if ($xml -match "<Data Name='IpAddress'>([^<]*)</Data>") { $Matches[1] } else { '' }
+    $parsed = $null
+    if (-not $ipText -or -not [System.Net.IPAddress]::TryParse($ipText, [ref]$parsed)) { return $false }
+    -not [System.Net.IPAddress]::IsLoopback($parsed)
+})
+if ($exportable.Count -eq 0) {
+    [System.IO.File]::WriteAllText($StateFile, [string]$scannedThrough, $Utf8NoBom)
+    exit 0
+}
+
 # Empty the spool when it grows past the cap.  Truncating to zero is safe where
 # rewriting is not: an empty file has nothing old to re-read, so the follower
 # simply resumes on our next append.
@@ -64,8 +88,8 @@ if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt $MaxBytes) {
 }
 
 # One XML event per line (strip CR/LF so CrowdSec sees one event per line).
-$lines = @($fresh | ForEach-Object { $_.ToXml() -replace '\r?\n', ' ' }) -join "`r`n"
+$lines = @($exportable | ForEach-Object { $_.ToXml() -replace '\r?\n', ' ' }) -join "`r`n"
 [System.IO.File]::AppendAllText($OutFile, $lines + "`r`n", $Utf8NoBom)
 
-[System.IO.File]::WriteAllText($StateFile, [string]$fresh[-1].RecordId, $Utf8NoBom)
+[System.IO.File]::WriteAllText($StateFile, [string]$scannedThrough, $Utf8NoBom)
 exit 0
