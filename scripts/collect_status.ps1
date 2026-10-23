@@ -309,10 +309,22 @@ if ($delugePassword -and $delugeWebOpen) {
 # Deluge Web UI (separate entry -- serves the browser interface)
 $delugeWebOk = $false
 if ($delugeWebOpen) {
-    try {
-        $webCheck = Invoke-WebRequest "http://127.0.0.1:$delugeWebPort" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        $delugeWebOk = ($webCheck.StatusCode -eq 200)
-    } catch {}
+    if ($delugeLoggedIn) {
+        # auth.login above already round-tripped through the Web UI's JSON-RPC.
+        # Fetching "/" re-renders the index, and the Windows build logs two
+        # "WebUI falling back to debug mode" warnings on every render (its
+        # pre-built "normal" mode scripts are absent) -- 576 lines a day in Loki.
+        $delugeWebOk = $true
+    } else {
+        try {
+            # GET /json is answered with 405 without rendering the UI; any HTTP
+            # response still proves the web server is serving.
+            $null = Invoke-WebRequest "http://127.0.0.1:$delugeWebPort/json" -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
+            $delugeWebOk = $true
+        } catch {
+            $delugeWebOk = [bool]($_.Exception.Response -and $_.Exception.Response.StatusCode.value__ -eq 405)
+        }
+    }
 }
 if ($delugeEnabled) {
     $svcs.Add((SvcEntry 'DelugeWeb' 'Deluge Web UI' $delugeWebOpen $delugeWebOk 0))
