@@ -45,17 +45,29 @@ $MountLetter = if ($Config.PSObject.Properties['RealDebrid'] -and $Config.RealDe
     $Config.RealDebrid.MountLetter.ToString().ToUpper().TrimEnd(':')
 } else { "R" }
 
-# Movies on MountLetter (e.g. R:\).  TV shows are NOT split onto a second
-# drive: zurg serves one flat __all__ tree and the WebDAV layer has no reliable
-# movies/shows split, which is why only a Movies library is provisioned.
+$TvMountLetter = "S"
+if ($Config.PSObject.Properties['RealDebrid'] -and $Config.RealDebrid.PSObject.Properties['TvMountLetter'] -and $Config.RealDebrid.TvMountLetter) {
+    $TvMountLetter = $Config.RealDebrid.TvMountLetter.ToString().ToUpper().TrimEnd(':')
+}
+
+# Zurg v1.0.0's `directories` block (written by 15_zurg.ps1) exposes the library
+# as zurg:movies and zurg:shows.  Each tree gets its own mount: MovieLetter is
+# movies only (its torrent folder names are unchanged, so an existing Jellyfin
+# movie library keeps valid paths), TvMountLetter is shows only.
 if ($MountLetter -notmatch '^[A-Y]$') {
     Write-Warning "[$AppName] MountLetter '$MountLetter' is not A-Y. Falling back to 'R'."
     Write-DebugLog "WARN" "Invalid MountLetter '$MountLetter'. Using default R."
     $MountLetter = "R"
 }
+if ($TvMountLetter -notmatch '^[A-Y]$' -or $TvMountLetter -eq $MountLetter) {
+    Write-Warning "[$AppName] TvMountLetter '$TvMountLetter' is invalid or equals MountLetter. Falling back to a free default."
+    Write-DebugLog "WARN" "Invalid/duplicate TvMountLetter '$TvMountLetter'."
+    $TvMountLetter = if ($MountLetter -ne 'S') { 'S' } else { 'T' }
+}
 $MovieLetter = $MountLetter
+$TvLetter    = $TvMountLetter
 
-Write-DebugLog "VAR MountLetter=$MountLetter MovieLetter=$MovieLetter"
+Write-DebugLog "VAR MountLetter=$MountLetter MovieLetter=$MovieLetter TvMountLetter=$TvLetter"
 
 if (Test-Path $LockFile) {
     Write-Host "[$AppName] Already installed. Skipping." -ForegroundColor Green
@@ -199,16 +211,19 @@ if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Forc
 
 # --dir-cache-time is the only thing that can invalidate a cached directory
 # listing: the WebDAV backend reports ChangeNotify=false, so rclone polls nothing.
-# At 5m, a listing taken while Zurg was still compiling __all__ stayed EMPTY on
+# At 5m, a listing taken while Zurg was still compiling its library stayed EMPTY on
 # R:\ for five minutes after Zurg already had content.  One minute still
 # collapses the repeated listings of a Jellyfin scan but bounds how long a
 # stale/empty root can survive.
 $CommonFlags = "--skip-links --read-only --vfs-cache-mode off --dir-cache-time 1m --no-modtime --buffer-size 64M --transfers 4 --log-level ERROR --config `"$RcloneConf`""
 
 $MoviesSvc  = "rclone-rd-movies"
-$MoviesMountArgs = "mount zurg:__all__ ${MovieLetter}:\ $CommonFlags"
+$TvSvc      = "rclone-rd-shows"
+$MoviesMountArgs = "mount zurg:movies ${MovieLetter}:\ $CommonFlags"
+$TvMountArgs     = "mount zurg:shows ${TvLetter}:\ $CommonFlags"
 
 Write-DebugLog "VAR MoviesSvc=$MoviesSvc MoviesMountArgs=$MoviesMountArgs"
+Write-DebugLog "VAR TvSvc=$TvSvc TvMountArgs=$TvMountArgs"
 
 # A letter that is already a local volume or network mapping makes the mount
 # fail; surface it here rather than as a warning after the service is registered.
@@ -216,6 +231,11 @@ $letterOwner = Get-PSDrive -Name $MovieLetter -PSProvider FileSystem -ErrorActio
 if ($letterOwner) {
     Write-Warning "     Drive ${MovieLetter}: is already in use (root: $($letterOwner.Root)). rclone cannot mount over an existing drive -- set a free RealDebrid.MountLetter in config.json."
     Write-DebugLog "WARN" "MountLetter ${MovieLetter}: already in use by $($letterOwner.Root)"
+}
+$tvLetterOwner = Get-PSDrive -Name $TvLetter -PSProvider FileSystem -ErrorAction SilentlyContinue
+if ($tvLetterOwner) {
+    Write-Warning "     Drive ${TvLetter}: is already in use (root: $($tvLetterOwner.Root)). rclone cannot mount over an existing drive -- set a free RealDebrid.TvMountLetter in config.json."
+    Write-DebugLog "WARN" "TvMountLetter ${TvLetter}: already in use by $($tvLetterOwner.Root)"
 }
 
 # -- 6. Register rclone-rd-movies NSSM service ----------------------------------
@@ -262,6 +282,39 @@ nssm set $MoviesSvc AppRestartDelay 5000 | Out-Null
 nssm set $MoviesSvc AppThrottle 30000 | Out-Null
 Write-DebugLog "INFO" "NSSM service '$MoviesSvc' registered (auto-restart on exit)"
 
+# -- 6b. Register rclone-rd-shows NSSM service ----------------------------------
+Write-Host "  -> Registering $TvSvc service (${TvLetter}:\)..." -ForegroundColor Gray
+
+$tvSvcExists = Get-Service -Name $TvSvc -ErrorAction SilentlyContinue
+if ($tvSvcExists) {
+    $null = Stop-ServiceBounded -Name $TvSvc
+    $waited = 0
+    while ((Get-Service -Name $TvSvc -ErrorAction SilentlyContinue).Status -eq 'StopPending' -and $waited -lt 30) {
+        Start-Sleep -Seconds 2; $waited += 2
+    }
+    nssm remove $TvSvc confirm | Out-Null
+    $waited = 0
+    while ($null -ne (Get-Service -Name $TvSvc -ErrorAction SilentlyContinue) -and $waited -lt 10) {
+        Start-Sleep -Seconds 1; $waited += 1
+    }
+}
+
+nssm install $TvSvc $RcloneExe | Out-Null
+nssm set $TvSvc AppDirectory $AppBinDir | Out-Null
+nssm set $TvSvc AppParameters $TvMountArgs | Out-Null
+nssm set $TvSvc AppStdout (Join-Path $LogDir "rclone-rd-shows.log") | Out-Null
+nssm set $TvSvc AppStderr (Join-Path $LogDir "rclone-rd-shows-error.log") | Out-Null
+nssm set $TvSvc AppRotateFiles 1 | Out-Null
+nssm set $TvSvc AppRotateBytes 5242880 | Out-Null
+# Same delayed-start/restart policy as the movies mount: Zurg must be listening
+# first, and rclone itself recovers from transient WebDAV outages.
+nssm set $TvSvc Start SERVICE_DELAYED_AUTO_START | Out-Null
+nssm set $TvSvc ObjectName "LocalSystem" | Out-Null
+nssm set $TvSvc AppExit Default Restart | Out-Null
+nssm set $TvSvc AppRestartDelay 5000 | Out-Null
+nssm set $TvSvc AppThrottle 30000 | Out-Null
+Write-DebugLog "INFO" "NSSM service '$TvSvc' registered (auto-restart on exit)"
+
 # -- 7. Wait for Zurg WebDAV before starting rclone -----------------------------
 # Zurg starts its HTTP server asynchronously after network tests. rclone connects
 # to Zurg's WebDAV on port 9999 at mount time. If we start rclone before Zurg is
@@ -296,9 +349,9 @@ if (-not $zurgReady) {
     Write-DebugLog "WARN" "Zurg WebDAV at $zurgDavUrl not ready after ${zurgWaited}s"
 }
 
-# -- 7b. Wait until Zurg's __all__ can be enumerated ----------------------------
+# -- 7b. Wait until Zurg's movies tree can be enumerated ------------------------
 # A listening port is not a ready mount.  Zurg opens the WebDAV listener as soon
-# as its network test finishes but keeps __all__ EMPTY until the manager has
+# as its network test finishes but keeps its trees EMPTY until the manager has
 # fetched and compiled every torrent: measured ~31 s to listen versus 5m01s to
 # "Finished compiling 551 unique torrents" for 567 torrents.  rclone caches the
 # first listing of a directory for --dir-cache-time and the WebDAV backend has
@@ -306,12 +359,12 @@ if (-not $zurgReady) {
 # a full five minutes.  Layer 2's own 240 s wait starts later, so it expired
 # before the cache did and the Jellyfin scan was deferred.  Blocking here -- the
 # component that owns the mount -- is what lets the scan fire during the install.
-$zurgIndexUrl     = "http://127.0.0.1:$ZurgPort/dav/__all__/"
+$zurgIndexUrl     = "http://127.0.0.1:$ZurgPort/dav/movies/"
 $zurgIndexReady   = $false
 $zurgIndexEntries = 0
 $zurgIndexStart   = Get-Date
 if ($zurgReady) {
-    Write-Host "  -> Waiting for Zurg to build its __all__ listing..." -ForegroundColor Gray
+    Write-Host "  -> Waiting for Zurg to build its movies listing..." -ForegroundColor Gray
     $zurgIndexDeadline = $zurgIndexStart.AddSeconds(600)
     $nextIndexLog      = 60
     while (-not $zurgIndexReady -and (Get-Date) -lt $zurgIndexDeadline) {
@@ -330,7 +383,7 @@ if ($zurgReady) {
             $indexWaited = [int]((Get-Date) - $zurgIndexStart).TotalSeconds
             if ($indexWaited -ge $nextIndexLog) {
                 Write-Host "     ... Zurg is still compiling its torrent cache (${indexWaited}s elapsed)." -ForegroundColor DarkGray
-                Write-DebugLog "INFO" "Zurg __all__ still empty after ${indexWaited}s"
+                Write-DebugLog "INFO" "Zurg movies tree still empty after ${indexWaited}s"
                 $nextIndexLog += 60
             }
             Start-Sleep -Seconds 5
@@ -338,13 +391,13 @@ if ($zurgReady) {
     }
 }
 $zurgIndexWaited = if ($zurgReady) { [int]((Get-Date) - $zurgIndexStart).TotalSeconds } else { 0 }
-Write-DebugLog "VAR Zurg __all__ ready=$zurgIndexReady entries=$zurgIndexEntries waited=${zurgIndexWaited}s"
+Write-DebugLog "VAR Zurg movies ready=$zurgIndexReady entries=$zurgIndexEntries waited=${zurgIndexWaited}s"
 if ($zurgIndexReady) {
-    Write-Host "     OK Zurg __all__ lists $zurgIndexEntries entries (${zurgIndexWaited}s)." -ForegroundColor Green
+    Write-Host "     OK Zurg movies tree lists $zurgIndexEntries entries (${zurgIndexWaited}s)." -ForegroundColor Green
 } elseif ($zurgReady) {
-    Write-Warning "     Zurg __all__ still empty after ${zurgIndexWaited}s. The mount will start empty, so the Jellyfin scan may be deferred until rclone's directory cache expires."
+    Write-Warning "     Zurg movies tree still empty after ${zurgIndexWaited}s. The mount will start empty, so the Jellyfin scan may be deferred until rclone's directory cache expires."
     Write-Warning "     An empty Real-Debrid account looks the same; otherwise check $InstallDir\logs\zurg.log."
-    Write-DebugLog "WARN" "Zurg __all__ not enumerable after ${zurgIndexWaited}s"
+    Write-DebugLog "WARN" "Zurg movies tree not enumerable after ${zurgIndexWaited}s"
 }
 
 # -- 8. Start service -----------------------------------------------------------
@@ -401,6 +454,38 @@ if ($mSvcRunning -and $mountOk) {
     Write-DebugLog "WARN" "$MoviesSvc status=$mSvcStatus"
 }
 
+# -- 8b. Start and verify the shows mount --------------------------------------
+Write-Host "  -> Starting $TvSvc..." -ForegroundColor Gray
+$null = Start-ServiceBounded -Name $TvSvc
+
+$tSvc = $null
+$tPollDeadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $tPollDeadline) {
+    $tSvc = Get-Service -Name $TvSvc -ErrorAction SilentlyContinue
+    if ($tSvc -and $tSvc.Status -eq "Running") { break }
+    if ($tSvc -and $tSvc.Status -ne "StartPending") { break }
+    Start-Sleep -Seconds 2
+}
+if (-not $tSvc) { $tSvc = Get-Service -Name $TvSvc -ErrorAction SilentlyContinue }
+
+$tSvcStatus = if ($tSvc) { $tSvc.Status } else { "NOT FOUND" }
+$tSvcRunning = [bool]($tSvc -and $tSvc.Status -eq "Running")
+Write-DebugLog "VAR $TvSvc status=$tSvcStatus"
+
+# A shows tree with zero entries is a valid library, so presence of the drive
+# letter -- not an entry count -- is the readiness signal here.
+$tvMounted = Test-Path "${TvLetter}:\"
+if ($tSvcRunning -and $tvMounted) {
+    Write-Host "     OK $TvSvc running (${TvLetter}:\)" -ForegroundColor Green
+    Write-DebugLog "INFO" "$TvSvc running, mount at ${TvLetter}:\ present"
+} elseif ($tSvcRunning) {
+    Write-Warning "     $TvSvc running but ${TvLetter}:\ is not present yet. The mount may still be warming up."
+    Write-DebugLog "WARN" "$TvSvc running but drive ${TvLetter}:\ not found"
+} else {
+    Write-Warning "     $TvSvc not running (status: $tSvcStatus). Check $LogDir\rclone-rd-shows-error.log."
+    Write-DebugLog "WARN" "$TvSvc status=$tSvcStatus"
+}
+
 # -- 9. Write lock file ---------------------------------------------------------
 # Only a running mount service counts as installed.  Writing the lock file (and
 # the ledger entry) after a failed start would make every later run report
@@ -409,9 +494,9 @@ if ($mSvcRunning -and $mountOk) {
 # check above is deliberately not part of this decision: WinFsp mount points are
 # per session, so an installer running in an interactive session may not see a
 # perfectly healthy mount.
-if (-not $mSvcRunning) {
-    Write-Warning "[$AppName] Install incomplete: service '$MoviesSvc' is $mSvcStatus. Not writing the lock file so a re-run retries."
-    Write-DebugLog "ERROR" "$MoviesSvc not running ($mSvcStatus); lock file and ledger entry not written"
+if (-not $mSvcRunning -or -not $tSvcRunning) {
+    Write-Warning "[$AppName] Install incomplete: '$MoviesSvc'=$mSvcStatus, '$TvSvc'=$tSvcStatus. Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "$MoviesSvc=$mSvcStatus / $TvSvc=$tSvcStatus; lock file and ledger entry not written"
     exit 1
 }
 
@@ -427,5 +512,5 @@ if (-not $rcloneVer) {
     $rcloneVer = Detect-InstalledVersion -AppName "rclone" -Entry $rcloneEntry -InstallDir $InstallDir
 }
 if ($rcloneVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "rclone" -Version $rcloneVer }
-Write-Host "  OK $AppName installed (movies: ${MovieLetter}:\)." -ForegroundColor Green
+Write-Host "  OK $AppName installed (movies: ${MovieLetter}:\, shows: ${TvLetter}:\)." -ForegroundColor Green
 Write-DebugLog "INFO" "16_rclone.ps1 complete. Lock file written: $LockFile"

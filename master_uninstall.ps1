@@ -261,7 +261,7 @@ if (Test-Path $DelugeStateDir) {
 $AllServices = @(
     "IPBan", "Caddy", "php-cgi", "Sonarr", "Radarr", "Prowlarr", "Bazarr",
     "DelugeDaemon", "DelugeWeb", "Flaresolverr", "Jellyseerr",
-    "Grafana", "Loki", "Alloy", "rclone-rd-movies", "rclone-rd", "Zurg"
+    "Grafana", "Loki", "Alloy", "rclone-rd-movies", "rclone-rd-shows", "rclone-rd", "Zurg"
 )
 Write-Host "  -> Stopping all services in parallel..." -ForegroundColor Yellow
 Stop-ServicesBounded -Names $AllServices
@@ -296,36 +296,43 @@ if (-not (Test-Path $rclonePath)) {
 }
 Write-DebugLog "VAR rclone executable = $rclonePath"
 
-$rdMountLetter = $null
-if ($Config -and $Config.PSObject.Properties['RealDebrid'] -and $Config.RealDebrid -and
-    $Config.RealDebrid.PSObject.Properties['MountLetter'] -and $Config.RealDebrid.MountLetter) {
-    $rdMountLetter = [string]$Config.RealDebrid.MountLetter
+# Two mounts since the Zurg movies/shows split: MountLetter (movies) and
+# TvMountLetter (shows). Older configs only carry MountLetter; both are tolerated.
+$rdMountLetters = @()
+foreach ($key in @('MountLetter', 'TvMountLetter')) {
+    if ($Config -and $Config.PSObject.Properties['RealDebrid'] -and $Config.RealDebrid -and
+        $Config.RealDebrid.PSObject.Properties[$key] -and $Config.RealDebrid.$key) {
+        $letter = ([string]$Config.RealDebrid.$key).ToUpper().TrimEnd(':')
+        if ($letter -and $rdMountLetters -notcontains $letter) { $rdMountLetters += $letter }
+    }
 }
 
-if ($rclonePath -and $rdMountLetter) {
-    $mountLetter = $rdMountLetter
-    $mountPath   = "${mountLetter}:\"
-    Write-DebugLog "VAR Checking mount path=$mountPath exists=$(Test-Path $mountPath)"
-    if (Test-Path $mountPath) {
-        Write-Host "  -> Unmounting rclone drive ${mountLetter}: ..." -ForegroundColor Yellow
-        Write-DebugLog "INFO" "Unmounting rclone drive $mountLetter before service removal"
-        try {
-            & $rclonePath unmount "${mountLetter}:" 2>&1 | Out-Null
-            Write-Host "  -> rclone drive ${mountLetter}: unmounted." -ForegroundColor Yellow
-            Write-DebugLog "INFO" "rclone unmount ${mountLetter}: succeeded"
-        } catch {
-            Write-Warning "  -> rclone unmount ${mountLetter}: failed (may need manual unmount after reboot): $_"
-            Write-DebugLog "WARN" "rclone unmount ${mountLetter}: failed: $_"
+if ($rclonePath -and $rdMountLetters.Count -gt 0) {
+    foreach ($mountLetter in $rdMountLetters) {
+        $mountPath = "${mountLetter}:\"
+        Write-DebugLog "VAR Checking mount path=$mountPath exists=$(Test-Path $mountPath)"
+        if (Test-Path $mountPath) {
+            Write-Host "  -> Unmounting rclone drive ${mountLetter}: ..." -ForegroundColor Yellow
+            Write-DebugLog "INFO" "Unmounting rclone drive $mountLetter before service removal"
+            try {
+                & $rclonePath unmount "${mountLetter}:" 2>&1 | Out-Null
+                Write-Host "  -> rclone drive ${mountLetter}: unmounted." -ForegroundColor Yellow
+                Write-DebugLog "INFO" "rclone unmount ${mountLetter}: succeeded"
+            } catch {
+                Write-Warning "  -> rclone unmount ${mountLetter}: failed (may need manual unmount after reboot): $_"
+                Write-DebugLog "WARN" "rclone unmount ${mountLetter}: failed: $_"
+            }
+        } else {
+            Write-DebugLog "INFO" "No rclone mount at $mountPath; skipping unmount"
         }
-    } else {
-        Write-DebugLog "INFO" "No rclone mount at $mountPath; skipping unmount"
     }
 } elseif ($rclonePath) {
-    Write-DebugLog "INFO" "rclone found but config.json has no RealDebrid.MountLetter; skipping unmount"
+    Write-DebugLog "INFO" "rclone found but config.json has no RealDebrid.MountLetter/TvMountLetter; skipping unmount"
 } else {
     Write-DebugLog "INFO" "rclone.exe not found (PATH or $InstallDir\rclone); skipping unmount"
 }
 Remove-NssmService "rclone-rd-movies"
+Remove-NssmService "rclone-rd-shows"
 Remove-NssmService "rclone-rd"
 Remove-NssmService "Zurg"
 

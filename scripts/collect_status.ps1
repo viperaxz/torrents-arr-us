@@ -388,16 +388,26 @@ if ($Config.Apps.RealDebrid -eq $true) {
     $zurgCheck = QuickGet 'http://127.0.0.1:9999/'
     $svcs.Add((SvcEntry 'Zurg' 'Zurg' (TcpOpen 9999) $zurgCheck.ok $zurgCheck.ms))
 
-    $ml = if ($Config.RealDebrid -and $Config.RealDebrid.MountLetter) { $Config.RealDebrid.MountLetter.ToString().ToUpper().TrimEnd(':') } else { 'R' }
-    $mounted = Test-Path "$ml`:\"
-    SetState 'rclone-rd-movies' $mounted
-    $st = GetState 'rclone-rd-movies'
-    $svcs.Add([ordered]@{
-        name = 'rclone-rd-movies'; state = if ($sv = Get-Service 'rclone-rd-movies' -ErrorAction SilentlyContinue) { $sv.Status.ToString() } else { $null }
-        port_open = $null; api_ok = $mounted; api_latency_ms = 0
-        drive = "$ml`:"; drive_mounted = $mounted
-        consecutive_ok = $st.consecutive_ok; last_ok = $st.last_ok; last_fail = $st.last_fail
-    })
+    # Two mounts since the Zurg movies/shows split (zurg:movies, zurg:shows).
+    $mountSpecs = @(
+        @{ Svc = 'rclone-rd-movies'; Key = 'MountLetter';   Default = 'R' },
+        @{ Svc = 'rclone-rd-shows';  Key = 'TvMountLetter'; Default = 'S' }
+    )
+    foreach ($ms in $mountSpecs) {
+        $letter = if ($Config.RealDebrid -and $Config.RealDebrid.PSObject.Properties[$ms.Key] -and $Config.RealDebrid.($ms.Key)) {
+            $Config.RealDebrid.($ms.Key).ToString().ToUpper().TrimEnd(':')
+        } else { $ms.Default }
+        $drive   = "$letter`:"
+        $mounted = Test-Path "$letter`:\"
+        SetState $ms.Svc $mounted
+        $st = GetState $ms.Svc
+        $svcs.Add([ordered]@{
+            name = $ms.Svc; state = if ($sv = Get-Service $ms.Svc -ErrorAction SilentlyContinue) { $sv.Status.ToString() } else { $null }
+            port_open = $null; api_ok = $mounted; api_latency_ms = 0
+            drive = $drive; drive_mounted = $mounted
+            consecutive_ok = $st.consecutive_ok; last_ok = $st.last_ok; last_fail = $st.last_fail
+        })
+    }
 }
 
 # Local LLM backend (optional, externally managed -- never installed by this project)

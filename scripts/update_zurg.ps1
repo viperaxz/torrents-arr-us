@@ -94,6 +94,35 @@ try {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 
+    # One-time migration for installs created before the movies/shows split:
+    # add Zurg's `directories` block so the rclone mounts (zurg:movies /
+    # zurg:shows) have something to mount.  Only a successful swap reaches here,
+    # and the extra restart happens just once per install.
+    $zurgCfgPath = Join-Path $InstallDir "Zurg\config.yml"
+    if (Test-Path $zurgCfgPath) {
+        $zurgCfgText = [System.IO.File]::ReadAllText($zurgCfgPath)
+        if ($zurgCfgText -notmatch '(?m)^directories:') {
+            $dirBlock = @"
+
+directories:
+  shows:
+    group: media
+    group_order: 10
+    filters:
+      - has_episodes: true
+  movies:
+    group: media
+    group_order: 20
+    only_show_the_biggest_file: true
+    filters:
+      - regex: /.*/
+"@
+            [System.IO.File]::AppendAllText($zurgCfgPath, $dirBlock, (New-Object System.Text.UTF8Encoding($false)))
+            $null = Restart-ServiceBounded -Name $ServiceName -StopTimeoutSeconds 60 -StartTimeoutSeconds 120
+            Write-UcLog "INFO" "Added Zurg directories (movies/shows split) and restarted $ServiceName"
+        }
+    }
+
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "exe swapped, WebDAV listener verified" }
 } catch {

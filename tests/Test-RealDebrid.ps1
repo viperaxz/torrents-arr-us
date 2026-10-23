@@ -13,12 +13,14 @@ if ($Config.Apps.RealDebrid -ne $true) {
 # host's RealDebrid config section has no port key.
 $zurgPort = 9999
 
-# MountLetter is the base letter and the installer mounts exactly one drive:
-# movies, from zurg's __all__ tree.  TV shows are NOT split onto a second drive
-# (the WebDAV layer cannot separate them), so only this one drive is expected.
+# Two drives since the Zurg `directories` split: MountLetter carries zurg:movies,
+# TvMountLetter carries zurg:shows.  Same fallbacks as scripts/16_rclone.ps1.
 $ml     = if ($Config.RealDebrid -and $Config.RealDebrid.MountLetter) { $Config.RealDebrid.MountLetter.ToString().ToUpper().TrimEnd(':') } else { 'R' }
-if ($ml -notmatch '^[A-Y]$') { $ml = 'R' }   # same fallback as scripts/16_rclone.ps1
+if ($ml -notmatch '^[A-Y]$') { $ml = 'R' }
+$tl     = if ($Config.RealDebrid -and $Config.RealDebrid.PSObject.Properties['TvMountLetter'] -and $Config.RealDebrid.TvMountLetter) { $Config.RealDebrid.TvMountLetter.ToString().ToUpper().TrimEnd(':') } else { 'S' }
+if ($tl -notmatch '^[A-Y]$' -or $tl -eq $ml) { $tl = if ($ml -ne 'S') { 'S' } else { 'T' } }
 $mDrive = "$ml`:"
+$tDrive = "$tl`:"
 
 # A WinFsp drive letter belongs to the Windows session that created it.  The
 # mount is created by the rclone-rd-movies service in session 0, so when this
@@ -78,6 +80,15 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     } else {
         $Script:Results.Add((New-TestResult $svc 1 "DriveMoviesMounted_$mDrive" 'SKIP' "Drive $mDrive is owned by the rclone-rd-movies service session (0) and is not visible from this session -- verify from a service context"))
     }
+
+    $tMounted = Test-Path "$tDrive\"
+    if ($tMounted) {
+        $Script:Results.Add((New-TestResult $svc 1 "DriveShowsMounted_$tDrive" 'PASS' "Shows drive $tDrive mounted"))
+    } elseif ($mountVisibleHere) {
+        $Script:Results.Add((New-TestResult $svc 1 "DriveShowsMounted_$tDrive" 'FAIL' "Shows drive $tDrive not mounted"))
+    } else {
+        $Script:Results.Add((New-TestResult $svc 1 "DriveShowsMounted_$tDrive" 'SKIP' "Drive $tDrive is owned by the rclone-rd-shows service session (0) and is not visible from this session -- verify from a service context"))
+    }
 }
 
 # -- Layer 2: Jellyfin RD library points at the mount letter ------------------
@@ -101,6 +112,8 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
             $libPaths = @($libs.data | ForEach-Object { $_.Locations } | ForEach-Object { $_ })
             $hasMovieDrive = $libPaths | Where-Object { $_ -match "^$([regex]::Escape($mDrive))" }
             $Script:Results.Add((New-TestResult $svc 2 "JellyfinMoviesRD" $(if ($hasMovieDrive) { 'PASS' } else { 'WARN' }) "Jellyfin library on $mDrive"))
+            $hasTvDrive = $libPaths | Where-Object { $_ -match "^$([regex]::Escape($tDrive))" }
+            $Script:Results.Add((New-TestResult $svc 2 "JellyfinShowsRD" $(if ($hasTvDrive) { 'PASS' } else { 'WARN' }) "Jellyfin library on $tDrive"))
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'JellyfinLibraries' 'FAIL' $libs.error))
         }
@@ -118,5 +131,15 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
         $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$mDrive" 'SKIP' "Drive $mDrive belongs to the rclone-rd-movies service session (0) -- not visible from this session"))
     } else {
         $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$mDrive" 'FAIL' "Drive $mDrive not mounted"))
+    }
+
+    if (Test-Path "$tDrive\") {
+        $tItems = @(Get-ChildItem "$tDrive\" -ErrorAction SilentlyContinue)
+        # Zero entries is a valid shows tree; it just means no episode torrents.
+        $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$tDrive" $(if ($tItems.Count -gt 0) { 'PASS' } else { 'WARN' }) "$($tItems.Count) item(s) in $tDrive"))
+    } elseif (-not $mountVisibleHere) {
+        $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$tDrive" 'SKIP' "Drive $tDrive belongs to the rclone-rd-shows service session (0) -- not visible from this session"))
+    } else {
+        $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$tDrive" 'FAIL' "Drive $tDrive not mounted"))
     }
 }

@@ -32,7 +32,8 @@
   },
   "RealDebrid": {
     "ApiKey": "",
-    "MountLetter": "R"
+    "MountLetter": "R",
+    "TvMountLetter": "S"
   },
   "LLM": {
     "Enabled": false,
@@ -201,6 +202,16 @@
           "Name": "RD Movies",
           "Path": "R:\\",
           "Type": "movies",
+          "Lean": {
+            "DisableVideoExtraction": true,
+            "DisableMetadata": false,
+            "DisableImages": false
+          }
+        },
+        {
+          "Name": "RD TV Shows",
+          "Path": "S:\\",
+          "Type": "tvshows",
           "Lean": {
             "DisableVideoExtraction": true,
             "DisableMetadata": false,

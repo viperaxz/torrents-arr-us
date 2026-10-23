@@ -132,8 +132,11 @@ Write-DebugLog "VAR ZurgConfig=$ZurgConfig"
 
 $ZurgPort = 9999
 # v1.0.0+ uses the zurg-public stable release channel.
-# __all__ is the built-in directory that exposes all torrents at the WebDAV root.
-# rclone mounts zurg:__all__ so torrent folders appear directly at the drive root.
+# The `directories` block is zurg's supported movies/shows split: has_episodes
+# routes episode-bearing torrents to zurg:shows, everything else (biggest file
+# only) to zurg:movies.  rclone mounts those two trees on separate letters so
+# Jellyfin gets a real Movies library and a real TV library instead of one
+# flat __all__ tree that cannot tell them apart.
 # host pins the WebDAV endpoint to loopback: zurg's default is "[::]" (every
 # interface) and the endpoint is unauthenticated, so without this the whole
 # Real-Debrid library is published to the LAN.  Nothing in this suite reaches
@@ -148,6 +151,18 @@ check_for_changes_every_secs: 15
 enable_repair: true
 enable_thorough_hash_check: false
 cache_network_test_results: true
+directories:
+  shows:
+    group: media
+    group_order: 10
+    filters:
+      - has_episodes: true
+  movies:
+    group: media
+    group_order: 20
+    only_show_the_biggest_file: true
+    filters:
+      - regex: /.*/
 "@
 
 # No BOM: the file is parsed by Go's YAML reader, which is happiest with plain UTF-8.

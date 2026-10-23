@@ -1,8 +1,8 @@
 ﻿# update_rclone.ps1
 # Per-app update script: rclone (GitHub zip, single-exe swap).
 # The rclone directory also holds rclone.conf, so only rclone.exe is replaced.
-# After the swap the movies mount must be visible at the configured drive
-# letter, otherwise the swap is rolled back.
+# Both mount services (movies + shows) are stopped and restarted, and both drive
+# letters must answer a real readdir, otherwise the swap is rolled back.
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$InstallDir,
@@ -17,7 +17,6 @@ $ErrorActionPreference = "Stop"
 $Config = Initialize-UpdateScript -Config $Config
 
 $AppName     = "rclone"
-$ServiceName = "rclone-rd-movies"
 $ExePath     = Join-Path $InstallDir "rclone\rclone.exe"
 
 $mountLetter = "R"
@@ -26,10 +25,27 @@ if ($Config.PSObject.Properties["RealDebrid"] -and $Config.RealDebrid.MountLette
 }
 if ($mountLetter -notmatch '^[A-Y]$') { $mountLetter = "R" }   # same fallback as scripts/16_rclone.ps1
 
+$tvMountLetter = "S"
+if ($Config.PSObject.Properties["RealDebrid"] -and $Config.RealDebrid.PSObject.Properties["TvMountLetter"] -and $Config.RealDebrid.TvMountLetter) {
+    $tvMountLetter = $Config.RealDebrid.TvMountLetter.ToString().ToUpper().TrimEnd(':')
+}
+if ($tvMountLetter -notmatch '^[A-Y]$' -or $tvMountLetter -eq $mountLetter) {
+    $tvMountLetter = if ($mountLetter -ne 'S') { 'S' } else { 'T' }
+}
+
+# Both mount services hold rclone.exe open, so both must stop for the exe swap.
+# Older installs only have the movies service; only the services that exist are
+# passed to the swap helper (a missing one would fail its health gate).
+$ServiceNames = @(@("rclone-rd-movies", "rclone-rd-shows") | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+if ($ServiceNames.Count -eq 0) { $ServiceNames = @("rclone-rd-movies") }
+
+$checkLetters = @($mountLetter)
+if ($ServiceNames -contains "rclone-rd-shows") { $checkLetters += $tvMountLetter }
+
 $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $AppName
 
 if ($WhatIf) {
-    return [PSCustomObject]@{ App = $AppName; Status = "DRYRUN"; Installed = $installed; Target = $Version; Detail = "single-exe swap (service: $ServiceName, mount: ${mountLetter}:\)" }
+    return [PSCustomObject]@{ App = $AppName; Status = "DRYRUN"; Installed = $installed; Target = $Version; Detail = "single-exe swap (services: $($ServiceNames -join ', '), mounts: $(($checkLetters | ForEach-Object { "$_`:" }) -join ', '))" }
 }
 if (-not $installed -or $installed -ieq "unknown") {
     return [PSCustomObject]@{ App = $AppName; Status = "SKIPPED"; Installed = $installed; Target = $Version; Detail = "not installed or installed version unknown" }
@@ -51,11 +67,18 @@ try {
     if (-not $newExe) { throw "rclone.exe not found in archive" }
 
     # Test-Path alone passes while the mount root still cannot serve directory
-    # listings (Zurg rebuilding __all__ right after a restart), which is exactly
+    # listings (Zurg rebuilding its trees right after a restart), which is exactly
     # the state a bad swap leaves behind.  A real readdir is the reliable signal.
-    $mountCheck = { param() try { $null = Get-ChildItem "${mountLetter}:\" -ErrorAction Stop; $true } catch { $false } }
+    # Every mounted drive must answer: a stale shows mount is still a failed update.
+    $mountCheck = {
+        param()
+        foreach ($l in $checkLetters) {
+            try { $null = Get-ChildItem "${l}:\" -ErrorAction Stop } catch { return $false }
+        }
+        return $true
+    }
     $swap = Swap-SingleExeWithRollback -AppName $AppName -ExePath $ExePath `
-                -NewExePath $newExe.FullName -ServiceNames @($ServiceName) -HealthSeconds 15 -PostHealthCheck $mountCheck
+                -NewExePath $newExe.FullName -ServiceNames $ServiceNames -HealthSeconds 15 -PostHealthCheck $mountCheck
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 

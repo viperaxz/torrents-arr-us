@@ -77,7 +77,7 @@ Internet
 | **CrowdSec** | Intrusion detection — parses logs, issues ban decisions | 8080 (LAPI, localhost only) | MSI Windows Service (LocalSystem) |
 | **CrowdSec FW bouncer** | Intrusion prevention — applies decisions to Windows Firewall | — | MSI Windows Service (LocalSystem) |
 | **Zurg** | Real-Debrid WebDAV bridge (optional) | — | NSSM Windows Service (runs as seedbox-svc) |
-| **rclone** | Mounts Zurg WebDAV as a drive letter via WinFsp (optional) | — | One NSSM Windows Service: `rclone-rd-movies` |
+| **rclone** | Mounts Zurg WebDAV as drive letters via WinFsp (optional) | — | Two NSSM Windows Services: `rclone-rd-movies` (`zurg:movies`), `rclone-rd-shows` (`zurg:shows`) |
 
 ---
 
@@ -215,10 +215,10 @@ CrowdSec splits into two independent components, and **both are required** — t
 
 ### Real-Debrid Integration (Zurg + rclone)
 - Enabled when `Apps.RealDebrid = true` and `RealDebrid.ApiKey` is set.
-- **Zurg** (`scripts/15_zurg.ps1`) — downloads the latest release from `debridmediamanager/zurg-public`; generates `config.yml` pointing at the RD API; creates an NSSM service under `seedbox-svc`. The rclone mount uses `zurg:__all__` to expose all torrents at the drive root — Jellyfin classifies movies vs shows by filename pattern. The generated `config.yml` pins `host: 127.0.0.1` (Zurg's WebDAV endpoint is unauthenticated, so it is deliberately loopback-only) and gets an explicit ACL — full control for Administrators/SYSTEM, modify for `seedbox-svc` — because the file holds the Real-Debrid API token.
-- **rclone** (`scripts/16_rclone.ps1`) — installs WinFsp (required for FUSE-style mounts on Windows) via Chocolatey; downloads rclone from GitHub; creates one NSSM service: `rclone-rd-movies` mounts `zurg:__all__` at `<MountLetter>:\` (default `R:\`). TV shows are not provisioned as a separate mount because Zurg's WebDAV layer cannot reliably separate shows from movies — Jellyfin classifies the mounted content by filename pattern instead.
+- **Zurg** (`scripts/15_zurg.ps1`) — downloads the latest release from `debridmediamanager/zurg-public`; generates `config.yml` pointing at the RD API; creates an NSSM service under `seedbox-svc`. The generated config carries a `directories` block — zurg's supported split: `has_episodes` routes episode torrents to `zurg:shows`, everything else (biggest file only) to `zurg:movies`. The generated `config.yml` pins `host: 127.0.0.1` (Zurg's WebDAV endpoint is unauthenticated, so it is deliberately loopback-only) and gets an explicit ACL — full control for Administrators/SYSTEM, modify for `seedbox-svc` — because the file holds the Real-Debrid API token.
+- **rclone** (`scripts/16_rclone.ps1`) — installs WinFsp (required for FUSE-style mounts on Windows) via Chocolatey; downloads rclone from GitHub; creates two NSSM services: `rclone-rd-movies` mounts `zurg:movies` at `<MountLetter>:\` (default `R:\`) and `rclone-rd-shows` mounts `zurg:shows` at `<TvMountLetter>:\` (default `S:\`). The movie tree keeps the same torrent folder names as the old `__all__` mount, so an existing Jellyfin movie library keeps valid paths; shows live on their own drive and get a real TV library.
 - **Lean library flags** — `Layer2.Jellyfin.MediaLibraries` entries accept an optional `Lean` object with three independent booleans: `DisableVideoExtraction` (skips chapter image extraction and trickplay, always recommended for remote content), `DisableMetadata` (skips TMDb fetchers), `DisableImages` (skips poster/backdrop downloads). Lean libraries also get photo scanning disabled, and Layer 2 caps the **global** `ImageExtractionTimeoutMs` at 1000 ms: Jellyfin 12.x exposes no per-library switch for its embedded-artwork extractor (`EmbeddedImageProvider` is an `IDynamicImageProvider`), which otherwise reads each image-less item over WebDAV for up to the 10 s default during a scan.
-- **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`).
+- **Config additions** — `RealDebrid.ApiKey`, `RealDebrid.MountLetter` (default `"R"`, movies), `RealDebrid.TvMountLetter` (default `"S"`, shows).
 
 ### Optional LLM Reverse Proxy (bring-your-own backend)
 - Enabled by `LLM.Enabled = true` in `config.json`; the project **never installs or manages the LLM itself** — the user runs the backend (Strata, Ollama, LM Studio, or any OpenAI-compatible server) separately, bound to loopback.
@@ -288,8 +288,9 @@ CrowdSec splits into two independent components, and **both are required** — t
     "RealDebrid": false   // Zurg + rclone Real-Debrid mount
   },
   "RealDebrid": {
-    "ApiKey":      "...",  // Real-Debrid API key
-    "MountLetter": "R"     // the RD library is mounted on R:\
+    "ApiKey":       "...",  // Real-Debrid API key
+    "MountLetter":  "R",    // zurg:movies is mounted on R:\
+    "TvMountLetter": "S"    // zurg:shows is mounted on S:\
   },
   "LLM": {
     "Enabled":      false,       // publish an externally managed LLM via Caddy
@@ -519,15 +520,16 @@ Also exposed as `grafana_enable.ps1` (root-level) — sets `Apps.Grafana = true`
 #### `scripts/15_zurg.ps1`
 Installs Zurg, the Real-Debrid WebDAV bridge. Enabled when `Apps.RealDebrid = true` and `RealDebrid.ApiKey` is non-empty.
 - Downloads the latest Windows amd64 binary from `debridmediamanager/zurg-public` GitHub releases; caches in `bin/`.
-- Generates `config.yml` in the Zurg install directory with the `__all__` mount path (no regex filters — workaround for the `compilePattern()` panic in v0.9.3-final; see memory entry `project_zurg_bug.md`) and pins `host: 127.0.0.1`, so the unauthenticated WebDAV endpoint never listens on the LAN. The file holds the Real-Debrid API token, so it is written BOM-free and given an explicit ACL (Administrators/SYSTEM full control, `seedbox-svc` modify — Zurg rewrites the file on startup).
+- Generates `config.yml` in the Zurg install directory with the `directories` movies/shows split (`has_episodes` → `zurg:shows`; everything else → `zurg:movies`, biggest file only) and pins `host: 127.0.0.1`, so the unauthenticated WebDAV endpoint never listens on the LAN. The file holds the Real-Debrid API token, so it is written BOM-free and given an explicit ACL (Administrators/SYSTEM full control, `seedbox-svc` modify — Zurg rewrites the file on startup).
 - Creates an NSSM service under `seedbox-svc`; waits up to 30 seconds for the WebDAV endpoint to respond.
 
 #### `scripts/16_rclone.ps1`
-Installs rclone and creates one NSSM mount service. Enabled when `Apps.RealDebrid = true`.
+Installs rclone and creates two NSSM mount services. Enabled when `Apps.RealDebrid = true`.
 - Installs **WinFsp** via Chocolatey (required for FUSE-style drive mounts on Windows).
 - Downloads rclone from GitHub releases; creates a minimal `rclone.conf` pointing at the Zurg WebDAV endpoint (`http://127.0.0.1:9999`).
-- Creates `rclone-rd-movies` service: mounts `zurg:__all__` at `<MountLetter>:\` (default `R:\`).
-- The service depends on `Zurg` (via NSSM `DependOnService`) so it starts after Zurg is ready; this dependency is skipped if Zurg is not installed.
+- Creates `rclone-rd-movies` (mounts `zurg:movies` at `<MountLetter>:\`, default `R:\`) and `rclone-rd-shows` (mounts `zurg:shows` at `<TvMountLetter>:\`, default `S:\`).
+- Both services are `SERVICE_DELAYED_AUTO_START` under LocalSystem with `AppExit Default Restart` (5 s): no `DependOnService` is used, because SCM would stop the mount when Zurg restarts; rclone recovers from transient WebDAV outages itself.
+- Readiness: waits for `zurg:movies` to list at least one entry (Zurg publishes its trees only after compiling the torrent cache), then verifies both services are Running and both drive letters exist before writing the lock file.
 
 #### `scripts/12_security.ps1`
 Two-phase security installer (see [Security Layer](#security-layer) in Feature Summary for full design rationale).
@@ -718,7 +720,7 @@ Only Caddy (80/443) and the BitTorrent peer port (`Ports.DelugeBT`, default 5688
 Collects server health metrics and writes them as `dashboard/current_status.json`:
 - **System**: uptime (hours), memory used/total (GB), memory percent.
 - **Drives**: per-drive letter free/used/total GB and percent used.
-- **Services**: running state for all seedbox services (Caddy, Sonarr, Radarr, Prowlarr, Jellyfin, Deluge, Bazarr, Flaresolverr, Jellyseerr, Zurg, rclone-rd-movies, Grafana, Loki, Alloy).
+- **Services**: running state for all seedbox services (Caddy, Sonarr, Radarr, Prowlarr, Jellyfin, Deluge, Bazarr, Flaresolverr, Jellyseerr, Zurg, rclone-rd-movies, rclone-rd-shows, Grafana, Loki, Alloy).
 - **Downloads**: active and waiting Deluge download counts via RPC.
 - **Security**: Windows Firewall rule count for the abuse blocklist.
 Runs every 5 minutes via `Seedbox_Status_Collector` (SYSTEM scheduled task registered by `13_status.ps1`). No credentials or secrets are written to the output JSON.
