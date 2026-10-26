@@ -1,6 +1,6 @@
 {
   "schema": 2,
-  "updated": "2026-10-23",
+  "updated": "2026-10-26",
   "github_raw_url": "https://raw.githubusercontent.com/viperaxz/torrents-arr-us/main/versions.json",
   "apps": {
     "Sonarr": {
@@ -33,12 +33,11 @@
       "repo": "FlareSolverr/FlareSolverr",
       "asset": "flaresolverr_windows_x64.zip"
     },
-
     "Jellyseerr": {
       "version": "v3.5.1",
       "source": "github_source",
       "repo": "seerr-team/seerr",
-      "security": true,
+      "security": false,
       "securityNote": "CVE-2026-113470 - distrusted eMudhra intermediate CAs; requires the bundled Node.js 22.23.4 runtime.",
       "note": "Built from source (Node.js + pnpm). Updated by scripts\\update_jellyseerr.ps1 (rebuild from source, refreshes the bundled Node 22 LTS). Upstream renamed the project to Seerr."
     },
@@ -74,7 +73,7 @@
       "package": "caddy"
     },
     "NSSM": {
-      "version": "2.24.101.20180116",
+      "version": "2.24.101",
       "source": "chocolatey",
       "package": "nssm"
     },
