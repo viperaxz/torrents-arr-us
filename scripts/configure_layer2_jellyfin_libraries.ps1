@@ -254,6 +254,17 @@ foreach ($lib in $Layer2Config.MediaLibraries) {
     $libPath = $lib.Path
     $libType = $lib.Type
 
+    # Optional libraries only exist when their tree does.  The "Anime" library is
+    # fed by scripts\sync_anime_library.ps1 from the Real-Debrid anime mount, so on
+    # an install without Anime.Sources the path is never created and an empty
+    # library would only clutter the home screen.
+    $isOptional = [bool]($lib.PSObject.Properties['Optional'] -and $lib.Optional)
+    if ($isOptional -and -not (Test-Path -LiteralPath $libPath)) {
+        Write-Host "  [SKIP] Library '$libName' ($libType) -> $libPath  -- optional and not present yet" -ForegroundColor DarkGray
+        Write-DebugLog "INFO" "Library '$libName' skipped: optional path '$libPath' does not exist"
+        continue
+    }
+
     # Skip RD/Lean libraries when RealDebrid is not enabled (Zurg/rclone not installed, drive letter missing)
     $isLean = $lib.PSObject.Properties['Lean'] -and $lib.Lean
     if ($isLean -and -not $rdEnabled) {

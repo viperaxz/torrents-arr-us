@@ -261,7 +261,7 @@ if (Test-Path $DelugeStateDir) {
 $AllServices = @(
     "IPBan", "Caddy", "php-cgi", "Sonarr", "Radarr", "Prowlarr", "Bazarr",
     "DelugeDaemon", "DelugeWeb", "Flaresolverr", "Jellyseerr",
-    "Grafana", "Loki", "Alloy", "rclone-rd-movies", "rclone-rd-shows", "rclone-rd", "Zurg"
+    "Grafana", "Loki", "Alloy", "rclone-rd-movies", "rclone-rd-shows", "rclone-rd-anime", "rclone-rd", "Zurg"
 )
 Write-Host "  -> Stopping all services in parallel..." -ForegroundColor Yellow
 Stop-ServicesBounded -Names $AllServices
@@ -296,8 +296,9 @@ if (-not (Test-Path $rclonePath)) {
 }
 Write-DebugLog "VAR rclone executable = $rclonePath"
 
-# Two mounts since the Zurg movies/shows split: MountLetter (movies) and
-# TvMountLetter (shows). Older configs only carry MountLetter; both are tolerated.
+# Mounts since the Zurg movies/shows split: MountLetter (movies), TvMountLetter
+# (shows) and Anime.MountLetter (absolute-numbered anime packs). Older configs
+# carry fewer of them; every absent key is simply skipped.
 $rdMountLetters = @()
 foreach ($key in @('MountLetter', 'TvMountLetter')) {
     if ($Config -and $Config.PSObject.Properties['RealDebrid'] -and $Config.RealDebrid -and
@@ -305,6 +306,11 @@ foreach ($key in @('MountLetter', 'TvMountLetter')) {
         $letter = ([string]$Config.RealDebrid.$key).ToUpper().TrimEnd(':')
         if ($letter -and $rdMountLetters -notcontains $letter) { $rdMountLetters += $letter }
     }
+}
+if ($Config -and $Config.PSObject.Properties['Anime'] -and $Config.Anime -and
+    $Config.Anime.PSObject.Properties['MountLetter'] -and $Config.Anime.MountLetter) {
+    $letter = ([string]$Config.Anime.MountLetter).ToUpper().TrimEnd(':')
+    if ($letter -and $rdMountLetters -notcontains $letter) { $rdMountLetters += $letter }
 }
 
 if ($rclonePath -and $rdMountLetters.Count -gt 0) {
@@ -333,8 +339,41 @@ if ($rclonePath -and $rdMountLetters.Count -gt 0) {
 }
 Remove-NssmService "rclone-rd-movies"
 Remove-NssmService "rclone-rd-shows"
+Remove-NssmService "rclone-rd-anime"
 Remove-NssmService "rclone-rd"
 Remove-NssmService "Zurg"
+
+# The anime symlink farm and its refresh task are derived data: the links point at
+# the Real-Debrid mount that is about to disappear, so they are removed here rather
+# than left dangling behind the library.
+$animeSyncTask = Get-ScheduledTask -TaskName "Seedbox_AnimeSync" -ErrorAction SilentlyContinue
+if ($animeSyncTask) {
+    try {
+        Unregister-ScheduledTask -TaskName "Seedbox_AnimeSync" -Confirm:$false -ErrorAction Stop
+        Write-Host "  -> Removed Seedbox_AnimeSync scheduled task." -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Seedbox_AnimeSync task unregistered"
+    } catch {
+        Write-Warning "  -> Could not remove Seedbox_AnimeSync: $_"
+        Write-DebugLog "WARN" "Seedbox_AnimeSync removal failed: $_"
+    }
+}
+$animeLibraryPath = if ($Config -and $Config.PSObject.Properties['Anime'] -and $Config.Anime -and
+                         $Config.Anime.PSObject.Properties['LibraryPath'] -and $Config.Anime.LibraryPath) {
+    [string]$Config.Anime.LibraryPath
+} elseif ($Config -and $Config.General -and $Config.General.InstallDir) {
+    Join-Path $Config.General.InstallDir "Anime"
+} else { $null }
+if ($animeLibraryPath -and (Test-Path -LiteralPath $animeLibraryPath)) {
+    # Only symlinks live here; deleting a link never touches the media it points at.
+    try {
+        Remove-Item -LiteralPath $animeLibraryPath -Recurse -Force -ErrorAction Stop
+        Write-Host "  -> Removed anime library view: $animeLibraryPath" -ForegroundColor Yellow
+        Write-DebugLog "INFO" "Removed anime library view $animeLibraryPath"
+    } catch {
+        Write-Warning "  -> Could not remove ${animeLibraryPath}: $_"
+        Write-DebugLog "WARN" "Anime library view removal failed: $_"
+    }
+}
 
 # CrowdSec + its firewall bouncer are MSI-installed services, not NSSM ones.
 # Stop them here; the packages themselves are removed in the Chocolatey phase.

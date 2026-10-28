@@ -137,10 +137,35 @@ $ZurgPort = 9999
 # only) to zurg:movies.  rclone mounts those two trees on separate letters so
 # Jellyfin gets a real Movies library and a real TV library instead of one
 # flat __all__ tree that cannot tell them apart.
+#
+# Zurg gives each torrent to the FIRST matching directory by group_order, so the
+# optional `anime` directory only has to be listed before `shows` to take
+# absolute-numbered anime packs out of the Jellyfin TV library -- there is no
+# negative filter.  Those packs are unreadable to Jellyfin as television (no
+# SxxEyy, multi-season show) and are re-presented as a renamed symlink tree by
+# scripts\sync_anime_library.ps1.
+#
 # host pins the WebDAV endpoint to loopback: zurg's default is "[::]" (every
 # interface) and the endpoint is unauthenticated, so without this the whole
 # Real-Debrid library is published to the LAN.  Nothing in this suite reaches
 # Zurg from off-box -- rclone mounts it over 127.0.0.1.
+. (Join-Path $PSScriptRoot "anime_helpers.ps1")
+$animeRegex = if ($Config.Apps.RealDebrid -eq $true) { Get-AnimeTorrentRegex -Config $Config } else { $null }
+$animeBlock = ""
+if ($animeRegex) {
+    Write-DebugLog "INFO" "Zurg anime directory enabled (patterns: $animeRegex)"
+    $animeBlock = @"
+  anime:
+    group: media
+    group_order: 5
+    filters:
+      - and:
+        - has_episodes: true
+        - regex: /$animeRegex/
+
+"@
+}
+
 $configYml = @"
 zurg: v1
 token: $RdApiKey
@@ -152,7 +177,7 @@ enable_repair: true
 enable_thorough_hash_check: false
 cache_network_test_results: true
 directories:
-  shows:
+$animeBlock  shows:
     group: media
     group_order: 10
     filters:

@@ -5,6 +5,8 @@ param (
 
 # -- Debug logging ---------------------------------------------------------------
 . (Join-Path $PSScriptRoot "debug_logger.ps1")
+# Anime split config helpers (zurg:anime mount + renamed symlink farm).
+. (Join-Path $PSScriptRoot "anime_helpers.ps1")
 
 # Bounded service control: nssm services wedge in Stop/Start Pending and the
 # built-in cmdlets wait indefinitely. See service_helpers.ps1.
@@ -67,7 +69,23 @@ if ($TvMountLetter -notmatch '^[A-Y]$' -or $TvMountLetter -eq $MountLetter) {
 $MovieLetter = $MountLetter
 $TvLetter    = $TvMountLetter
 
-Write-DebugLog "VAR MountLetter=$MountLetter MovieLetter=$MovieLetter TvMountLetter=$TvLetter"
+# `. (Join-Path $PSScriptRoot "anime_helpers.ps1")` is loaded above; the anime
+# mount only exists when config.json carries an Anime block with sources.  It
+# holds the absolute-numbered packs that zurg routed to zurg:anime -- the renamed
+# symlink tree Jellyfin reads is built from this mount.
+$AnimeCfg    = Get-AnimeConfig -Config $Config
+$AnimeEnabled = [bool]($AnimeCfg.Enabled -and $AnimeCfg.Sources.Count -gt 0)
+$AnimeLetter = $AnimeCfg.MountLetter
+if ($AnimeEnabled) {
+    if ($AnimeLetter -notmatch '^[A-Y]$' -or $AnimeLetter -in @($MovieLetter, $TvLetter)) {
+        $candidate = @('T', 'U', 'V', 'W', 'X', 'Y') | Where-Object { $_ -ne $MovieLetter -and $_ -ne $TvLetter } | Select-Object -First 1
+        Write-Warning "[$AppName] Anime.MountLetter '$AnimeLetter' is invalid or already used. Falling back to '$candidate'."
+        Write-DebugLog "WARN" "Invalid/duplicate Anime.MountLetter '$AnimeLetter' -> '$candidate'"
+        $AnimeLetter = $candidate
+    }
+}
+
+Write-DebugLog "VAR MountLetter=$MountLetter MovieLetter=$MovieLetter TvMountLetter=$TvLetter AnimeEnabled=$AnimeEnabled AnimeLetter=$AnimeLetter"
 
 if (Test-Path $LockFile) {
     Write-Host "[$AppName] Already installed. Skipping." -ForegroundColor Green
@@ -219,11 +237,14 @@ $CommonFlags = "--skip-links --read-only --vfs-cache-mode off --dir-cache-time 1
 
 $MoviesSvc  = "rclone-rd-movies"
 $TvSvc      = "rclone-rd-shows"
+$AnimeSvc   = "rclone-rd-anime"
 $MoviesMountArgs = "mount zurg:movies ${MovieLetter}:\ $CommonFlags"
 $TvMountArgs     = "mount zurg:shows ${TvLetter}:\ $CommonFlags"
+$AnimeMountArgs  = "mount zurg:anime ${AnimeLetter}:\ $CommonFlags"
 
 Write-DebugLog "VAR MoviesSvc=$MoviesSvc MoviesMountArgs=$MoviesMountArgs"
 Write-DebugLog "VAR TvSvc=$TvSvc TvMountArgs=$TvMountArgs"
+Write-DebugLog "VAR AnimeSvc=$AnimeSvc enabled=$AnimeEnabled AnimeMountArgs=$AnimeMountArgs"
 
 # A letter that is already a local volume or network mapping makes the mount
 # fail; surface it here rather than as a warning after the service is registered.
@@ -236,6 +257,13 @@ $tvLetterOwner = Get-PSDrive -Name $TvLetter -PSProvider FileSystem -ErrorAction
 if ($tvLetterOwner) {
     Write-Warning "     Drive ${TvLetter}: is already in use (root: $($tvLetterOwner.Root)). rclone cannot mount over an existing drive -- set a free RealDebrid.TvMountLetter in config.json."
     Write-DebugLog "WARN" "TvMountLetter ${TvLetter}: already in use by $($tvLetterOwner.Root)"
+}
+if ($AnimeEnabled) {
+    $animeLetterOwner = Get-PSDrive -Name $AnimeLetter -PSProvider FileSystem -ErrorAction SilentlyContinue
+    if ($animeLetterOwner) {
+        Write-Warning "     Drive ${AnimeLetter}: is already in use (root: $($animeLetterOwner.Root)). rclone cannot mount over an existing drive -- set a free Anime.MountLetter in config.json."
+        Write-DebugLog "WARN" "Anime.MountLetter ${AnimeLetter}: already in use by $($animeLetterOwner.Root)"
+    }
 }
 
 # -- 6. Register rclone-rd-movies NSSM service ----------------------------------
@@ -314,6 +342,53 @@ nssm set $TvSvc AppExit Default Restart | Out-Null
 nssm set $TvSvc AppRestartDelay 5000 | Out-Null
 nssm set $TvSvc AppThrottle 30000 | Out-Null
 Write-DebugLog "INFO" "NSSM service '$TvSvc' registered (auto-restart on exit)"
+
+# -- 6c. Register rclone-rd-anime NSSM service ----------------------------------
+# Only present when config.json maps absolute-numbered anime packs.  The tree can
+# legitimately be empty (no anime in Real-Debrid yet), so nothing here requires
+# entries -- just a live mount service.
+if ($AnimeEnabled) {
+    Write-Host "  -> Registering $AnimeSvc service (${AnimeLetter}:\)..." -ForegroundColor Gray
+
+    $animeSvcExists = Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue
+    if ($animeSvcExists) {
+        $null = Stop-ServiceBounded -Name $AnimeSvc
+        $waited = 0
+        while ((Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue).Status -eq 'StopPending' -and $waited -lt 30) {
+            Start-Sleep -Seconds 2; $waited += 2
+        }
+        nssm remove $AnimeSvc confirm | Out-Null
+        $waited = 0
+        while ($null -ne (Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue) -and $waited -lt 10) {
+            Start-Sleep -Seconds 1; $waited += 1
+        }
+    }
+
+    nssm install $AnimeSvc $RcloneExe | Out-Null
+    nssm set $AnimeSvc AppDirectory $AppBinDir | Out-Null
+    nssm set $AnimeSvc AppParameters $AnimeMountArgs | Out-Null
+    nssm set $AnimeSvc AppStdout (Join-Path $LogDir "rclone-rd-anime.log") | Out-Null
+    nssm set $AnimeSvc AppStderr (Join-Path $LogDir "rclone-rd-anime-error.log") | Out-Null
+    nssm set $AnimeSvc AppRotateFiles 1 | Out-Null
+    nssm set $AnimeSvc AppRotateBytes 5242880 | Out-Null
+    # Same delayed-start/restart policy as the other two mounts: Zurg first, and
+    # rclone recovers from WebDAV outages on its own.
+    nssm set $AnimeSvc Start SERVICE_DELAYED_AUTO_START | Out-Null
+    nssm set $AnimeSvc ObjectName "LocalSystem" | Out-Null
+    nssm set $AnimeSvc AppExit Default Restart | Out-Null
+    nssm set $AnimeSvc AppRestartDelay 5000 | Out-Null
+    nssm set $AnimeSvc AppThrottle 30000 | Out-Null
+    Write-DebugLog "INFO" "NSSM service '$AnimeSvc' registered (auto-restart on exit)"
+} else {
+    # A previously installed anime mount would keep a stale drive letter after the
+    # Anime block is removed from config.json.
+    if (Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue) {
+        Write-Host "  -> Removing $AnimeSvc (Anime block disabled in config.json)..." -ForegroundColor Gray
+        $null = Stop-ServiceBounded -Name $AnimeSvc
+        nssm remove $AnimeSvc confirm | Out-Null
+        Write-DebugLog "INFO" "Removed $AnimeSvc (anime disabled)"
+    }
+}
 
 # -- 7. Wait for Zurg WebDAV before starting rclone -----------------------------
 # Zurg starts its HTTP server asynchronously after network tests. rclone connects
@@ -486,6 +561,39 @@ if ($tSvcRunning -and $tvMounted) {
     Write-DebugLog "WARN" "$TvSvc status=$tSvcStatus"
 }
 
+# -- 8c. Start and verify the anime mount --------------------------------------
+$animeSvcRunning = $true
+if ($AnimeEnabled) {
+    Write-Host "  -> Starting $AnimeSvc..." -ForegroundColor Gray
+    $null = Start-ServiceBounded -Name $AnimeSvc
+
+    $aSvc = $null
+    $aPollDeadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $aPollDeadline) {
+        $aSvc = Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue
+        if ($aSvc -and $aSvc.Status -eq "Running") { break }
+        if ($aSvc -and $aSvc.Status -ne "StartPending") { break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $aSvc) { $aSvc = Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue }
+
+    $aSvcStatus    = if ($aSvc) { $aSvc.Status } else { "NOT FOUND" }
+    $animeSvcRunning = [bool]($aSvc -and $aSvc.Status -eq "Running")
+    Write-DebugLog "VAR $AnimeSvc status=$aSvcStatus"
+
+    $animeMounted = Test-Path "${AnimeLetter}:\"
+    if ($animeSvcRunning -and $animeMounted) {
+        Write-Host "     OK $AnimeSvc running (${AnimeLetter}:\)" -ForegroundColor Green
+        Write-DebugLog "INFO" "$AnimeSvc running, mount at ${AnimeLetter}:\ present"
+    } elseif ($animeSvcRunning) {
+        Write-Warning "     $AnimeSvc running but ${AnimeLetter}:\ is not present yet. The mount may still be warming up."
+        Write-DebugLog "WARN" "$AnimeSvc running but drive ${AnimeLetter}:\ not found"
+    } else {
+        Write-Warning "     $AnimeSvc not running (status: $aSvcStatus). Check $LogDir\rclone-rd-anime-error.log."
+        Write-DebugLog "WARN" "$AnimeSvc status=$aSvcStatus"
+    }
+}
+
 # -- 9. Write lock file ---------------------------------------------------------
 # Only a running mount service counts as installed.  Writing the lock file (and
 # the ledger entry) after a failed start would make every later run report
@@ -494,9 +602,9 @@ if ($tSvcRunning -and $tvMounted) {
 # check above is deliberately not part of this decision: WinFsp mount points are
 # per session, so an installer running in an interactive session may not see a
 # perfectly healthy mount.
-if (-not $mSvcRunning -or -not $tSvcRunning) {
-    Write-Warning "[$AppName] Install incomplete: '$MoviesSvc'=$mSvcStatus, '$TvSvc'=$tSvcStatus. Not writing the lock file so a re-run retries."
-    Write-DebugLog "ERROR" "$MoviesSvc=$mSvcStatus / $TvSvc=$tSvcStatus; lock file and ledger entry not written"
+if (-not $mSvcRunning -or -not $tSvcRunning -or -not $animeSvcRunning) {
+    Write-Warning "[$AppName] Install incomplete: '$MoviesSvc'=$mSvcStatus, '$TvSvc'=$tSvcStatus, '$AnimeSvc'=$(if ($AnimeEnabled) { (Get-Service -Name $AnimeSvc -ErrorAction SilentlyContinue).Status } else { 'disabled' }). Not writing the lock file so a re-run retries."
+    Write-DebugLog "ERROR" "$MoviesSvc=$mSvcStatus / $TvSvc=$tSvcStatus / anime=$animeSvcRunning; lock file and ledger entry not written"
     exit 1
 }
 
@@ -512,5 +620,62 @@ if (-not $rcloneVer) {
     $rcloneVer = Detect-InstalledVersion -AppName "rclone" -Entry $rcloneEntry -InstallDir $InstallDir
 }
 if ($rcloneVer) { Set-InstalledVersion -InstallDir $InstallDir -AppName "rclone" -Version $rcloneVer }
-Write-Host "  OK $AppName installed (movies: ${MovieLetter}:\, shows: ${TvLetter}:\)." -ForegroundColor Green
+
+# -- 10. Anime symlink farm + refresh task -------------------------------------
+# The anime mount holds absolute-numbered packs, which Jellyfin cannot read as
+# multi-season television.  sync_anime_library.ps1 links each episode into
+# <Anime.LibraryPath>\<Show>\Season NN\<Show> - SxxEyy.mkv so the "Anime" library
+# (configured in Layer 2) sees a normal show.  It is idempotent and cheap: it
+# only compares link names/targets on the mount listing.
+if ($AnimeEnabled) {
+    $syncSrc = Join-Path $PSScriptRoot "sync_anime_library.ps1"
+    $helpersSrc = Join-Path $PSScriptRoot "anime_helpers.ps1"
+    $installScripts = Join-Path $InstallDir "scripts"
+    if (-not (Test-Path $installScripts)) { New-Item -ItemType Directory -Path $installScripts -Force | Out-Null }
+    $syncDst = Join-Path $installScripts "sync_anime_library.ps1"
+    Copy-Item -LiteralPath $syncSrc -Destination $syncDst -Force
+    Copy-Item -LiteralPath $helpersSrc -Destination (Join-Path $installScripts "anime_helpers.ps1") -Force
+    $configForTask = Join-Path (Split-Path $PSScriptRoot -Parent) "config.json"
+
+    Write-Host "  -> Building the anime library view ($($AnimeLetter):\)..." -ForegroundColor Gray
+    # The mount may still be warming up right after the service start; a missing
+    # listing simply means this first pass links nothing and the task retries.
+    try {
+        & $syncDst -ConfigPath $configForTask
+    } catch {
+        Write-Warning "     Anime sync failed: $_"
+        Write-DebugLog "WARN" "Anime sync failed during install: $_"
+    }
+
+    # Real-Debrid content changes without any local event, so a periodic pass is
+    # what keeps the view current.  IgnoreNew prevents overlapping runs.
+    try {
+        $syncAction = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$syncDst`" -ConfigPath `"$configForTask`" -Quiet"
+        $syncTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+            -RepetitionInterval (New-TimeSpan -Minutes 30) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+        $syncPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+            -LogonType ServiceAccount -RunLevel Highest
+        $syncSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+            -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName "Seedbox_AnimeSync" `
+            -Action $syncAction -Trigger $syncTrigger `
+            -Principal $syncPrincipal -Settings $syncSettings -Force | Out-Null
+        $syncTask = Get-ScheduledTask -TaskName "Seedbox_AnimeSync" -ErrorAction SilentlyContinue
+        if ($syncTask -and $syncTask.State -in @('Ready', 'Running')) {
+            Write-Host "     OK Seedbox_AnimeSync registered (every 30 min)." -ForegroundColor Green
+            Write-DebugLog "INFO" "Seedbox_AnimeSync registered (state=$($syncTask.State))"
+        } else {
+            Write-Warning "     Seedbox_AnimeSync did not register cleanly (state=$($syncTask.State))."
+            Write-DebugLog "ERROR" "Seedbox_AnimeSync state=$($syncTask.State)"
+        }
+    } catch {
+        Write-Warning "     Could not register Seedbox_AnimeSync: $_"
+        Write-DebugLog "ERROR" "Seedbox_AnimeSync registration failed: $_"
+    }
+}
+
+$mountLine = if ($AnimeEnabled) { "movies: ${MovieLetter}:\, shows: ${TvLetter}:\, anime: ${AnimeLetter}:\" } else { "movies: ${MovieLetter}:\, shows: ${TvLetter}:\" }
+Write-Host "  OK $AppName installed ($mountLine)." -ForegroundColor Green
 Write-DebugLog "INFO" "16_rclone.ps1 complete. Lock file written: $LockFile"

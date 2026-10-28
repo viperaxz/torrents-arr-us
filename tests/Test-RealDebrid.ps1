@@ -22,6 +22,22 @@ if ($tl -notmatch '^[A-Y]$' -or $tl -eq $ml) { $tl = if ($ml -ne 'S') { 'S' } el
 $mDrive = "$ml`:"
 $tDrive = "$tl`:"
 
+# Optional anime split: absolute-numbered packs get their own zurg:anime mount and
+# are re-presented to Jellyfin as a renamed symlink tree by
+# scripts\sync_anime_library.ps1.  Same fallbacks as scripts/16_rclone.ps1.
+$animeEnabled = [bool]($Config.Anime -and $Config.Anime.PSObject.Properties['Enabled'] -and $Config.Anime.Enabled -eq $true -and
+                        $Config.Anime.PSObject.Properties['Sources'] -and @($Config.Anime.Sources).Count -gt 0)
+$al = if ($animeEnabled -and $Config.Anime.PSObject.Properties['MountLetter'] -and $Config.Anime.MountLetter) {
+    $Config.Anime.MountLetter.ToString().ToUpper().TrimEnd(':')
+} else { 'T' }
+if ($al -notmatch '^[A-Y]$' -or $al -in @($ml, $tl)) {
+    $al = @('T', 'U', 'V', 'W', 'X', 'Y') | Where-Object { $_ -ne $ml -and $_ -ne $tl } | Select-Object -First 1
+}
+$aDrive   = "$al`:"
+$aLibPath = if ($animeEnabled -and $Config.Anime.PSObject.Properties['LibraryPath'] -and $Config.Anime.LibraryPath) {
+    [string]$Config.Anime.LibraryPath
+} else { Join-Path $InstallDir 'Anime' }
+
 # A WinFsp drive letter belongs to the Windows session that created it.  The
 # mount is created by the rclone-rd-movies service in session 0, so when this
 # suite runs from an interactive desktop session (1+) the drive letter is
@@ -89,6 +105,19 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     } else {
         $Script:Results.Add((New-TestResult $svc 1 "DriveShowsMounted_$tDrive" 'SKIP' "Drive $tDrive is owned by the rclone-rd-shows service session (0) and is not visible from this session -- verify from a service context"))
     }
+
+    if ($animeEnabled) {
+        $aSvcInfo = Get-Service 'rclone-rd-anime' -ErrorAction SilentlyContinue
+        $Script:Results.Add((New-TestResult $svc 1 'AnimeServiceRunning' $(if ($aSvcInfo -and $aSvcInfo.Status -eq 'Running') { 'PASS' } elseif (-not $aSvcInfo) { 'FAIL' } else { 'WARN' }) "rclone-rd-anime NSSM service ($(if ($aSvcInfo) { $aSvcInfo.Status } else { 'missing' }))"))
+
+        if (Test-Path "$aDrive\") {
+            $Script:Results.Add((New-TestResult $svc 1 "DriveAnimeMounted_$aDrive" 'PASS' "Anime drive $aDrive mounted"))
+        } elseif ($mountVisibleHere) {
+            $Script:Results.Add((New-TestResult $svc 1 "DriveAnimeMounted_$aDrive" 'FAIL' "Anime drive $aDrive not mounted"))
+        } else {
+            $Script:Results.Add((New-TestResult $svc 1 "DriveAnimeMounted_$aDrive" 'SKIP' "Drive $aDrive is owned by the rclone-rd-anime service session (0) and is not visible from this session -- verify from a service context"))
+        }
+    }
 }
 
 # -- Layer 2: Jellyfin RD library points at the mount letter ------------------
@@ -114,6 +143,10 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 2) {
             $Script:Results.Add((New-TestResult $svc 2 "JellyfinMoviesRD" $(if ($hasMovieDrive) { 'PASS' } else { 'WARN' }) "Jellyfin library on $mDrive"))
             $hasTvDrive = $libPaths | Where-Object { $_ -match "^$([regex]::Escape($tDrive))" }
             $Script:Results.Add((New-TestResult $svc 2 "JellyfinShowsRD" $(if ($hasTvDrive) { 'PASS' } else { 'WARN' }) "Jellyfin library on $tDrive"))
+            if ($animeEnabled) {
+                $hasAnimeLib = $libPaths | Where-Object { $_ -match "^$([regex]::Escape($aLibPath))" }
+                $Script:Results.Add((New-TestResult $svc 2 'JellyfinAnimeLibrary' $(if ($hasAnimeLib) { 'PASS' } else { 'WARN' }) "Jellyfin library on $aLibPath"))
+            }
         } else {
             $Script:Results.Add((New-TestResult $svc 2 'JellyfinLibraries' 'FAIL' $libs.error))
         }
@@ -141,5 +174,18 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 3) {
         $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$tDrive" 'SKIP' "Drive $tDrive belongs to the rclone-rd-shows service session (0) -- not visible from this session"))
     } else {
         $Script:Results.Add((New-TestResult $svc 3 "DriveNonEmpty_$tDrive" 'FAIL' "Drive $tDrive not mounted"))
+    }
+
+    if ($animeEnabled) {
+        $animeLinks = 0
+        if (Test-Path -LiteralPath $aLibPath) {
+            $animeLinks = @(Get-ChildItem -LiteralPath $aLibPath -Recurse -File -Force -ErrorAction SilentlyContinue |
+                            Where-Object { $_.PSObject.Properties['LinkType'] -and $_.LinkType -eq 'SymbolicLink' }).Count
+        }
+        # No anime in Real-Debrid yet is a valid empty view; a mounted anime drive
+        # that produced no links is the signal that scripts\sync_anime_library.ps1
+        # has never run (or matched nothing).
+        $animeLinkStatus = if ($animeLinks -gt 0) { 'PASS' } elseif (Test-Path "$aDrive\") { 'WARN' } else { 'SKIP' }
+        $Script:Results.Add((New-TestResult $svc 3 'AnimeLibraryLinks' $animeLinkStatus "$animeLinks episode link(s) in $aLibPath"))
     }
 }

@@ -388,15 +388,25 @@ if ($Config.Apps.RealDebrid -eq $true) {
     $zurgCheck = QuickGet 'http://127.0.0.1:9999/'
     $svcs.Add((SvcEntry 'Zurg' 'Zurg' (TcpOpen 9999) $zurgCheck.ok $zurgCheck.ms))
 
-    # Two mounts since the Zurg movies/shows split (zurg:movies, zurg:shows).
+    # Mounts since the Zurg movies/shows split (zurg:movies, zurg:shows), plus the
+    # optional zurg:anime mount that holds absolute-numbered anime packs.
     $mountSpecs = @(
         @{ Svc = 'rclone-rd-movies'; Key = 'MountLetter';   Default = 'R' },
         @{ Svc = 'rclone-rd-shows';  Key = 'TvMountLetter'; Default = 'S' }
     )
+    $animeEnabled = [bool]($Config.Anime -and $Config.Anime.PSObject.Properties['Enabled'] -and $Config.Anime.Enabled -eq $true -and
+                           $Config.Anime.PSObject.Properties['Sources'] -and @($Config.Anime.Sources).Count -gt 0)
+    if ($animeEnabled -and (Get-Service -Name 'rclone-rd-anime' -ErrorAction SilentlyContinue)) {
+        $animeLetter = if ($Config.Anime.PSObject.Properties['MountLetter'] -and $Config.Anime.MountLetter) {
+            $Config.Anime.MountLetter.ToString().ToUpper().TrimEnd(':')
+        } else { 'T' }
+        $mountSpecs += @{ Svc = 'rclone-rd-anime'; Explicit = $animeLetter }
+    }
     foreach ($ms in $mountSpecs) {
-        $letter = if ($Config.RealDebrid -and $Config.RealDebrid.PSObject.Properties[$ms.Key] -and $Config.RealDebrid.($ms.Key)) {
-            $Config.RealDebrid.($ms.Key).ToString().ToUpper().TrimEnd(':')
-        } else { $ms.Default }
+        $letter = if ($ms.ContainsKey('Explicit')) { $ms.Explicit }
+                  elseif ($Config.RealDebrid -and $Config.RealDebrid.PSObject.Properties[$ms.Key] -and $Config.RealDebrid.($ms.Key)) {
+                      $Config.RealDebrid.($ms.Key).ToString().ToUpper().TrimEnd(':')
+                  } else { $ms.Default }
         $drive   = "$letter`:"
         $mounted = Test-Path "$letter`:\"
         SetState $ms.Svc $mounted

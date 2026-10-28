@@ -17,6 +17,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "update_common.ps1")
+# Anime split helpers: needed by the config migration below (zurg:anime directory).
+. (Join-Path $PSScriptRoot "anime_helpers.ps1")
 $Config = Initialize-UpdateScript -Config $Config
 
 $AppName     = "Zurg"
@@ -94,13 +96,16 @@ try {
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
 
-    # One-time migration for installs created before the movies/shows split:
-    # add Zurg's `directories` block so the rclone mounts (zurg:movies /
-    # zurg:shows) have something to mount.  Only a successful swap reaches here,
-    # and the extra restart happens just once per install.
+    # One-time migrations for installs created before the split(s):
+    #   * add Zurg's `directories` block so the rclone mounts (zurg:movies /
+    #     zurg:shows) have something to mount;
+    #   * add the optional `anime` directory, which routes absolute-numbered anime
+    #     packs out of zurg:shows and into zurg:anime.
+    # Only a successful swap reaches here, and each extra restart happens once.
     $zurgCfgPath = Join-Path $InstallDir "Zurg\config.yml"
     if (Test-Path $zurgCfgPath) {
         $zurgCfgText = [System.IO.File]::ReadAllText($zurgCfgPath)
+        $zurgCfgChanged = $false
         if ($zurgCfgText -notmatch '(?m)^directories:') {
             $dirBlock = @"
 
@@ -117,9 +122,31 @@ directories:
     filters:
       - regex: /.*/
 "@
-            [System.IO.File]::AppendAllText($zurgCfgPath, $dirBlock, (New-Object System.Text.UTF8Encoding($false)))
+            $zurgCfgText = $zurgCfgText.TrimEnd() + "`n" + $dirBlock.TrimStart("`r", "`n")
+            $zurgCfgChanged = $true
+            Write-UcLog "INFO" "Adding Zurg directories (movies/shows split)"
+        }
+
+        if (Get-Command Get-AnimeTorrentRegex -ErrorAction SilentlyContinue) {
+            $animeRegex = Get-AnimeTorrentRegex -Config $Config
+            if ($animeRegex -and $zurgCfgText -notmatch '(?m)^\s+anime:') {
+                $animeBlock = "  anime:`n    group: media`n    group_order: 5`n    filters:`n      - and:`n        - has_episodes: true`n        - regex: /$animeRegex/`n"
+                # Zurg picks the first matching directory by group_order, so the
+                # block must be inserted directly under `directories:` -- ahead of
+                # shows/movies -- or those torrents stay in zurg:shows.
+                $dirHeader = [regex]::Match($zurgCfgText, '(?m)^directories:[ \t]*\r?\n')
+                if ($dirHeader.Success) {
+                    $zurgCfgText = $zurgCfgText.Insert($dirHeader.Index + $dirHeader.Length, $animeBlock)
+                    $zurgCfgChanged = $true
+                    Write-UcLog "INFO" "Adding Zurg anime directory (absolute-numbered packs)"
+                }
+            }
+        }
+
+        if ($zurgCfgChanged) {
+            [System.IO.File]::WriteAllText($zurgCfgPath, $zurgCfgText, (New-Object System.Text.UTF8Encoding($false)))
             $null = Restart-ServiceBounded -Name $ServiceName -StopTimeoutSeconds 60 -StartTimeoutSeconds 120
-            Write-UcLog "INFO" "Added Zurg directories (movies/shows split) and restarted $ServiceName"
+            Write-UcLog "INFO" "Zurg config migrated and $ServiceName restarted"
         }
     }
 

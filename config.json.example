@@ -35,6 +35,13 @@
     "MountLetter": "R",
     "TvMountLetter": "S"
   },
+  "Anime": {
+    "Enabled": false,
+    "MountLetter": "T",
+    "LibraryPath": "D:\\MediaServer\\Anime",
+    "Sources": [],
+    "ExtraTorrents": []
+  },
   "LLM": {
     "Enabled": false,
     "Subdomain": "llm",
@@ -212,6 +219,17 @@
           "Name": "RD TV Shows",
           "Path": "S:\\",
           "Type": "tvshows",
+          "Lean": {
+            "DisableVideoExtraction": true,
+            "DisableMetadata": false,
+            "DisableImages": false
+          }
+        },
+        {
+          "Name": "Anime",
+          "Path": "D:\\MediaServer\\Anime",
+          "Type": "tvshows",
+          "Optional": true,
           "Lean": {
             "DisableVideoExtraction": true,
             "DisableMetadata": false,

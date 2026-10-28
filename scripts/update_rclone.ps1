@@ -1,8 +1,9 @@
 ﻿# update_rclone.ps1
 # Per-app update script: rclone (GitHub zip, single-exe swap).
 # The rclone directory also holds rclone.conf, so only rclone.exe is replaced.
-# Both mount services (movies + shows) are stopped and restarted, and both drive
-# letters must answer a real readdir, otherwise the swap is rolled back.
+# Every mount service (movies, shows, and the optional anime mount) is stopped and
+# restarted, and every drive letter must answer a real readdir, otherwise the swap
+# is rolled back.
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$InstallDir,
@@ -14,6 +15,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "update_common.ps1")
+# Anime split helpers: the anime mount letter lives in the Anime block.
+. (Join-Path $PSScriptRoot "anime_helpers.ps1")
 $Config = Initialize-UpdateScript -Config $Config
 
 $AppName     = "rclone"
@@ -33,14 +36,22 @@ if ($tvMountLetter -notmatch '^[A-Y]$' -or $tvMountLetter -eq $mountLetter) {
     $tvMountLetter = if ($mountLetter -ne 'S') { 'S' } else { 'T' }
 }
 
-# Both mount services hold rclone.exe open, so both must stop for the exe swap.
-# Older installs only have the movies service; only the services that exist are
-# passed to the swap helper (a missing one would fail its health gate).
-$ServiceNames = @(@("rclone-rd-movies", "rclone-rd-shows") | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
+$animeCfg      = Get-AnimeConfig -Config $Config
+$animeEnabled  = [bool]($animeCfg.Enabled -and $animeCfg.Sources.Count -gt 0)
+$animeLetter   = $animeCfg.MountLetter
+
+# Every mount service holds rclone.exe open, so all of them must stop for the exe
+# swap.  Older installs only have the movies service (no anime mount); only the
+# services that exist are passed to the swap helper (a missing one would fail its
+# health gate).
+$serviceCandidates = @("rclone-rd-movies", "rclone-rd-shows")
+if ($animeEnabled) { $serviceCandidates += "rclone-rd-anime" }
+$ServiceNames = @($serviceCandidates | Where-Object { Get-Service -Name $_ -ErrorAction SilentlyContinue })
 if ($ServiceNames.Count -eq 0) { $ServiceNames = @("rclone-rd-movies") }
 
 $checkLetters = @($mountLetter)
 if ($ServiceNames -contains "rclone-rd-shows") { $checkLetters += $tvMountLetter }
+if ($ServiceNames -contains "rclone-rd-anime") { $checkLetters += $animeLetter }
 
 $installed = Get-InstalledVersion -InstallDir $InstallDir -AppName $AppName
 
@@ -81,6 +92,21 @@ try {
                 -NewExePath $newExe.FullName -ServiceNames $ServiceNames -HealthSeconds 15 -PostHealthCheck $mountCheck
     Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not $swap.Ok) { throw "exe swap failed: $($swap.Detail)" }
+
+    # The anime view is a set of symlinks into the mount that just restarted, so
+    # refresh it while we know the drives are healthy (cheap and idempotent).
+    if ($animeEnabled) {
+        $animeSync  = Join-Path $InstallDir "scripts\sync_anime_library.ps1"
+        $animeConfig = Join-Path (Split-Path $PSScriptRoot -Parent) "config.json"
+        if (Test-Path $animeSync) {
+            try {
+                & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $animeSync -ConfigPath $animeConfig -Quiet | Out-Null
+                Write-UcLog "INFO" "Anime library view refreshed after rclone update"
+            } catch {
+                Write-UcLog "WARN" "Anime sync after rclone update failed: $_"
+            }
+        }
+    }
 
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "" }
