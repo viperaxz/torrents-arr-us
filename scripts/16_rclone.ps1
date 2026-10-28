@@ -69,10 +69,9 @@ if ($TvMountLetter -notmatch '^[A-Y]$' -or $TvMountLetter -eq $MountLetter) {
 $MovieLetter = $MountLetter
 $TvLetter    = $TvMountLetter
 
-# `. (Join-Path $PSScriptRoot "anime_helpers.ps1")` is loaded above; the anime
-# mount only exists when config.json carries an Anime block with sources.  It
-# holds the absolute-numbered packs that zurg routed to zurg:anime -- the renamed
-# symlink tree Jellyfin reads is built from this mount.
+# The anime mount only exists when config.json carries an Anime block with
+# sources.  It holds the absolute-numbered packs that Zurg routed to zurg:anime --
+# the renamed symlink tree Jellyfin reads is built from this mount.
 $AnimeCfg    = Get-AnimeConfig -Config $Config
 $AnimeEnabled = [bool]($AnimeCfg.Enabled -and $AnimeCfg.Sources.Count -gt 0)
 $AnimeLetter = $AnimeCfg.MountLetter
