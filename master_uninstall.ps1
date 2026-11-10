@@ -457,6 +457,7 @@ foreach ($task in @("Seedbox_Cloudflare_Updater", "Seedbox_DuckDNS_Updater",
                     "Seedbox_Blocklist_Update", "Seedbox_GeoBlock_Update", "Seedbox_CaddyLogRelay",
                     "Seedbox_Status_Collector", "Seedbox_TestSuite", "Seedbox_TestSuiteFull",
                     "Seedbox_SecurityEventExport", "Seedbox_CrowdSecWhitelistRefresh",
+                    "Seedbox_AnimeSync", "Seedbox_TempCleanup",
                     "win-seedbox Update Check")) {
     $exists = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
     Write-DebugLog "VAR task '$task' exists: $($null -ne $exists)"

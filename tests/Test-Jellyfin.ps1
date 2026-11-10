@@ -40,6 +40,24 @@ if ($LayerFilter -eq 0 -or $LayerFilter -eq 1) {
     }
     $Script:Results.Add((New-TestResult $svc 1 'ServiceRunning' $(if ($nssm -and $nssm.Status -eq 'Running') { 'PASS' } else { 'FAIL' }) 'Service state'))
 
+    # Jellyfin 12.3 refuses to start when its data volume has under 2 GiB free:
+    #   [FTL] Main: Unhandled Exception
+    #   System.InvalidOperationException: The path `...\Server\data` has
+    #   insufficient free space. Available: 1.8GiB, Required: 2GiB.
+    # The service then stays stopped with nothing but that line in the log, so the
+    # condition belongs in the fast layer rather than being inferred from an outage.
+    $dataPath  = 'C:\ProgramData\Jellyfin\Server\data'
+    $minFreeGb = 2
+    $warnFreeGb = 5
+    try {
+        $dataDrive = (Get-Item -LiteralPath $dataPath -ErrorAction Stop).PSDrive
+        $freeGb    = [math]::Round($dataDrive.Free / 1GB, 2)
+        $diskStatus = if ($freeGb -lt $minFreeGb) { 'FAIL' } elseif ($freeGb -lt $warnFreeGb) { 'WARN' } else { 'PASS' }
+        $Script:Results.Add((New-TestResult $svc 1 'DataPathFreeSpace' $diskStatus "$freeGb GB free on $($dataDrive.Name): (Jellyfin needs $minFreeGb GB to start)"))
+    } catch {
+        $Script:Results.Add((New-TestResult $svc 1 'DataPathFreeSpace' 'WARN' "Could not read free space for ${dataPath}: $($_.Exception.Message)"))
+    }
+
     Get-LogValidationResult $svc 1 $log $pos 'jellyfin' $t0 $Script:LokiEnabled
 }
 

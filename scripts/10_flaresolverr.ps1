@@ -353,6 +353,50 @@ if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
     }
 }
 
+# -- Temp cleanup task ---------------------------------------------------------
+# FlareSolverr's bundled Chrome gets a fresh profile per launch under the service
+# account's temp directory and never removes it (Prowlarr calls the solver without
+# a session, so that is one profile per request).  Measured on this box: 720
+# orphaned profiles at ~189 MB each = 66.8 GB, which filled C: to 0.5 GB free and
+# then stopped Jellyfin, which refuses to start with less than 2 GiB free on its
+# data volume.  scripts\clean_temp.ps1 prunes them; schedule it so it cannot build
+# up again.
+$installScripts = Join-Path $InstallDir "scripts"
+if (-not (Test-Path $installScripts)) { New-Item -ItemType Directory -Path $installScripts -Force | Out-Null }
+$cleanSrc = Join-Path $PSScriptRoot "clean_temp.ps1"
+$cleanDst = Join-Path $installScripts "clean_temp.ps1"
+if (Test-Path $cleanSrc) {
+    Copy-Item -LiteralPath $cleanSrc -Destination $cleanDst -Force
+    $configForTask = Join-Path (Split-Path $PSScriptRoot -Parent) "config.json"
+    try {
+        $cleanAction  = New-ScheduledTaskAction -Execute "powershell.exe" `
+            -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$cleanDst`" -ConfigPath `"$configForTask`" -Quiet"
+        $cleanTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) `
+            -RepetitionInterval (New-TimeSpan -Hours 6) `
+            -RepetitionDuration (New-TimeSpan -Days 3650)
+        $cleanPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+            -LogonType ServiceAccount -RunLevel Highest
+        $cleanSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+            -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+        Register-ScheduledTask -TaskName "Seedbox_TempCleanup" `
+            -Action $cleanAction -Trigger $cleanTrigger `
+            -Principal $cleanPrincipal -Settings $cleanSettings -Force | Out-Null
+        $cleanTask = Get-ScheduledTask -TaskName "Seedbox_TempCleanup" -ErrorAction SilentlyContinue
+        if ($cleanTask -and $cleanTask.State -in @('Ready', 'Running')) {
+            Write-Host "  -> Seedbox_TempCleanup registered (every 6h)." -ForegroundColor DarkGray
+            Write-DebugLog "INFO" "Seedbox_TempCleanup registered (state=$($cleanTask.State))"
+        } else {
+            Write-Warning "  -> Seedbox_TempCleanup did not register cleanly (state=$($cleanTask.State))."
+            Write-DebugLog "ERROR" "Seedbox_TempCleanup state=$($cleanTask.State)"
+        }
+    } catch {
+        Write-Warning "  -> Could not register Seedbox_TempCleanup: $_"
+        Write-DebugLog "ERROR" "Seedbox_TempCleanup registration failed: $_"
+    }
+} else {
+    Write-DebugLog "WARN" "clean_temp.ps1 not found at $cleanSrc -- temp cleanup task not registered"
+}
+
 $LockVersion = if ($PinnedVersion) { $PinnedVersion } else { "unknown" }
 [System.IO.File]::WriteAllText($LockFile, $LockVersion, (New-Object System.Text.UTF8Encoding($false)))
 Write-DebugLog "INFO" "Lock file written: $LockFile (version=$LockVersion)"

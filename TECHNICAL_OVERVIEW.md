@@ -17,7 +17,7 @@ It installs, wires together, and secures a complete self-hosted media stack behi
    - [Application Installers](#application-installers)
    - [Layer 1 — Auth Configuration](#layer-1--auth-configuration)
    - [Layer 2 — Application Integration](#layer-2--application-integration)
-- [Anime split (absolute-numbered packs)](#anime-split-absolute-numbered-packs)
+   - [Anime split (absolute-numbered packs)](#anime-split-absolute-numbered-packs)
    - [Helpers & Utilities](#helpers--utilities)
 6. [Networking & TLS](#6-networking--tls)
 7. [Security Model](#7-security-model)
@@ -170,7 +170,12 @@ CrowdSec splits into two independent components, and **both are required** — t
 - Layer 2 registers it with Prowlarr as an indexer proxy via `/api/v1/indexerproxy`, enabling automatic routing of Cloudflare-protected trackers.
 - Prowlarr only uses an indexer proxy that carries at least one tag (`IndexerProxyDefinition.Enable` is `Tags.Any()`) **and** only hands it to indexers whose tags intersect the proxy's, so `configure_layer2_flaresolverr.ps1` creates/reuses a `flaresolverr` tag, puts it on the proxy and applies it (bulk tag edit, additive) to the indexers Prowlarr's schema flags as needing the solver — native definitions like `RuTracker.org` are listed explicitly because they carry no `info_flaresolverr` schema flag.
 - Flaresolverr binds to `127.0.0.1` only — it is never publicly exposed.
+- **Temp-profile litter (and why it matters)**: the bundled Chromium is driven through undetected-chromedriver, which gives every launch a fresh profile created with Python's `tempfile.mkdtemp()` under the service account's temp directory and never removes it. Prowlarr calls the solver statelessly (no `session` parameter), so that is **one ~189 MB profile per request**. Measured on a live box: 720 orphaned profiles = **66.8 GB** in three weeks, which filled `C:` to 0.5 GB free and then took Jellyfin down (see [Temp cleanup and disk space](#temp-cleanup-and-disk-space)). `scripts/clean_temp.ps1` prunes them and `Seedbox_TempCleanup` runs it every 6 hours as SYSTEM; it also clears stale leftovers older than 72 hours and reports free space.
 
+### Temp cleanup and disk space
+- **Jellyfin's hard floor**: Jellyfin 12.3 checks free space before it will start and exits fatally when the volume holding `<datadir>` has less than **2 GiB** free. The log carries one line — `[FTL] Main: Unhandled Exception` with `System.InvalidOperationException: The path ... has insufficient free space. Available: 1.8GiB, Required: 2GiB.` — and the service then simply stays stopped, with nothing in the UI to explain it.
+- **What fills the disk on this stack**: FlareSolverr's per-launch Chromium profiles (see [Cloudflare CAPTCHA Bypass](#cloudflare-captcha-bypass-flaresolverr)) — 720 of them, 66.8 GB, three weeks. Jellyfin's own transcode scratch and stale installers accumulate in the same temp directory but are far smaller.
+- **Countermeasure**: `Seedbox_TempCleanup` runs `scripts/clean_temp.ps1` every 6 hours as SYSTEM (see [scripts/clean_temp.ps1](#scripts-clean_temppps1)). Free space is reported by the status collector as `media.jellyfin.data_path_free_gb` / `data_path_min_free_gb` / `data_path_disk_ok`, and the test suite asserts it in the fast layer as `Jellyfin / L1 DataPathFreeSpace` (FAIL under 2 GB, WARN under 5 GB) — so a repeat shows up in Grafana and in `test_results.json` long before the service is unable to boot.
 ### Structured Debug Logging
 - `scripts/debug_logger.ps1` provides a shared `Write-DebugLog`/`Initialize-DebugLog` pair dot-sourced by every installer and configure script.
 - Controlled by `General.DebugLogging = true` in `config.json`; disabled by default (zero performance impact when off).
@@ -514,6 +519,7 @@ Minimal script. Installs ffmpeg via Chocolatey if not already present. Verifies 
 - Opens a Windows Firewall rule for port 8191 (TCP inbound), though only Prowlarr accesses it locally.
 - Waits up to 60 seconds for the API to respond (Flaresolverr initialises a headless Chromium instance on first start, which takes ~20–30 seconds).
 - Uses the standard lock file (`.locks/.flaresolverr.lock`) for idempotency.
+- Stages `scripts/clean_temp.ps1` into `<InstallDir>\scripts` and registers `Seedbox_TempCleanup` (SYSTEM, every 6 hours, `MultipleInstances IgnoreNew`). The solver's Chromium writes a fresh ~189 MB profile per launch into the service account's temp directory; without pruning that reached 66.8 GB and stopped Jellyfin from starting. See [Temp cleanup and disk space](#temp-cleanup-and-disk-space).
 
 #### `scripts/13_status.ps1`
 Registers the `Seedbox_Status_Collector` Windows Scheduled Task (every 5 minutes, SYSTEM, hidden) that runs `collect_status.ps1`. Immediately performs an initial collection on install so the dashboard has data on first load. Uses the standard lock file (`.locks/.status.lock`) for idempotency.
@@ -707,6 +713,13 @@ Two functions for encrypting/decrypting the Caddy `caddy-data/` directory tree.
 - **`Restore-CaddyData`**: Reads the salt prefix, re-derives the same key/IV, decrypts, and extracts the zip to the destination directory.
 - Used by `01_webserver.ps1` (restore on reinstall) and `master_uninstall.ps1` (backup on uninstall).
 
+#### `scripts/clean_temp.ps1`
+Prunes the disposable temp directories left behind under the service account's profile, and reports free space.
+- **Why it exists**: FlareSolverr's bundled Chromium writes a fresh ~189 MB profile per launch into `%TEMP%` of the account the services run as (`seedbox-svc`) and never deletes it. 720 of them reached 66.8 GB and filled `C:` to 0.49 GB free.
+- **Consequence it prevents**: Jellyfin 12.3 aborts startup when the volume holding its data directory has under 2 GiB free (`insufficient free space. Available: 1.8GiB, Required: 2GiB` → `[FTL] Main: Unhandled Exception`), and the service then stays stopped with nothing but that log line. The same full disk produced `IOException saving to ...metadata\People\...\folder.jpg` failures while scanning.
+- **Policy**: entries matching the per-launch patterns (`tmp[a-z0-9_]{8}`, `chromium_chrome_Unpacker_*`, `scoped_dir*`, `Crashpad*`, `chrome_*`, Jellyfin's transcode scratch, `pip-*`) are removed once older than `-AgeHours` (default 6); everything else in temp only after `-GenericAgeHours` (default 72). Locked entries are counted and skipped, reparse points are deleted as links (never recursed through), and the run is logged to `<InstallDir>\logs\temp_cleanup.log`.
+- **Account resolution**: the profile directory is resolved through `Win32_UserProfile` by SID, because Windows can store it as `seedbox-svc.<COMPUTERNAME>`.
+- **Scheduling**: `scripts/10_flaresolverr.ps1` stages the script into `<InstallDir>\scripts` and registers `Seedbox_TempCleanup` (SYSTEM, every 6 hours, `MultipleInstances IgnoreNew`). `master_uninstall.ps1` removes the task.
 #### `scripts/update_blocklists.ps1`
 Fetches abuse IP lists and creates Windows Firewall BLOCK rules:
 - Downloads Spamhaus DROP and EDROP (BGP hijack / bulletproof-hosting ranges) and Firehol Level 1 (mass-scanner / known-bad CIDRs).

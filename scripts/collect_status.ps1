@@ -515,10 +515,28 @@ try {
         $jfRes    = QuickGet "http://127.0.0.1:$jellyfinPort${jfBase}/Items/Counts" @{ 'Authorization' = ($jfClient + ', Token="' + $jfKey + '"') } 10 -JsonOnly
         if ($jfRes.ok -and $jfRes.data) {
             $jfCounts = $jfRes.data
+            # Jellyfin 12.3 aborts startup when the volume holding its data
+            # directory has less than 2 GiB free ("insufficient free space.
+            # Available: 1.8GiB, Required: 2GiB" -> [FTL] Unhandled Exception, and
+            # the service stays stopped). Publishing the number next to the counts
+            # is what lets a dashboard alert fire while the server is still up,
+            # instead of discovering the outage after a reboot.
+            $jfDataPath  = 'C:\ProgramData\Jellyfin\Server\data'
+            $jfFreeGb    = $null
+            $jfNeedsGb   = 2
+            try {
+                $jfDrive = (Get-Item -LiteralPath $jfDataPath -ErrorAction Stop).PSDrive
+                if ($jfDrive -and $jfDrive.Free -ne $null) {
+                    $jfFreeGb = [math]::Round($jfDrive.Free / 1GB, 2)
+                }
+            } catch { }
             $status.media.jellyfin = [ordered]@{
-                movies   = [int]$jfCounts.MovieCount
-                series   = [int]$jfCounts.SeriesCount
-                episodes = [int]$jfCounts.EpisodeCount
+                movies               = [int]$jfCounts.MovieCount
+                series               = [int]$jfCounts.SeriesCount
+                episodes             = [int]$jfCounts.EpisodeCount
+                data_path_free_gb    = $jfFreeGb
+                data_path_min_free_gb = $jfNeedsGb
+                data_path_disk_ok    = if ($jfFreeGb -ne $null) { ($jfFreeGb -ge $jfNeedsGb) } else { $null }
             }
         }
     }
