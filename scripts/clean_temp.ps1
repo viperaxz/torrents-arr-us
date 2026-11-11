@@ -23,8 +23,15 @@ param(
 #
 # so the server was down until the temp litter was cleared.  This script is the
 # recurring countermeasure: it prunes the disposable directories (aggressively, at
-# $AgeHours) and stale leftover files (at $GenericAgeHours), skips anything locked
-# by a live process, and never follows a reparse point.
+# $AgeHours) and stale leftover files (at $GenericAgeHours), and never follows a
+# reparse point.
+#
+# Locked entries are DEFERRED, not exempted.  Eligibility comes from the entry's
+# own LastWriteTime on every run, so an entry held open now is retried on the next
+# pass -- and a reboot does not change that (a dead process releases its handles,
+# the timestamps stay old, so the very next run deletes the leftovers).  The run
+# logs which entries were locked: one that is reported every single time is a real
+# leak rather than a handle that happened to be open.
 
 function Write-CleanLog {
     param([string]$Level, [string]$Message)
@@ -142,6 +149,7 @@ $ageCutoff  = $now.AddHours(-$GenericAgeHours)
 $fastCount = 0; $fastBytes = 0
 $slowCount = 0; $slowBytes = 0
 $locked    = 0
+$lockedItems = [System.Collections.Generic.List[object]]::new()
 
 foreach ($root in $targets) {
     $entries = Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue
@@ -156,13 +164,29 @@ foreach ($root in $targets) {
             if ($isFast) { $fastCount++; $fastBytes += $size }
             else         { $slowCount++; $slowBytes += $size }
         } catch {
+            # Not exempt -- just held open right now.  Eligibility is re-evaluated
+            # from LastWriteTime on every run, so the next pass (a few hours later,
+            # or after the reboot that killed the owning process) deletes it.
+            # Record what it was: a bare count cannot tell a transient handle from
+            # something that is locked on every single run.
             $locked++
+            $lockedItems.Add([PSCustomObject]@{ Path = $entry.FullName; Reason = $_.Exception.Message })
         }
     }
 }
 
 $freedGb = [math]::Round(($fastBytes + $slowBytes) / 1GB, 2)
 Write-CleanLog "INFO" ("Cleanup done: browser=$fastCount (${AgeHours}h), stale=$slowCount (${GenericAgeHours}h), locked=$locked, freed=${freedGb}GB")
+# An entry that shows up here run after run is a genuine leak, not a timing
+# artefact -- say which one, or the counter is as uninformative as "0 bytes free".
+if ($locked -gt 0) {
+    foreach ($item in ($lockedItems | Select-Object -First 10)) {
+        Write-CleanLog "WARN" "Locked, will retry next run: $($item.Path) :: $($item.Reason)"
+    }
+    if ($lockedItems.Count -gt 10) {
+        Write-CleanLog "WARN" "$($lockedItems.Count - 10) further locked entry(ies) not listed"
+    }
+}
 
 # -- 4. Report free space ------------------------------------------------------
 $report = @()
