@@ -53,6 +53,18 @@ try {
 
     # The ledger is deliberately not updated on failure: the next run retries.
     Set-InstalledVersion -InstallDir $InstallDir -AppName $AppName -Version $Version
+
+    # Keep the recurring temp-cleanup task alive on boxes that only ever run
+    # `box update`: the binary swap above is the only FlareSolverr path they take,
+    # and the task is what stops the per-launch Chrome profiles from filling the
+    # system drive again. Idempotent, and non-fatal if it fails.
+    try {
+        . (Join-Path $PSScriptRoot "temp_cleanup_task.ps1")
+        $null = Register-TempCleanupTask -InstallDir $InstallDir -SourceDir $PSScriptRoot
+    } catch {
+        Write-UcLog "WARN" "Temp cleanup task not refreshed after update: $_"
+    }
+
     return [PSCustomObject]@{ App = $AppName; Status = "OK"; Installed = $installed; Target = $Version; Detail = "API ready on :$port" }
 } catch {
     return [PSCustomObject]@{ App = $AppName; Status = "FAILED"; Installed = $installed; Target = $Version; Detail = $_.Exception.Message }
