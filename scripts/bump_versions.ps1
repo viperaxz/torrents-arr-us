@@ -138,6 +138,45 @@ function Get-LatestFtpVersion {
     return $best
 }
 
+function Compare-VersionLike {
+    # Orders two version strings the way a package feed should, so a bump can be
+    # rejected before it becomes a downgrade.  Segments are split on '.' and '-',
+    # a leading 'v' is dropped, and numeric segments compare as numbers.
+    # "2.24.101" vs "2.24.101.20180116": the 4-part one is HIGHER (the missing
+    # segment pads to 0), which is exactly the NSSM case -- Chocolatey carried
+    # 2.24.101.20180116 first and published the shorter 2.24.101 later, so its
+    # IsLatestVersion flag points at a version that sorts LOWER.  Returns -1, 0
+    # or 1.
+    param([string]$A, [string]$B)
+
+    $norm = {
+        param([string]$v)
+        $v = $v.Trim()
+        if ($v -match '^[vV]') { $v = $v.Substring(1) }
+        # Drop build metadata; keep the numeric/dash sections for comparison.
+        @(($v -split '[.\-+]') | Where-Object { $_ -ne '' })
+    }
+    $pa = & $norm $A
+    $pb = & $norm $B
+    $len = [Math]::Max($pa.Count, $pb.Count)
+    for ($i = 0; $i -lt $len; $i++) {
+        $sa = if ($i -lt $pa.Count) { $pa[$i] } else { '0' }
+        $sb = if ($i -lt $pb.Count) { $pb[$i] } else { '0' }
+        $na = 0L; $nb = 0L
+        $aNumeric = [long]::TryParse($sa, [ref]$na)
+        $bNumeric = [long]::TryParse($sb, [ref]$nb)
+        if ($aNumeric -and $bNumeric) {
+            if ($na -lt $nb) { return -1 }
+            if ($na -gt $nb) { return 1 }
+        } else {
+            $c = [string]::CompareOrdinal($sa, $sb)
+            if ($c -lt 0) { return -1 }
+            if ($c -gt 0) { return 1 }
+        }
+    }
+    return 0
+}
+
 Write-Host "Bump check for versions.json (schema $($Manifest.schema))..." -ForegroundColor Cyan
 
 $changes = [System.Collections.Generic.List[object]]::new()
@@ -172,6 +211,15 @@ foreach ($prop in $Manifest.apps.PSObject.Properties) {
     if (-not $latest) { continue }
 
     if ($latest -ne $current) {
+        # Never write a version that sorts lower than what is pinned.  A feed's
+        # "latest" is publish order, not semver: Chocolatey published NSSM
+        # 2.24.101.20180116 and only later added 2.24.101, so IsLatestVersion
+        # points at a DOWNGRADE.  Applying that would move every NSSM service to
+        # an older build, so it is refused here rather than discovered mid-update.
+        if ((Compare-VersionLike $latest $current) -lt 0) {
+            Write-Host ("  {0,-18} feed says {1}, pinned {2} sorts higher -- keeping pin (not a downgrade)" -f $app, $latest, $current) -ForegroundColor DarkYellow
+            continue
+        }
         $changes.Add([PSCustomObject]@{ App = $app; Old = $current; New = $latest })
         $entry.version = $latest
     } else {
