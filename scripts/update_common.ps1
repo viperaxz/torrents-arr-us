@@ -322,8 +322,11 @@ function Get-RemoteManifest {
         # the update silently did nothing.  A unique query string plus no-cache
         # headers forces a fresh object; if the CDN still answers with the stale
         # copy, the caller's ledger-vs-remote comparison simply sees no updates.
-        $busted = if ($Url -match '\?') { "$Url&_cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" }
-                  else { "$Url?_cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" }
+        # NOTE: ${Url} must be braced -- in "$Url?_cb=..." PowerShell folds the '?'
+        # into the variable name, so the URL silently expands to nothing and the
+        # fetch dies with "Invalid URI: The hostname could not be parsed".
+        $sep = if ($Url -match '\?') { '&' } else { '?' }
+        $busted = "${Url}${sep}_cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
         $headers = @{ 'Cache-Control' = 'no-cache, no-store'; 'Pragma' = 'no-cache' }
         $result = Invoke-RestMethod -Uri $busted -Headers $headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         if ($result -is [string]) {
@@ -509,12 +512,36 @@ function Swap-AppDirectoryWithRollback {
         New-Item -Path $appBinDir -ItemType Directory -Force | Out-Null
         Expand-Archive -Path $ZipPath -DestinationPath $appBinDir -Force -ErrorAction Stop
 
-        # Flatten single-directory zips.
-        $children = Get-ChildItem $appBinDir
-        if ($children.Count -eq 1 -and $children[0].PSIsContainer) {
-            $inner = $children[0].FullName
-            Get-ChildItem $inner | ForEach-Object { Move-Item $_.FullName $appBinDir -Force }
-            Remove-Item $inner -Recurse -Force
+        # Flatten a wrapper directory ONLY when it is the thing standing between
+        # NSSM and its program.  Deciding by the zip's shape alone was wrong: a
+        # Servarr zip publishes its own install root (Prowlarr/Prowlarr.exe) which
+        # NSSM launches as <install>\Prowlarr\Prowlarr.exe, so flattening moved the
+        # exe one level up.  Start-Service then failed with
+        #   "Program ...\Prowlarr\Prowlarr.exe couldn't be launched.
+        #    CreateProcess() failed: the system cannot find the file specified"
+        # and the whole update rolled back.  Sonarr and FlareSolverr need the
+        # opposite (flat), so the decision has to come from the expected path.
+        $expectedPrograms = @()
+        foreach ($svcName in $ServiceNames) {
+            $prog = & nssm get $svcName Application 2>$null
+            if ($prog) { $expectedPrograms += ([string]$prog).Trim() }
+        }
+        $missingPrograms = @($expectedPrograms | Where-Object { -not (Test-Path -LiteralPath $_) })
+        if ($missingPrograms.Count -gt 0) {
+            $children = @(Get-ChildItem $appBinDir)
+            if ($children.Count -eq 1 -and $children[0].PSIsContainer) {
+                $inner = $children[0].FullName
+                Get-ChildItem $inner | ForEach-Object { Move-Item $_.FullName $appBinDir -Force }
+                Remove-Item $inner -Recurse -Force
+                $missingPrograms = @($expectedPrograms | Where-Object { -not (Test-Path -LiteralPath $_) })
+                Write-UcLog "INFO" "Flattened wrapper directory in $appBinDir (single top-level folder)"
+            }
+        }
+        # Fail before Start-Service, not after: a missing program makes every
+        # start attempt die instantly and the crash would be attributed to the new
+        # build instead of to the extraction.
+        if ($missingPrograms.Count -gt 0) {
+            throw "archive does not provide the program NSSM launches: $($missingPrograms -join '; ')"
         }
 
         foreach ($svcName in $ServiceNames) {
