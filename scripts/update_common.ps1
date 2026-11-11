@@ -315,7 +315,17 @@ function Get-RemoteManifest {
     }
     if (-not $Url) { return $LocalManifest }
     try {
-        $result = Invoke-RestMethod -Uri $Url -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+        # raw.githubusercontent is fronted by a CDN with Cache-Control: max-age=300,
+        # so a plain GET can serve a copy up to five minutes stale.  That made the
+        # sequence "push new pins -> box update" report every app as up to date,
+        # because the remote manifest read here still carried the OLD versions --
+        # the update silently did nothing.  A unique query string plus no-cache
+        # headers forces a fresh object; if the CDN still answers with the stale
+        # copy, the caller's ledger-vs-remote comparison simply sees no updates.
+        $busted = if ($Url -match '\?') { "$Url&_cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" }
+                  else { "$Url?_cb=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" }
+        $headers = @{ 'Cache-Control' = 'no-cache, no-store'; 'Pragma' = 'no-cache' }
+        $result = Invoke-RestMethod -Uri $busted -Headers $headers -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
         if ($result -is [string]) {
             # GitHub raw serves text/plain, so PS 5.1 returns the raw JSON
             # string.  Strip UTF-8 BOM characters (the remote file can carry
